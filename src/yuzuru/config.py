@@ -162,7 +162,8 @@ class Config:
 
 def default_tiers() -> list[TierConfig]:
     return [
-        TierConfig("small", num_ctx=16384, auto_params_max_b=6, allow_cpu_offload=True, max_cpu_fraction=1.0),
+        # 32k everywhere: a coding agent's system prompt + tool schemas alone is ~20k tokens.
+        TierConfig("small", num_ctx=32768, auto_params_max_b=6, allow_cpu_offload=True, max_cpu_fraction=1.0),
         TierConfig("medium", num_ctx=32768, auto_params_max_b=20),
         TierConfig("large", num_ctx=32768, auto_params_max_b=None),
     ]

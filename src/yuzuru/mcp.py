@@ -1,5 +1,8 @@
 """Minimal MCP server (Streamable HTTP, JSON responses only) exposing yuzuru tools.
 
+Tool names are unprefixed; clients namespace them by server (OpenCode shows
+`yuzuru_status`, `yuzuru_train`, ...).
+
 Works with any MCP client; OpenCode picks it up from the `mcp` section that
 `yuzuru opencode --install` writes. Tool results are plain text.
 """
@@ -25,8 +28,8 @@ PROTOCOL_VERSION = "2025-06-18"
 
 INSTRUCTIONS = (
     "yuzuru serves this assistant from local models sized to the free GPU memory. "
-    "Call yuzuru_model with 'large' when a task needs deeper reasoning than the current model gives. "
-    "Start GPU training / fine-tuning with yuzuru_train rather than bash: it moves the LLM out of VRAM first "
+    "Call this server's `model` tool with 'large' when a task needs deeper reasoning than the current model gives. "
+    "Start GPU training / fine-tuning with its `train` tool rather than bash: it moves the LLM out of VRAM first "
     "and runs the job in the background with a log file."
 )
 
@@ -71,7 +74,7 @@ class MCPServer:
     def _register(self) -> None:
         st = self.st
 
-        @self.tool("yuzuru_status", "Show GPU/RAM usage, which local model sizes fit right now, loaded models and "
+        @self.tool("status", "Show GPU/RAM usage, which local model sizes fit right now, loaded models and "
                    "running training jobs (leases).", {})
         async def status(args: dict[str, Any], headers: dict[str, str]) -> str:
             await st.broker.refresh()
@@ -81,7 +84,7 @@ class MCPServer:
                       + (" | cloud (paid API, for problems local models cannot solve)" if st.cfg.cloud.usable else "")
                       + " | an installed model name")
 
-        @self.tool("yuzuru_models", "List the local models installed in Ollama, which tier each serves, and whether "
+        @self.tool("models", "List the local models installed in Ollama, which tier each serves, and whether "
                    "each is enabled.", {})
         async def models(args: dict[str, Any], headers: dict[str, str]) -> str:
             lines = []
@@ -94,10 +97,10 @@ class MCPServer:
             return "\n".join(lines) or "no models installed"
 
         @self.tool(
-            "yuzuru_model",
+            "model",
             "Choose the local model for the rest of this session, from the next model call on: a size tier "
             "('large' before hard multi-step work such as architecture, subtle debugging or math; the smallest tier "
-            "for trivial chores), a specific installed model name (see yuzuru_models), or 'auto' to let the router "
+            "for trivial chores), a specific installed model name (see the `models` tool), or 'auto' to let the router "
             "decide per message again.",
             {"tier": {"type": "string", "description": tiers_desc},
              "session": {"type": "string", "description": "session id (optional; defaults to the active session)"}},
@@ -112,7 +115,7 @@ class MCPServer:
             return f"model for session {session}: {st.router.sessions[session].pinned or 'auto'}"
 
         @self.tool(
-            "yuzuru_train",
+            "train",
             "Start a GPU training / fine-tuning job in the background. yuzuru first moves the local LLM out of GPU "
             "memory, waits for the job's memory use to settle, then lets the LLM use what remains. Returns the PID "
             "and log file; read the log to follow progress.",
@@ -157,13 +160,13 @@ class MCPServer:
             return text
 
         @self.tool(
-            "yuzuru_wait",
+            "wait",
             "Wait for a running process to finish without holding GPU/RAM: yuzuru unloads the local LLM, then "
             "resumes this session with the outcome (exit status, log tail, your note) when the process exits. "
             "Use it instead of polling or sleeping. End your turn right after calling it.",
             {
                 "pid": {"type": "integer", "description": "process id to wait for"},
-                "lease": {"type": "string", "description": "or a yuzuru lease id (from yuzuru_status)"},
+                "lease": {"type": "string", "description": "or a yuzuru lease id (from the `status` tool)"},
                 "note": {"type": "string", "description": "what you will do when it ends (handed back to you)"},
                 "log": {"type": "string", "description": "log file whose last lines to hand back (optional)"},
                 "cwd": {"type": "string", "description": "working directory for resolving the log path (optional)"},

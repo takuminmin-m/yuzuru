@@ -89,6 +89,9 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
         log = Path(args.log or f".yuzuru/logs/run-{os.getpid()}.log")
         log.parent.mkdir(parents=True, exist_ok=True)
         argv = [a for a in sys.argv[1:] if a != "--detach"]
+        if not args.log:
+            i = argv.index("run") + 1
+            argv[i:i] = ["--log", str(log.resolve())]
         with log.open("ab") as f:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "yuzuru.cli", *argv],
@@ -279,6 +282,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--install", action="store_true", help="write into the OpenCode config directory")
     p.add_argument("--project", help="install into this project instead of the global config")
     p.add_argument("--set-default", action="store_true", help="make yuzuru/auto the default model")
+    p.add_argument("--local-only", action="store_true",
+                   help="disable OpenCode's built-in cloud models so nothing leaves the machine if yuzuru is down")
 
     args = ap.parse_args(argv)
     if args.command == "serve":

@@ -163,8 +163,13 @@ class Broker:
     # -------------------------------------------------------------- placement
 
     def _evictable(self, keep: str) -> list[LoadedModel]:
+        """Idle models in eviction order: GPU-resident first (LRU), CPU-only ones last.
+
+        CPU-only models (the classifier) hold no VRAM, so evicting them only
+        helps when host RAM is what is short; plan() reaches them last.
+        """
         ms = [m for m in self.loaded if m.name != keep and self.inflight[m.name] == 0]
-        return sorted(ms, key=lambda m: self.last_used.get(m.name, 0.0))
+        return sorted(ms, key=lambda m: (m.size_vram == 0, self.last_used.get(m.name, 0.0)))
 
     def place(self, spec: ModelSpec, offload_ok: bool, evict: list[LoadedModel] | None = None) -> Placement:
         """Where `spec` would end up if loaded now (after evicting `evict`)."""
@@ -237,7 +242,7 @@ class Broker:
                         taken = self.snapshot.ollama_host - host_before
                         self.catalog.record_host(spec.variant, actual.value, taken)
                         log.info("%s took %.1f GB VRAM + %.1f GB host RAM", spec.variant,
-                                 (self.is_loaded(spec.variant).size_vram) / 2**30, taken / 2**30)
+                                 (self.is_loaded(spec.variant).size_vram) / 2**30, max(0, taken) / 2**30)
                 return self.place(spec, offload_ok) if self.is_loaded(spec.variant) else placement
         except BaseException:
             self.inflight[spec.variant] -= 1
@@ -526,7 +531,11 @@ class Broker:
         }
 
     def warnings(self) -> list[str]:
-        out = []
+        out = [
+            f"GPU {g} is not responding; yuzuru is using the remaining GPUs. A reboot (or `sudo nvidia-smi -r`) "
+            "usually brings it back; repeated Xid 79 points at power, PCIe seating or riser issues"
+            for g in self.snapshot.lost_gpus
+        ]
         if (leak := self.ollama_unattributed()) > 2 * 2**30:
             out.append(
                 f"Ollama holds {leak / 2**30:.1f} GB of RAM that no loaded model accounts for "

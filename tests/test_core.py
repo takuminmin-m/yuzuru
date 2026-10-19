@@ -154,7 +154,8 @@ async def test_router_escalates_after_tool_errors(cfg, world, http):
 async def test_router_context_floor_and_overrides(cfg, world, http):
     cfg.router = RouterConfig(classifier="heuristic")
     _, _, router = await make(cfg, world, http)
-    router.pin("long", "small")  # small has 16k context
+    cfg.tiers[0].num_ctx = 16384
+    router.pin("long", "small")  # small now has 16k context
     d = await router.route(user("x" * 60000), {"x-yuzuru-session": "long"})
     assert d.wanted == "medium" and "context" in d.reason
     d = await router.route(user("ありがとう @large"), {})
@@ -225,14 +226,14 @@ async def test_mcp_tools(cfg, world, http):
             assert (await c.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})).status_code == 202
             r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             names = {t["name"] for t in r.json()["result"]["tools"]}
-            assert {"yuzuru_status", "yuzuru_model", "yuzuru_train"} <= names
+            assert {"status", "model", "models", "train", "wait"} <= names
             r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                                           "params": {"name": "yuzuru_status", "arguments": {}}})
+                                           "params": {"name": "status", "arguments": {}}})
             assert "LLM budget" in r.json()["result"]["content"][0]["text"]
             # Pin the session OpenCode identifies via its own header.
             await c.post("/v1/chat/completions", json=user("hi"), headers={"x-opencode-session": "ses_1"})
             r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-                                           "params": {"name": "yuzuru_model", "arguments": {"tier": "large"}}})
+                                           "params": {"name": "model", "arguments": {"tier": "large"}}})
             assert not r.json()["result"]["isError"]
             assert st.router.sessions["ses_1"].pinned == "large"
     finally:
@@ -507,3 +508,70 @@ async def test_pid_watch_and_long_poll(cfg, world, http, tmp_path):
     await wait_for(lambda: catalog.specs["small"].variant in world.loaded)
     with pytest.raises(ValueError):
         await waiter.add(session="s", pid=proc.pid)  # already gone
+
+
+def test_default_tiers_fit_an_agent_prompt():
+    from yuzuru.config import default_tiers
+
+    assert all(t.num_ctx >= 32768 for t in default_tiers())
+
+
+async def test_classifier_survives_truncated_json(cfg, world, http, monkeypatch):
+    catalog, broker, router = await make(cfg, world, http)
+
+    async def truncated(payload, timeout=None):
+        return {"message": {"content": '{"difficulty": "hard", "reason": "The user asks to redes'}}
+
+    monkeypatch.setattr(router.ollama, "chat", truncated)
+    level, reason = await router.classify("このモジュールを再設計して", 2)
+    assert level == 2 and reason.startswith("classifier:hard")
+
+
+async def test_cpu_classifier_is_evicted_last(cfg, world, http):
+    catalog, broker, _ = await make(cfg, world, http)
+    for spec in (catalog.router_spec, catalog.specs["small"]):
+        await broker.acquire(spec)
+        await broker.release(spec, touch=False)
+    broker.last_used[catalog.router_spec.variant] = 0  # least recently used
+    order = [m.name for m in broker._evictable(keep="")]
+    assert order[-1] == catalog.router_spec.variant
+    world.foreign = [0, 12 * GB - 1]  # only GPU0 left: medium must evict small, not the classifier
+    await broker.refresh()
+    _, evict = broker.plan(catalog.specs["medium"], True)
+    assert catalog.router_spec.variant not in [m.name for m in evict]
+
+
+def test_opencode_install_v2_codemode_off_and_local_only(cfg, tmp_path, monkeypatch):
+    from yuzuru import opencode
+
+    monkeypatch.setattr(opencode, "opencode_major", lambda: 2)
+    monkeypatch.setattr(opencode, "installed_models", lambda cfg: ["qwen3:14b"])
+    (tmp_path / "opencode.json").write_text(json.dumps({"model": "other/x", "disabled_providers": ["foo"]}))
+    opencode.install(cfg, tmp_path, set_default=False, local_only=True)
+    conf = json.loads((tmp_path / "opencode.json").read_text())
+    assert conf["mcp"]["servers"]["yuzuru"]["codemode"] is False
+    assert conf["model"] == "other/x"  # kept without --set-default
+    assert conf["disabled_providers"] == ["foo", "opencode"]
+    assert "qwen3:14b" in conf["provider"]["yuzuru"]["models"]
+    assert not (tmp_path / ".opencode" / "plugins" / "yuzuru.ts").exists()  # 2.x cannot load it
+
+
+def test_nvidia_probe_survives_a_dead_gpu(monkeypatch):
+    import subprocess
+
+    from yuzuru.resources import NvidiaSmiProbe
+
+    dead = "Unable to determine the device handle for GPU0000:04:00.0: Unknown Error"
+
+    def fake_run(argv, **kw):
+        if "-L" in argv:
+            return subprocess.CompletedProcess(argv, 255, f"GPU 1: RTX 3060 (UUID: GPU-403d)\n", dead)
+        if "-i" in argv:
+            return subprocess.CompletedProcess(argv, 0, "1, GPU-403d, RTX 3060, 12288, 205\n", "")
+        return subprocess.CompletedProcess(argv, 255, "", dead)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    probe = NvidiaSmiProbe(ollama_cgroup="none")
+    snap = probe.snapshot()
+    assert [g.uuid for g in snap.gpus] == ["GPU-403d"]
+    assert snap.lost_gpus and "0000:04:00.0" in snap.lost_gpus[0]

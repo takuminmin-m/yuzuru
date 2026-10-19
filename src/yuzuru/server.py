@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import logging
 import secrets
 import uuid
@@ -110,6 +112,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
     async def chat(request: Request) -> Response:
         body = await request.json()
         headers = {k.lower(): v for k, v in request.headers.items()}
+        if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
+            (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
         try:
             decision = await st.router.route(body, headers)
         except LookupError as e:
