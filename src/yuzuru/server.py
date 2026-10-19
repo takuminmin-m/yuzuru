@@ -37,7 +37,7 @@ class State:
         self.http = http or httpx.AsyncClient(base_url=cfg.ollama_url, timeout=httpx.Timeout(None, connect=5))
         self.ollama = Ollama(cfg.ollama_url, self.http)
         self.catalog = Catalog(cfg, self.ollama)
-        self.broker = Broker(cfg, probe or make_probe(cfg.resources.probe), self.ollama, self.catalog)
+        self.broker = Broker(cfg, probe or make_probe(cfg.resources.probe, cfg.resources.ollama_cgroup), self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.tasks: list[asyncio.Task] = []
 

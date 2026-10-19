@@ -134,6 +134,8 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
 
 
 def print_status(s: dict[str, Any]) -> None:
+    for w in s.get("warnings", []):
+        print(f"! {w}")
     for g in s["gpus"]:
         print(f"GPU{g['index']} {g['name']:<28} used {gb(g['used']):>8} / {gb(g['total'])}")
     print(f"RAM {'':<28} avail {gb(s['ram']['available']):>7} / {gb(s['ram']['total'])}")

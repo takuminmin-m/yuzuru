@@ -38,7 +38,8 @@ def gb(n: float) -> str:
 
 
 def format_status(s: dict[str, Any]) -> str:
-    lines = [f"GPU{g['index']} {g['name']}: {gb(g['used'])} / {gb(g['total'])} used" for g in s["gpus"]]
+    lines = [f"warning: {w}" for w in s.get("warnings", [])]
+    lines += [f"GPU{g['index']} {g['name']}: {gb(g['used'])} / {gb(g['total'])} used" for g in s["gpus"]]
     lines.append(f"RAM: {gb(s['ram']['available'])} free of {gb(s['ram']['total'])}")
     b = s["budget"]
     lines.append(f"LLM budget: {gb(b['fast'])} (unified memory)" if b["unified"] else

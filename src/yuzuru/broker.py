@@ -111,7 +111,8 @@ class Broker:
     def budget(self) -> Budget:
         snap, res = self.snapshot, self.cfg.resources
         ollama_vram = sum(m.size_vram for m in self.loaded)
-        ollama_ram = sum(m.size_ram for m in self.loaded)
+        # Only what unloading would actually give back (not memory Ollama leaked).
+        ollama_ram = sum(self.host_of(m) for m in self.loaded)
         reserved = sum(self._lease_reserve(l) for l in self.leases.values())
         ram_for_llm = snap.ram_available + ollama_ram - res.ram_reserve_mb * MB
         if not snap.gpus:
@@ -122,6 +123,25 @@ class Broker:
         margin = res.vram_margin_mb * MB * len(snap.gpus)
         fast = snap.gpu_total - foreign - reserved - margin
         return Budget(fast=max(0, fast), slow=max(0, ram_for_llm), unified=False)
+
+    def ollama_host(self) -> int:
+        """Host RAM held by Ollama: measured via its cgroup, else what /api/ps implies."""
+        if self.snapshot.ollama_host is not None:
+            return self.snapshot.ollama_host
+        return sum(self.host_of(m) for m in self.loaded)
+
+    def ollama_unattributed(self) -> int:
+        """Host RAM Ollama holds beyond its loaded models (e.g. leaked by killed runners)."""
+        if self.snapshot.ollama_host is None:
+            return 0
+        return max(0, self.snapshot.ollama_host - sum(self.host_of(m) for m in self.loaded))
+
+    def host_of(self, m: LoadedModel) -> int:
+        spec = self.catalog.by_variant(m.name)
+        placement = "cpu" if m.size_vram == 0 else ("gpu" if m.size_vram >= m.size * 0.98 else "offload")
+        if spec and placement in spec.measured_host:
+            return spec.measured_host[placement]
+        return m.size_ram
 
     # -------------------------------------------------------------- placement
 
@@ -140,17 +160,17 @@ class Broker:
         b = self.budget()
         need = spec.estimated_size
         free_fast = b.fast - sum(m.size_vram for m in others)
-        free_slow = b.slow - sum(m.size_ram for m in others)
+        free_slow = b.slow - sum(self.host_of(m) for m in others)
         if spec.cpu_only:
             pool = free_fast if b.unified else free_slow
             return Placement.CPU if need <= pool else Placement.NONE
-        if need <= free_fast:
+        if need <= free_fast and (b.unified or spec.host_need("gpu") <= free_slow):
             return Placement.GPU
         tier = self.cfg.tier(spec.tier)
         spill = need - max(0, free_fast)
         max_frac = tier.max_cpu_fraction if tier and tier.max_cpu_fraction is not None else (0.7 if spec.moe else 0.25)
         allowed = offload_ok and (tier is None or tier.allow_cpu_offload)
-        if allowed and not b.unified and spill <= need * max_frac and spill <= free_slow:
+        if allowed and not b.unified and spill <= need * max_frac and spec.host_need("offload") <= free_slow:
             return Placement.OFFLOAD
         return Placement.NONE
 
@@ -191,8 +211,16 @@ class Broker:
                     await self.ollama.unload(m.name)
                 if not self.is_loaded(spec.variant):
                     log.info("loading %s (%s, ~%.1f GB)", spec.variant, placement.value, spec.estimated_size / 2**30)
+                    await self.refresh()
+                    host_before = self.snapshot.ollama_host
                     await self.ollama.load(spec.variant, self.cfg.keep_alive)
-                await self.refresh()
+                    await self.refresh()
+                    if self.is_loaded(spec.variant) and host_before is not None and self.snapshot.ollama_host is not None:
+                        actual = self.place(spec, offload_ok)
+                        taken = self.snapshot.ollama_host - host_before
+                        self.catalog.record_host(spec.variant, actual.value, taken)
+                        log.info("%s took %.1f GB VRAM + %.1f GB host RAM", spec.variant,
+                                 (self.is_loaded(spec.variant).size_vram) / 2**30, taken / 2**30)
                 return self.place(spec, offload_ok) if self.is_loaded(spec.variant) else placement
         except BaseException:
             self.inflight[spec.variant] -= 1
@@ -356,7 +384,18 @@ class Broker:
                 for name, s in self.catalog.specs.items()
             },
             "classifier": self.catalog.router_spec.variant if self.catalog.router_spec else None,
+            "warnings": self.warnings(),
         }
+
+    def warnings(self) -> list[str]:
+        out = []
+        if (leak := self.ollama_unattributed()) > 2 * 2**30:
+            out.append(
+                f"Ollama holds {leak / 2**30:.1f} GB of RAM that no loaded model accounts for "
+                "(memory from killed runners is sometimes not returned); restarting Ollama frees it, "
+                "e.g. `sudo systemctl restart ollama`"
+            )
+        return out
 
 
 def _pid_alive(pid: int) -> bool:

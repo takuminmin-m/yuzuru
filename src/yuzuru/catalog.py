@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,8 @@ class ModelSpec:
     measured_size: int | None = None
     cpu_only: bool = False
     moe: bool = False  # MoE models tolerate CPU offload far better than dense ones
+    # Host RAM Ollama actually took when loading this variant, by placement.
+    measured_host: dict[str, int] = field(default_factory=dict)
 
     @property
     def estimated_size(self) -> int:
@@ -45,6 +47,18 @@ class ModelSpec:
             return self.measured_size
         overhead = int(0.04 * self.file_size) + 384 * 1024 * 1024
         return int(self.file_size + self.kv_bytes_per_token * self.num_ctx + overhead)
+
+    def host_need(self, placement: str) -> int:
+        """Host RAM a load with this placement takes ("gpu" / "offload" / "cpu").
+
+        Until measured, assume the worst for partial offload: with CUDA,
+        llama.cpp has been seen keeping the *entire* model in host memory.
+        """
+        if placement in self.measured_host:
+            return self.measured_host[placement]
+        if placement == "gpu":
+            return int(0.1 * self.file_size)
+        return self.estimated_size
 
 
 def variant_name(tier: str, base: str, num_ctx: int, cpu: bool = False) -> str:
@@ -231,7 +245,7 @@ class Catalog:
         vprof = self.profiles.get(variant)
         if vprof.get("digest") != digest or vprof.get("params") != params:
             await self.ollama.create_variant(variant, base, params)
-            self.profiles.update(variant, digest=digest, params=params, measured_size=None)
+            self.profiles.update(variant, digest=digest, params=params, measured_size=None, measured_host={})
             vprof = self.profiles.get(variant)
 
         return ModelSpec(
@@ -243,6 +257,7 @@ class Catalog:
             params_b=parse_params_b(meta.get("details", {})),
             kv_bytes_per_token=float(prof["kv_bytes_per_token"]),
             measured_size=vprof.get("measured_size"),
+            measured_host=dict(vprof.get("measured_host") or {}),
             cpu_only=cpu,
             moe=bool(prof.get("moe")),
         )
@@ -252,6 +267,12 @@ class Catalog:
         if spec and size and spec.measured_size != size:
             spec.measured_size = size
             self.profiles.update(variant, measured_size=size)
+
+    def record_host(self, variant: str, placement: str, host: int) -> None:
+        spec = self.by_variant(variant)
+        if spec and host > 0:
+            spec.measured_host[placement] = host
+            self.profiles.update(variant, measured_host=dict(spec.measured_host))
 
 
 def _is_embedding(model: dict[str, Any]) -> bool:

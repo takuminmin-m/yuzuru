@@ -58,6 +58,8 @@ class RouterConfig:
 @dataclass
 class ResourceConfig:
     probe: str = "auto"  # auto | nvidia | none
+    # cgroup dir of the Ollama service for true host-RAM usage: auto | none | <path>
+    ollama_cgroup: str = "auto"
     vram_margin_mb: int = 512  # per GPU, never handed to the LLM
     ram_reserve_mb: int = 6144  # kept free for the OS, dataloaders, etc.
 

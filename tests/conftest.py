@@ -23,6 +23,7 @@ class FakeWorld:
     difficulty: str = "medium"
     chat_requests: list[dict] = field(default_factory=list)
     unloads: list[str] = field(default_factory=list)
+    measure_host: bool = True
 
     def add_model(self, name: str, params_b: float, size_gb: float, moe: bool = False) -> None:
         self.installed[name] = {
@@ -58,8 +59,15 @@ class FakeWorld:
             take = min(rest, total - foreign)
             rest -= take
             gpus.append(GPU(i, f"GPU-{i}", f"Fake {i}", total, foreign + take))
-        ram_used = 4 * GB + sum(m["size"] - m["size_vram"] for m in self.loaded.values())
-        return Snapshot(gpus=gpus, ram_total=self.ram_total, ram_available=self.ram_total - ram_used)
+        host = self.ollama_host()
+        return Snapshot(gpus=gpus, ram_total=self.ram_total, ram_available=self.ram_total - 4 * GB - host,
+                        ollama_host=host if self.measure_host else None)
+
+    def ollama_host(self) -> int:
+        # Like llama.cpp on CUDA: partial offload keeps the whole model in host RAM.
+        return sum(
+            m["size"] if m["size_vram"] < m["size"] else int(0.1 * m["size"]) for m in self.loaded.values()
+        )
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path

@@ -70,6 +70,7 @@ async def test_explicit_candidates_win(cfg, world, http):
 
 
 async def test_placement_moe_offloads_dense_does_not(cfg, world, http):
+    world.ram_total = 64 * GB
     catalog, broker, _ = await make(cfg, world, http)
     assert broker.plan(catalog.specs["medium"], True)[0] is Placement.GPU
     assert broker.plan(catalog.specs["large"], True)[0] is Placement.OFFLOAD
@@ -234,3 +235,28 @@ async def test_mcp_tools(cfg, world, http):
             assert st.router.sessions["ses_1"].pinned == "large"
     finally:
         await st.stop()
+
+
+async def test_offload_needs_host_ram_for_whole_model(cfg, world, http):
+    # 32 GB RAM: offloading the 28 GB MoE would need ~28 GB of host RAM -> refuse.
+    catalog, broker, _ = await make(cfg, world, http)
+    assert broker.plan(catalog.specs["large"], True)[0] is Placement.NONE
+    world.ram_total = 64 * GB
+    await broker.refresh()
+    spec = catalog.specs["large"]
+    assert await broker.acquire(spec) is Placement.OFFLOAD
+    await broker.release(spec, touch=False)
+    # The measured host footprint is remembered per placement.
+    assert spec.measured_host["offload"] == world.loaded[spec.variant]["size"]
+    assert broker.ollama_host() == world.ollama_host()
+
+
+async def test_leaked_ollama_memory_is_not_counted_as_freeable(cfg, world, http):
+    world.ram_total = 64 * GB
+    catalog, broker, _ = await make(cfg, world, http)
+    before = broker.budget().slow
+    orig = world.ollama_host
+    world.ollama_host = lambda: orig() + 16 * GB  # held by Ollama with nothing loaded
+    await broker.refresh()
+    assert broker.budget().slow <= before - 15 * GB
+    assert broker.warnings() and "restart" in broker.warnings()[0]
