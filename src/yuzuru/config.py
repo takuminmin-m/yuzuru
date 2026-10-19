@@ -56,6 +56,42 @@ class RouterConfig:
 
 
 @dataclass
+class CloudConfig:
+    """An OpenAI-compatible cloud API used when local models are not enough.
+
+    Any /chat/completions provider works (OpenAI, OpenRouter, Groq, a remote
+    vLLM, ...). The key is read from the environment, never from this file.
+    """
+
+    enabled: bool = False
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    model: str = ""
+    context: int = 200000
+    # When to go to the cloud without being asked:
+    #   off        - only when requested (yuzuru/cloud, @cloud, pin)
+    #   escalation - when a turn needs to escalate past the largest local tier
+    #   hard       - also whenever the router grades a new turn "hard"
+    auto: str = "escalation"
+    # Also use the cloud when the wanted local tier cannot be loaded right now
+    # (e.g. a training job holds the GPU) instead of a smaller local model.
+    when_no_memory: bool = False
+    # Also use the cloud when the prompt exceeds every local tier's context.
+    when_context: bool = True
+    max_requests_per_hour: int = 60
+
+    @property
+    def api_key(self) -> str | None:
+        import os
+
+        return os.environ.get(self.api_key_env) or None
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled and bool(self.model) and self.api_key is not None
+
+
+@dataclass
 class ResourceConfig:
     probe: str = "auto"  # auto | nvidia | none
     # cgroup dir of the Ollama service for true host-RAM usage: auto | none | <path>
@@ -89,6 +125,7 @@ class Config:
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local" / "state" / "yuzuru")
     tiers: list[TierConfig] = field(default_factory=list)
     router: RouterConfig = field(default_factory=RouterConfig)
+    cloud: CloudConfig = field(default_factory=CloudConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
 
@@ -141,6 +178,8 @@ def load_config(path: str | Path | None = None) -> Config:
             kwargs["resources"] = _build(ResourceConfig, value)
         elif key == "lease":
             kwargs["lease"] = _build(LeaseConfig, value)
+        elif key == "cloud":
+            kwargs["cloud"] = _build(CloudConfig, value)
         elif key == "state_dir":
             kwargs["state_dir"] = Path(value).expanduser()
         else:

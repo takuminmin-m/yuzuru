@@ -77,7 +77,9 @@ class MCPServer:
             await st.broker.refresh()
             return format_status(st.broker.status())
 
-        tiers_desc = "auto | " + " | ".join(t.name for t in st.cfg.tiers) + " | an installed model name"
+        tiers_desc = ("auto | " + " | ".join(t.name for t in st.cfg.tiers)
+                      + (" | cloud (paid API, for problems local models cannot solve)" if st.cfg.cloud.usable else "")
+                      + " | an installed model name")
 
         @self.tool("yuzuru_models", "List the local models installed in Ollama, which tier each serves, and whether "
                    "each is enabled.", {})

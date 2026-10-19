@@ -116,6 +116,23 @@ OpenCode からは tier だけでなく、有効なモデルを名前で直接�
 yuzuru が行い、tier の自動切り替えはしない）。モデル自身も MCP の `yuzuru_models` で一覧を見て、
 `yuzuru_model` に名前を渡してセッションを固定できる。
 
+### ローカルで手に負えないときはクラウドへ
+
+`yuzuru.yaml` の `cloud:` に OpenAI 互換 API（OpenAI / OpenRouter / Groq / 別マシンの vLLM など）を設定すると、
+最上位の `cloud` tier として使える。API キーは設定ファイルに書かず、`api_key_env` で指定した環境変数から読む。
+
+| いつクラウドに行くか | 設定 |
+|---|---|
+| 明示したとき: `yuzuru/cloud`、メッセージ内の `@cloud`、`yuzuru_model cloud` | 常に（`enabled` なら） |
+| 最大のローカル tier でもツールエラーが続くとき | `auto: escalation`（既定） |
+| ルーターが新しいターンを "hard" と判定したとき | `auto: hard` |
+| どのローカル tier のコンテキストにも収まらないとき | `when_context: true`（既定） |
+| 学習ジョブが GPU を使っていて、欲しい tier が載らないとき | `when_no_memory: true` |
+
+クラウドに移ったターンは、ツールループの間ずっとクラウドに留まり、次のユーザーターンで改めて判定される。
+自動で使う回数は `max_requests_per_hour` で頭打ちにできる（明示した場合は制限しない）。
+`yuzuru status` に使用回数が出る。
+
 ### 確認
 
 ```bash

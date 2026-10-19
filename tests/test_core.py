@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 import httpx
@@ -345,3 +346,94 @@ async def test_handover_from_hard_reservation_keeps_lease(cfg, world, http, monk
     lease.pid = holder_pid  # the holder is gone by the time the job takes over
     job = await broker.handover(lease.id, pid=os.getpid())
     assert job.id in broker.leases and job.state == "settling"
+
+
+def enable_cloud(cfg, monkeypatch, **kw):
+    from yuzuru.config import CloudConfig
+
+    monkeypatch.setenv("TEST_CLOUD_KEY", "sk-test")
+    cfg.cloud = CloudConfig(enabled=True, base_url="http://cloud/v1", api_key_env="TEST_CLOUD_KEY",
+                            model="frontier-1", **kw)
+    cfg.router = RouterConfig(classifier="heuristic", error_escalation=2)
+
+
+def failing_turn(text="テストを直して", n=2):
+    body = user(text)
+    for _ in range(n):
+        body["messages"] += [{"role": "assistant", "content": ""},
+                             {"role": "tool", "content": "Traceback (most recent call last):\n..."}]
+    return body
+
+
+async def test_cloud_after_escalation_past_largest_tier(cfg, world, http, monkeypatch):
+    enable_cloud(cfg, monkeypatch)
+    _, _, router = await make(cfg, world, http)
+    router.pin("s", "large")
+    await router.route(user("テストを直して"), {"x-yuzuru-session": "s"})
+    router.sessions["s"].pinned = None
+    d = await router.route(failing_turn(), {"x-yuzuru-session": "s"})
+    assert d.cloud and d.model == "frontier-1" and "tool errors" in d.reason
+    # The rest of the turn stays on the cloud.
+    body = failing_turn()
+    body["messages"] += [{"role": "assistant", "content": ""}, {"role": "tool", "content": "ok"}]
+    assert (await router.route(body, {"x-yuzuru-session": "s"})).cloud
+    # A new turn is local again.
+    assert not (await router.route(user("ありがとう"), {"x-yuzuru-session": "s"})).cloud
+
+
+async def test_cloud_auto_off_and_missing_key(cfg, world, http, monkeypatch):
+    enable_cloud(cfg, monkeypatch, auto="off")
+    _, _, router = await make(cfg, world, http)
+    router.pin("s", "large")
+    await router.route(user("x"), {"x-yuzuru-session": "s"})
+    router.sessions["s"].pinned = None
+    d = await router.route(failing_turn("x"), {"x-yuzuru-session": "s"})
+    assert not d.cloud
+    assert (await router.route(user("これは @cloud で"), {})).cloud  # explicit still works
+    monkeypatch.delenv("TEST_CLOUD_KEY")
+    with pytest.raises(RuntimeError):
+        await router.route({**user("x"), "model": "yuzuru/cloud"}, {})
+    assert not (await router.route(user("これは @cloud で"), {})).cloud
+
+
+async def test_cloud_auto_hard_rate_limit_context_and_no_memory(cfg, world, http, monkeypatch):
+    enable_cloud(cfg, monkeypatch, auto="hard", max_requests_per_hour=1, when_no_memory=True)
+    catalog, broker, router = await make(cfg, world, http)
+    assert (await router.route(user("アーキテクチャを設計して"), {})).cloud
+    d = await router.route(user("アーキテクチャを設計して"), {})  # over the hourly limit
+    assert not d.cloud and "limit" in d.reason
+    router.cloud_calls.clear()
+    cfg.cloud.max_requests_per_hour = 100
+    cfg.cloud.auto = "escalation"
+    d = await router.route(user("x" * 200000), {})  # beyond every local context
+    assert d.cloud and "context" in d.reason
+    world.foreign = [8 * GB, 12 * GB]  # training holds every GPU
+    await broker.refresh()
+    catalog.specs["large"].moe = False
+    d = await router.route(user("この関数にテストを書いて"), {})
+    assert d.cloud and "cannot load" in d.reason
+
+
+async def test_server_forwards_cloud_with_key(cfg, world, http, monkeypatch):
+    enable_cloud(cfg, monkeypatch)
+    seen = []
+
+    def cloud_handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "deep answer"}}]})
+
+    st = State(cfg, probe=FakeProbe(world), http=http)
+    st.cloud_http = httpx.AsyncClient(transport=httpx.MockTransport(cloud_handler))
+    app = create_app(cfg, st)
+    await st.start()
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://y") as c:
+            assert "cloud" in [m["id"] for m in (await c.get("/v1/models")).json()["data"]]
+            r = await c.post("/v1/chat/completions", json={**user("hi"), "model": "yuzuru/cloud"})
+            assert r.status_code == 200 and r.headers["x-yuzuru-tier"] == "cloud"
+            assert str(seen[0].url) == "http://cloud/v1/chat/completions"
+            assert seen[0].headers["authorization"] == "Bearer sk-test"
+            assert json.loads(seen[0].content)["model"] == "frontier-1"
+            assert not world.chat_requests  # nothing went to Ollama
+    finally:
+        await st.stop()

@@ -164,6 +164,10 @@ def print_status(s: dict[str, Any]) -> None:
         print(f"  {name:<7} {t['model']:<28} ctx {t['num_ctx']:>6}  {est:>9}  -> {t['placement']}")
     if s.get("classifier"):
         print(f"  router  {s['classifier']}")
+    c = s.get("cloud") or {}
+    if c.get("enabled"):
+        state = "ready" if c["usable"] else "unusable (model or API key missing)"
+        print(f"  cloud   {c['model']:<28} auto={c['auto']}, {c['calls_last_hour']}/{c['limit_per_hour']} calls this hour, {state}")
     print("  (* = estimate until first load)")
     if s["loaded"]:
         print("\nLoaded:")
