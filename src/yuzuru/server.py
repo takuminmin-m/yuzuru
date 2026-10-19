@@ -48,8 +48,16 @@ class State:
         self.tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
-        await self.catalog.refresh()
-        await self.broker.refresh()
+        # Come up even if Ollama (or the GPU driver) is not ready yet, as at boot
+        # when both are services; the loops below keep retrying.
+        try:
+            await self.catalog.refresh()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Ollama not reachable yet (%r); retrying in the background", e)
+        try:
+            await self.broker.refresh()
+        except Exception as e:  # noqa: BLE001
+            log.warning("resource probe failed (%r); retrying in the background", e)
         self.tasks.append(asyncio.create_task(self.broker.monitor()))
         self.tasks.append(asyncio.create_task(self._refresh_catalog()))
         self.tasks.append(asyncio.create_task(self._poll_watches()))
@@ -71,7 +79,7 @@ class State:
     async def _refresh_catalog(self) -> None:
         """Pick up models pulled/removed while running."""
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(60 if self.catalog.specs else 5)
             try:
                 before = {t: s.base for t, s in self.catalog.specs.items()}
                 await self.catalog.refresh()
