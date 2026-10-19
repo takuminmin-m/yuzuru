@@ -57,6 +57,7 @@ class State:
     async def stop(self) -> None:
         for t in self.tasks:
             t.cancel()
+        await self.broker.shutdown()
         await self.http.aclose()
         await self.cloud_http.aclose()
 
