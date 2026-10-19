@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -41,7 +42,8 @@ TRACE_RE = re.compile(r"Traceback \(most recent call last\)|^\s*at .+:\d+|error\
 TOOL_ERROR_RE = re.compile(
     r"Traceback \(most recent call last\)|\b(Error|Exception):|\bFAILED\b|exit code [1-9]|command not found|No such file",
 )
-OVERRIDE_RE = re.compile(r"(?:^|\s)@(small|medium|large|auto)\b", re.I)
+OVERRIDE_RE = re.compile(r"(?:^|\s)@(small|medium|large|cloud|auto)\b", re.I)
+CLOUD = "cloud"  # virtual tier above the largest local one
 
 CLASSIFIER_SYSTEM = """You route requests for a local coding assistant used for machine-learning research.
 Grade how capable a model the assistant's NEXT reply needs.
@@ -69,18 +71,27 @@ class SessionState:
 @dataclass
 class Decision:
     tier: str
-    spec: ModelSpec
+    spec: ModelSpec | None  # None for the cloud
     placement: Placement
     wanted: str
     reason: str
     session: str
     ctx_need: int
+    cloud_model: str | None = None
+
+    @property
+    def cloud(self) -> bool:
+        return self.spec is None
+
+    @property
+    def model(self) -> str:
+        return self.cloud_model or (self.spec.base if self.spec else "")
 
     def headers(self) -> dict[str, str]:
         return {
             "x-yuzuru-tier": self.tier,
-            "x-yuzuru-model": self.spec.base,
-            "x-yuzuru-placement": self.placement.value,
+            "x-yuzuru-model": self.model,
+            "x-yuzuru-placement": "cloud" if self.cloud else self.placement.value,
             "x-yuzuru-reason": self.reason.encode("ascii", "replace").decode()[:200],
         }
 
@@ -119,6 +130,7 @@ class Router:
         self.ollama = ollama
         self.sessions: dict[str, SessionState] = {}
         self.last_session: str | None = None
+        self.cloud_calls: deque[float] = deque()
         self.log_path = cfg.state_dir / "decisions.jsonl"
 
     # ---------------------------------------------------------------- helpers
@@ -143,9 +155,32 @@ class Router:
         system = next((message_text(m) for m in msgs if m.get("role") == "system"), "")
         return "h:" + hashlib.sha1((system[:2000] + "\0" + first_user[:2000]).encode()).hexdigest()[:12]
 
+    # ------------------------------------------------------------------ cloud
+
+    def cloud_ok(self, automatic: bool) -> tuple[bool, str]:
+        c = self.cfg.cloud
+        if not c.enabled or not c.model:
+            return False, "cloud not configured"
+        if c.api_key is None:
+            return False, f"cloud key ${c.api_key_env} not set"
+        cutoff = time.time() - 3600
+        while self.cloud_calls and self.cloud_calls[0] < cutoff:
+            self.cloud_calls.popleft()
+        if automatic and len(self.cloud_calls) >= c.max_requests_per_hour:
+            return False, f"cloud limit {c.max_requests_per_hour}/h reached"
+        return True, ""
+
+    def _cloud(self, reason: str, wanted: str, key: str, ctx_need: int) -> Decision:
+        self.cloud_calls.append(time.time())
+        return Decision(CLOUD, None, Placement.NONE, wanted, reason, key, ctx_need, cloud_model=self.cfg.cloud.model)
+
     def pin(self, session: str, target: str | None) -> None:
-        """Pin a session to a tier or to a specific installed model (None = auto)."""
-        if target is not None and self.cfg.tier(target) is None:
+        """Pin a session to a tier, the cloud, or a specific installed model (None = auto)."""
+        if target == CLOUD:
+            ok, why = self.cloud_ok(automatic=False)
+            if not ok:
+                raise ValueError(why)
+        elif target is not None and self.cfg.tier(target) is None:
             name = self.catalog.resolve(target)
             if name is None:
                 raise ValueError(f"{target!r} is neither a tier nor an installed model")
@@ -215,6 +250,31 @@ class Router:
         max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
         ctx_need = estimate_tokens(body) + min(int(max_tokens), 8192)
 
+        auto = self.cfg.cloud.auto
+        # Explicit cloud: requested, inline @cloud, session pin, or a turn already escalated there.
+        explicit = (
+            "requested" if requested == CLOUD
+            else "inline @cloud" if override and override.group(1).lower() == CLOUD
+            else "session pin" if requested == "auto" and sess.pinned == CLOUD
+            else "continuation" if not new_turn and sess.tier == CLOUD and requested == "auto"
+            else None
+        )
+        if explicit:
+            ok, why = self.cloud_ok(automatic=explicit == "continuation")
+            if not ok:
+                if explicit == "requested":
+                    raise RuntimeError(why)
+                explicit = None
+                reason_prefix = f"{why}; "
+            else:
+                if new_turn:
+                    sess.tier = CLOUD
+                decision = self._cloud(f"{explicit}: cloud", CLOUD, key, ctx_need)
+                self._log(decision, requested, agent, last_user)
+                return decision
+        else:
+            reason_prefix = ""
+
         # A model chosen by name (request or session pin) bypasses tiers entirely.
         direct = None
         if requested not in names and requested != "auto":
@@ -237,30 +297,63 @@ class Router:
             wanted, reason = requested, "requested"
         elif override and override.group(1).lower() in names:
             wanted, reason = override.group(1).lower(), "inline @override"
-        elif sess.pinned:
+        elif sess.pinned and sess.pinned in names:
             wanted, reason = sess.pinned, "session pin"
         elif agent in self.cfg.router.small_agents:
             wanted, reason = names[0], f"agent:{agent}"
         elif new_turn:
             level, reason = await self.classify(last_user, len(msgs))
             wanted = self.level_to_tier(level)
+            if level == len(LEVELS) - 1 and auto == "hard":
+                ok, why = self.cloud_ok(automatic=True)
+                if ok:
+                    sess.tier = CLOUD
+                    decision = self._cloud(f"{reason}; auto=hard: cloud", CLOUD, key, ctx_need)
+                    self._log(decision, requested, agent, last_user)
+                    return decision
+                reason += f"; {why}"
         else:
-            wanted, reason = sess.tier or names[-1], "continuation"
+            wanted, reason = (sess.tier if sess.tier in names else names[-1]), "continuation"
             errors = sum(
                 1 for m in _since_last_user(msgs) if m.get("role") == "tool" and TOOL_ERROR_RE.search(message_text(m))
             )
             if errors >= self.cfg.router.error_escalation and not sess.escalated:
+                sess.escalated = True
                 i = names.index(wanted)
-                if i + 1 < len(names):
+                at_top = self.catalog.nearest_tier(names[i]) == self.catalog.tiers[-1] if self.catalog.tiers else True
+                if i + 1 < len(names) and not at_top:
                     wanted, reason = names[i + 1], f"escalated after {errors} tool errors"
                     escalate = True
-                sess.escalated = True
+                elif auto in ("escalation", "hard"):
+                    ok, why = self.cloud_ok(automatic=True)
+                    if ok:
+                        sess.tier = CLOUD
+                        decision = self._cloud(f"{errors} tool errors at the largest local tier: cloud", CLOUD, key, ctx_need)
+                        self._log(decision, requested, agent, last_user)
+                        return decision
+                    reason += f"; cannot escalate ({why})"
+        reason = reason_prefix + reason
 
-        floor = next((t.name for t in self.cfg.tiers if t.num_ctx >= ctx_need), names[-1])
+        floor = next((t.name for t in self.cfg.tiers if t.num_ctx >= ctx_need), None)
+        if floor is None and self.cfg.cloud.when_context and requested == "auto":
+            ok, why = self.cloud_ok(automatic=True)
+            if ok:
+                decision = self._cloud(f"context needs {ctx_need} tokens, beyond every local tier: cloud",
+                                       wanted, key, ctx_need)
+                self._log(decision, requested, agent, last_user)
+                return decision
+        floor = floor or names[-1]
         if names.index(floor) > names.index(wanted):
             wanted, reason = floor, reason + f"; context needs {ctx_need} tokens"
 
         tier, placement, why = self._fit(wanted, ctx_need)
+        short = placement is Placement.NONE or names.index(tier) < names.index(self.catalog.nearest_tier(wanted) or tier)
+        if short and self.cfg.cloud.when_no_memory and requested == "auto":
+            ok, cwhy = self.cloud_ok(automatic=True)
+            if ok:
+                decision = self._cloud(f"{reason}; {wanted} cannot load now ({why}): cloud", wanted, key, ctx_need)
+                self._log(decision, requested, agent, last_user)
+                return decision
         if new_turn or escalate:
             sess.tier = wanted
         decision = Decision(
@@ -310,8 +403,8 @@ class Router:
             "requested": requested,
             "wanted": d.wanted,
             "tier": d.tier,
-            "model": d.spec.base,
-            "placement": d.placement.value,
+            "model": d.model,
+            "placement": "cloud" if d.cloud else d.placement.value,
             "reason": d.reason,
             "ctx_need": d.ctx_need,
             "text": text[:200],

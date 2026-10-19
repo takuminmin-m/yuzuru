@@ -39,6 +39,7 @@ class State:
         self.catalog = Catalog(cfg, self.ollama)
         self.broker = Broker(cfg, probe or make_probe(cfg.resources.probe, cfg.resources.ollama_cgroup), self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
+        self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
         self.tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
@@ -51,6 +52,7 @@ class State:
         for t in self.tasks:
             t.cancel()
         await self.http.aclose()
+        await self.cloud_http.aclose()
 
     async def _refresh_catalog(self) -> None:
         """Pick up models pulled/removed while running."""
@@ -90,7 +92,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
 
     @app.get("/v1/models", dependencies=guarded)
     async def models() -> dict[str, Any]:
-        ids = ["auto"] + st.catalog.tiers + st.catalog.enabled
+        ids = ["auto"] + st.catalog.tiers + (["cloud"] if cfg.cloud.usable else []) + st.catalog.enabled
         return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "yuzuru"} for i in ids]}
 
     @app.post("/v1/chat/completions", dependencies=guarded)
@@ -103,7 +105,10 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             raise HTTPException(404, str(e)) from e
         except RuntimeError as e:
             raise HTTPException(503, str(e)) from e
+        if decision.cloud:
+            return await forward_cloud(body, decision)
         spec = decision.spec
+        assert spec is not None
         placement = await st.broker.acquire(spec, force=True)
         if placement is not Placement.NONE:
             decision.placement = placement
@@ -145,6 +150,31 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             headers=out_headers,
         )
 
+    async def forward_cloud(body: dict[str, Any], decision: Any) -> Response:
+        c = cfg.cloud
+        body = {**body, "model": c.model}
+        headers = {"authorization": f"Bearer {c.api_key}", "content-type": "application/json"}
+        out_headers = decision.headers()
+        log.info("cloud: %s (%s)", c.model, decision.reason)
+        url = c.base_url.rstrip("/") + "/chat/completions"
+        if body.get("stream"):
+            upstream = await st.cloud_http.send(st.cloud_http.build_request("POST", url, json=body, headers=headers),
+                                                stream=True)
+
+            async def relay():
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
+                finally:
+                    await upstream.aclose()
+
+            return StreamingResponse(relay(), status_code=upstream.status_code,
+                                     media_type=upstream.headers.get("content-type", "text/event-stream"),
+                                     headers=out_headers)
+        upstream = await st.cloud_http.post(url, json=body, headers=headers)
+        return Response(upstream.content, status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type"), headers=out_headers)
+
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"], dependencies=guarded)
     async def passthrough(path: str, request: Request) -> Response:
         upstream = await st.http.request(
@@ -174,7 +204,10 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
     @app.get("/yuzuru/status", dependencies=guarded)
     async def status() -> dict[str, Any]:
         await st.broker.refresh()
-        return st.broker.status() | {"sessions": st.router.sessions_status()}
+        c = cfg.cloud
+        cloud = {"enabled": c.enabled, "usable": c.usable, "model": c.model, "auto": c.auto,
+                 "calls_last_hour": len(st.router.cloud_calls), "limit_per_hour": c.max_requests_per_hour}
+        return st.broker.status() | {"sessions": st.router.sessions_status(), "cloud": cloud}
 
     @app.post("/yuzuru/leases", dependencies=guarded)
     async def create_lease(payload: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +221,30 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             )
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
+        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
+
+    @app.post("/yuzuru/reservations", dependencies=guarded)
+    async def reserve(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            lease = await st.broker.create_reservation(
+                gpus=[str(g) for g in payload.get("gpus") or []],
+                vram=int(payload["vram"]) if payload.get("vram") else None,
+                ttl=float(payload["ttl"]) if payload.get("ttl") else None,
+                label=str(payload.get("label", "reserved")),
+                hard=bool(payload.get("hard", True)),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        return {"id": lease.id, "gpus": lease.gpus, "vram": lease.vram, "hard": lease.hard, "expires": lease.expires}
+
+    @app.post("/yuzuru/leases/{lease_id}/handover", dependencies=guarded)
+    async def handover(lease_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            lease = await st.broker.handover(lease_id, int(payload["pid"]), payload.get("session"))
+        except KeyError as e:
+            raise HTTPException(404, f"no reservation {lease_id}") from e
         return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
 
     @app.get("/yuzuru/leases", dependencies=guarded)
@@ -231,7 +288,10 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         ]}
         d = await st.router.route(body, {"x-yuzuru-session": sid})
         st.router.sessions.pop(sid, None)
-        return {"tier": d.tier, "wanted": d.wanted, "model": d.spec.base, "placement": d.placement.value,
+        if d.cloud:
+            st.router.cloud_calls.pop()  # a dry run is not a cloud call
+        return {"tier": d.tier, "wanted": d.wanted, "model": d.model,
+                "placement": "cloud" if d.cloud else d.placement.value,
                 "reason": d.reason, "ctx_need": d.ctx_need}
 
     @app.post("/yuzuru/sessions/{session}/pin", dependencies=guarded)

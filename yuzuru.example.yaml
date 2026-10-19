@@ -38,3 +38,14 @@ lease:
   settle_timeout: 180
   headroom_mb: 1024    # room for a settled job to grow
   restore_after: true  # reload the previous models when the job ends
+
+cloud:                 # paid API for what local models cannot do (off by default)
+  enabled: false
+  base_url: https://openrouter.ai/api/v1   # any OpenAI-compatible /chat/completions
+  api_key_env: OPENROUTER_API_KEY          # the key itself stays in the environment
+  model: ""            # the provider's model id
+  context: 200000
+  auto: escalation     # off | escalation (past the largest local tier) | hard (every "hard" turn)
+  when_no_memory: false  # use the cloud instead of a smaller local model while the GPU is busy
+  when_context: true   # use the cloud when the prompt exceeds every local context
+  max_requests_per_hour: 60   # cap for automatic use; explicit requests are not capped

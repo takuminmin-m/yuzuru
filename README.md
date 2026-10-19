@@ -64,6 +64,23 @@ yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
 
+### VRAM / GPU を強制的に確保する
+
+ジョブを始める前に「この GPU（この量）は空けておいて」と押さえておける。
+
+```bash
+yuzuru reserve --gpu 1                 # GPU1 の空きを丸ごと確保（LLM は即座に退く）
+yuzuru reserve --gpu 1 --vram 10G --for 2h
+yuzuru reserve --vram 8G --soft        # 予算から差し引くだけ（GPUの種類を問わない）
+yuzuru run --use <id> -- python train.py   # 確保した枠でジョブを実行（そのまま lease に引き継ぐ）
+yuzuru release <id>
+```
+
+既定は **hard**: 小さなホルダープロセスが libcuda（NVIDIA ドライバ同梱。torch 不要）経由で実際に VRAM を
+確保するので、Ollama も他のプロセスもその分を使えない。`run --use` するとホルダーが解放した直後に
+ジョブへ引き継ぐ（間に LLM が割り込まない）。`--soft` は確保量を LLM の予算から引くだけで、NVIDIA 以外でも使える。
+`--for` を過ぎるか、ホルダーが落ちると自動で解放され、元のモデルが戻る。
+
 OpenCode 上では MCP の `yuzuru_train` ツール（バックグラウンド実行 + ログファイル）を使うよう、MCP の
 instructions とツール説明でモデルに指示している（bash ツールはタイムアウトがあるので長い学習に向かない）。
 OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / `accelerate launch` などの bash 実行を
@@ -98,6 +115,23 @@ yuzuru models disable llama3:70b    # 自動割り当て・一覧から外す / 
 OpenCode からは tier だけでなく、有効なモデルを名前で直接選べる（`yuzuru/qwen3:14b`。メモリ管理は同じく
 yuzuru が行い、tier の自動切り替えはしない）。モデル自身も MCP の `yuzuru_models` で一覧を見て、
 `yuzuru_model` に名前を渡してセッションを固定できる。
+
+### ローカルで手に負えないときはクラウドへ
+
+`yuzuru.yaml` の `cloud:` に OpenAI 互換 API（OpenAI / OpenRouter / Groq / 別マシンの vLLM など）を設定すると、
+最上位の `cloud` tier として使える。API キーは設定ファイルに書かず、`api_key_env` で指定した環境変数から読む。
+
+| いつクラウドに行くか | 設定 |
+|---|---|
+| 明示したとき: `yuzuru/cloud`、メッセージ内の `@cloud`、`yuzuru_model cloud` | 常に（`enabled` なら） |
+| 最大のローカル tier でもツールエラーが続くとき | `auto: escalation`（既定） |
+| ルーターが新しいターンを "hard" と判定したとき | `auto: hard` |
+| どのローカル tier のコンテキストにも収まらないとき | `when_context: true`（既定） |
+| 学習ジョブが GPU を使っていて、欲しい tier が載らないとき | `when_no_memory: true` |
+
+クラウドに移ったターンは、ツールループの間ずっとクラウドに留まり、次のユーザーターンで改めて判定される。
+自動で使う回数は `max_requests_per_hour` で頭打ちにできる（明示した場合は制限しない）。
+`yuzuru status` に使用回数が出る。
 
 ### 確認
 
