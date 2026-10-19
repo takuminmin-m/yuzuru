@@ -202,12 +202,14 @@ class Waiter:
             self.suspended_models = []
         argv = [a.format(session=ev.session, message=self.message(ev), cwd=w.cwd or "") for a in self.cfg.resume.command]
         try:
-            proc = subprocess.Popen(
-                argv, cwd=w.cwd or None, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=w.cwd or None, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )
             ev.resumed = True
             log.info("resumed session %s (pid %d)", ev.session, proc.pid)
+            # Reap it when the resumed turn ends, so long-running servers collect no zombies.
+            self._spawn(proc.wait())
         except OSError as e:
             ev.resume_error = str(e)
             log.warning("could not resume session %s: %s", ev.session, e)
