@@ -191,7 +191,7 @@ async def test_managed_ollama_sees_only_allowed_gpus_and_is_restarted(cfg, fake_
     await m.start()
     try:
         first = starts(record)[-1]
-        first.pop("GGML_CUDA_NO_PINNED")  # depends on the kernel (test_pinned_leak)
+        assert first.pop("GGML_CUDA_NO_PINNED") is None
         assert first == {"pid": m.pid, "CUDA_VISIBLE_DEVICES": "GPU-a0d7", "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
                          "OLLAMA_MODELS": str(tmp_path / "models"), "OLLAMA_HOST": f"127.0.0.1:{free_port}",
                          "OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_VULKAN": "0"}

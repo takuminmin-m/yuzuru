@@ -9,8 +9,9 @@ falls back to ordinary memory, and the pages it tried to pin stay allocated,
 owned by no process, until the machine reboots. Restarting Ollama does not
 give them back.
 
-Seen with qwen3.6 (36B MoE) on an 8 GB GPU: 16 GB lost per load. Setting
-GGML_CUDA_NO_PINNED=1 for Ollama keeps llama.cpp from pinning host memory at all.
+Seen with qwen3.6 (36B MoE) on an 8 GB GPU: 16 GB lost per load. The fix is
+a newer kernel; yuzuru only warns and keeps a leaking model from being
+offloaded again.
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ LEAK_THRESHOLD = 1 * GB
 
 def kernel_release() -> str:
     return os.uname().release
+
+
+KERNEL_WARNING = ("Linux {release} leaks pinned host RAM until reboot when llama.cpp offloads part of a "
+                  "large model to the CPU (kernel bug 219427, fixed in 6.12); update the kernel")
 
 
 def kernel_leaks_pins(release: str | None = None) -> bool:
@@ -68,32 +73,19 @@ class LeakRecord:
     def __init__(self, path: Path, release: str | None = None) -> None:
         self.path = path
         self.release = release or kernel_release()
-        # variant -> {"gb": leaked by one load, "pinned": whether llama.cpp could pin host memory}
-        self.variants: dict[str, dict] = {}
+        self.variants: dict[str, float] = {}  # variant -> GB leaked by one load
         try:
             data = json.loads(path.read_text())
             if data.get("kernel") == self.release:
-                self.variants = {str(k): dict(v) for k, v in data.get("variants", {}).items()}
+                self.variants = {str(k): float(v) for k, v in data.get("variants", {}).items()}
         except (OSError, ValueError, AttributeError, TypeError):
             pass
 
     def __contains__(self, variant: str) -> bool:
         return variant in self.variants
 
-    def __bool__(self) -> bool:
-        return bool(self.variants)
-
-    def blocks(self, variant: str, pinned: bool) -> bool:
-        """Whether offloading `variant` would leak again.
-
-        A leak seen while pinning was allowed is cured by turning pinning off;
-        one seen without pinning is not.
-        """
-        seen = self.variants.get(variant)
-        return seen is not None and (pinned or not seen.get("pinned", True))
-
-    def add(self, variant: str, leaked: int, pinned: bool) -> None:
-        self.variants[variant] = {"gb": round(leaked / GB, 1), "pinned": pinned}
+    def add(self, variant: str, leaked: int) -> None:
+        self.variants[variant] = round(leaked / GB, 1)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps({"kernel": self.release, "updated": time.time(),
@@ -105,14 +97,3 @@ class LeakRecord:
 def record_path(state_dir: Path) -> Path:
     return state_dir / "pinned_leaks.json"
 
-
-def avoid_pinned(setting: str, state_dir: Path, release: str | None = None) -> bool:
-    """Whether Ollama should run with GGML_CUDA_NO_PINNED=1.
-
-    auto: on a kernel known to leak, or one where a leak was already seen.
-    """
-    if setting in ("on", "true", "yes"):
-        return False  # pinned memory allowed
-    if setting in ("off", "false", "no"):
-        return True
-    return kernel_leaks_pins(release) or bool(LeakRecord(record_path(state_dir), release))

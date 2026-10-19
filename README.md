@@ -29,6 +29,12 @@ OpenCode から `yuzuru/auto` を選ぶだけで、タスクの難易度と空�
 
 ## セットアップ
 
+> [!WARNING]
+> **Linux 6.11 のカーネルでは使わないこと（6.12 以降に更新する）。** 6.11 には、大きなモデルの一部を CPU に逃がして
+> 読み込むたびに、数 GB〜十数 GB の RAM が再起動するまで失われるバグがある（詳細は「トラブルシューティング」）。
+> `uname -r` で確認できる。6.11 で起動すると yuzuru はログと `yuzuru status` で警告する。カーネルを更新するときは、
+> NVIDIA ドライバも新しいカーネルに対応するものにする（古いドライバはモジュールをビルドできないことがある）
+
 ```bash
 uv tool install -e /home/takumi/Documents/yuzuru   # `yuzuru` コマンドを PATH に
 yuzuru serve                                       # 常駐（systemd 化は下記）
@@ -133,7 +139,6 @@ ollama:
   - GPU を限定したときは `OLLAMA_VULKAN=0` も付ける。Ollama は CUDA とは別に Vulkan でも GPU を探し、
     Vulkan は `CUDA_VISIBLE_DEVICES` を見ないので、除外した GPU が Vulkan のデバイスとして現れて使われてしまうため
     （`ollama.env` に `OLLAMA_VULKAN` を書けばそちらが優先）
-  - Linux 6.11 では `GGML_CUDA_NO_PINNED=1` も付ける（`ollama.cuda_pinned_memory: auto`。下の「RAM が解放されない」）
   - システムの `ollama.service` は 11434 で動いたままでよい（止めるなら `sudo systemctl disable --now ollama`）。
     OpenCode などは yuzuru 経由で使う（11434 を直接使うと、その分は yuzuru から見て他プロセスの使用量になる）
 
@@ -260,12 +265,10 @@ Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を ap
   失敗すると、固定済みのページを解放しないバグがある（[kernel bug 219427](https://bugzilla.kernel.org/show_bug.cgi?id=219427)、
   修正は 6.12）。llama.cpp は通常のメモリで動き続けるが、固定されたページは誰のものでもないまま残り、
   Ollama を止めても戻らない。qwen3.6 では 1 回の読み込みで約 16 GB 失われた
-  - 根本対策はカーネルの更新（6.12 以降。NVIDIA ドライバも新しいカーネルに対応するものへ）。失われた分は再起動でしか戻らない
-  - `ollama.manage: true` なら、6.11 では Ollama を `GGML_CUDA_NO_PINNED=1` 付きで起動して pinned メモリを使わせない
-    （`ollama.cuda_pinned_memory`、既定 `auto`）。システムの `ollama.service` を使う場合は
-    `sudo systemctl edit ollama` で `Environment="GGML_CUDA_NO_PINNED=1"` を足す
-  - それでも読み込みで RAM が失われたら、yuzuru はそのモデルをすぐアンロードし、このカーネルでは CPU に逃がす配置を
-    しない（`~/.local/state/yuzuru/pinned_leaks.json`、カーネルを更新すると無効）。`yuzuru status` にも警告が出る
+  - 対策はカーネルの更新（6.12 以降。NVIDIA ドライバも新しいカーネルに対応するものへ）。失われた分は再起動でしか戻らない
+  - 6.11 のまま使っていて読み込みで RAM が失われたら、yuzuru はそのモデルをすぐアンロードし、このカーネルでは
+    CPU に逃がす配置をしない（`~/.local/state/yuzuru/pinned_leaks.json`、カーネルを更新すると無効）。
+    これで 2 回目以降は防げるが、最初の 1 回分は失われる
 - OpenCode から送られている実際のリクエストを見たいとき: `YUZURU_DUMP=1 yuzuru serve` で、要求モデルごとの最新リクエストを
   `~/.local/state/yuzuru/last_request_<model>.json` に保存する
 

@@ -120,6 +120,14 @@ class FakeProbe(Probe):
         return self.world.snapshot()
 
 
+@pytest.fixture(autouse=True)
+def fixed_kernel(monkeypatch):
+    """Tests must not depend on the kernel they run on (6.11 adds a warning)."""
+    from yuzuru import pinleak
+
+    monkeypatch.setattr(pinleak, "kernel_release", lambda: "7.0.0-test")
+
+
 @pytest.fixture
 def world() -> FakeWorld:
     w = FakeWorld()

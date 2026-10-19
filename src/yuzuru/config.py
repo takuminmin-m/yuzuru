@@ -135,18 +135,10 @@ class OllamaConfig:
     # Extra environment, e.g. OLLAMA_FLASH_ATTENTION: "1" as set for ollama.service.
     env: dict[str, str] = field(default_factory=dict)
     startup_timeout: float = 60.0
-    # Pinned host memory for the CPU part of offloaded models (llama.cpp's default).
-    # Linux 6.11 leaks it until reboot when pinning fails (see pinleak.py), so
-    # auto turns it off (GGML_CUDA_NO_PINNED=1) on such a kernel: auto | on | off.
-    cuda_pinned_memory: str = "auto"
 
     def __post_init__(self) -> None:
         self.models = Path(self.models).expanduser()
         self.env = {str(k): str(v) for k, v in self.env.items()}
-        if isinstance(self.cuda_pinned_memory, bool):  # YAML reads a bare on/off as a boolean
-            self.cuda_pinned_memory = "on" if self.cuda_pinned_memory else "off"
-        if self.cuda_pinned_memory not in ("auto", "on", "off"):
-            raise ValueError(f"ollama.cuda_pinned_memory must be auto, on or off, not {self.cuda_pinned_memory!r}")
         if str(self.port).isdigit():
             self.port = int(self.port)
         elif self.port != "auto":

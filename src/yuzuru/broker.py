@@ -28,7 +28,7 @@ from typing import Any
 from .catalog import Catalog, ModelSpec
 from .config import MB, Config
 from .ollama import LoadedModel, Ollama, OllamaError
-from .pinleak import LEAK_THRESHOLD, LeakRecord, kernel_leaks_pins, record_path
+from .pinleak import KERNEL_WARNING, LEAK_THRESHOLD, LeakRecord, kernel_leaks_pins, record_path
 from .resources import Probe, Snapshot
 
 log = logging.getLogger("yuzuru.broker")
@@ -104,9 +104,8 @@ class Broker:
         self.failed: dict[str, float] = {}  # variant -> time until which it is not offered
         # Variants whose offloaded load leaked pinned host RAM on this kernel (see pinleak.py).
         self.pin_leaks = LeakRecord(record_path(cfg.state_dir))
-        # Whether Ollama's llama.cpp may pin host memory: False only when we know it
-        # runs with GGML_CUDA_NO_PINNED (the managed server tells us).
-        self.pinned: Callable[[], bool | None] = lambda: None
+        if kernel_leaks_pins(self.pin_leaks.release):
+            log.warning(KERNEL_WARNING.format(release=self.pin_leaks.release))
 
     # ------------------------------------------------------------------ state
 
@@ -182,7 +181,7 @@ class Broker:
         return m.size_ram
 
     def leaks_when_offloaded(self, variant: str) -> bool:
-        return self.pin_leaks.blocks(variant, self.pinned() is not False)
+        return variant in self.pin_leaks
 
     # -------------------------------------------------------------- placement
 
@@ -298,8 +297,7 @@ class Broker:
         if before is None or after is None or after - before < LEAK_THRESHOLD:
             return
         leaked = after - before
-        pinned = self.pinned() is not False
-        self.pin_leaks.add(spec.variant, leaked, pinned)
+        self.pin_leaks.add(spec.variant, leaked)
         log.error("loading %s leaked %.1f GB of pinned host RAM (kernel %s; only a reboot frees it); "
                   "unloading it and not offloading it to the CPU again on this kernel",
                   spec.variant, leaked / 2**30, self.pin_leaks.release)
@@ -617,16 +615,14 @@ class Broker:
             "usually brings it back; repeated Xid 79 points at power, PCIe seating or riser issues"
             for g in self.snapshot.lost_gpus
         ]
+        leaky_kernel = kernel_leaks_pins(self.pin_leaks.release)
+        if leaky_kernel:
+            out.append(KERNEL_WARNING.format(release=self.pin_leaks.release))
         unowned = self.snapshot.ram_unowned or 0
         if unowned > LEAK_THRESHOLD:
-            hint = "a kernel with the fix (6.12 or later) prevents it"
-            if self.pinned() is None:  # the system Ollama: we cannot set its environment
-                hint += ("; until then run Ollama with GGML_CUDA_NO_PINNED=1 (ollama.service) "
-                         "or let yuzuru run it (ollama.manage)")
-            what = ("Linux 6.11 leaks them when llama.cpp pins a large host buffer for a model offloaded to the CPU"
-                    if kernel_leaks_pins(self.pin_leaks.release) else "most likely a failed large pin")
+            what = ("the kernel bug above" if leaky_kernel else "most likely a failed large pin")
             out.append(f"{unowned / 2**30:.1f} GB of RAM is held by no process: pinned pages the kernel never "
-                       f"released ({what}). Restarting Ollama does not free it, only a reboot does; {hint}")
+                       f"released ({what}). Restarting Ollama does not free it, only a reboot does")
         # Leaked pins charged to Ollama's cgroup are explained above.
         if (leak := self.ollama_unattributed() - unowned) > 2 * 2**30:
             out.append(

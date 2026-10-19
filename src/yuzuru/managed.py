@@ -26,7 +26,6 @@ from typing import Any
 import httpx
 
 from .config import Config
-from .pinleak import avoid_pinned
 
 log = logging.getLogger("yuzuru.managed")
 
@@ -160,7 +159,6 @@ class ManagedOllama:
         self.restarts = 0
         self.scoped = False
         self.visible: str | None = None
-        self.pinned: bool | None = None  # whether llama.cpp may pin host memory
         self._scope_ok: bool | None = None
         self._stopping = False
         self._task: asyncio.Task | None = None
@@ -221,10 +219,7 @@ class ManagedOllama:
             # a GPU hidden from CUDA shows up there as a separate device and gets used.
             if "OLLAMA_VULKAN" not in self.oc.env:
                 env["OLLAMA_VULKAN"] = "0"
-        if "GGML_CUDA_NO_PINNED" not in env and avoid_pinned(self.oc.cuda_pinned_memory, self.cfg.state_dir):
-            env["GGML_CUDA_NO_PINNED"] = "1"
         self.visible = env.get("CUDA_VISIBLE_DEVICES")
-        self.pinned = "GGML_CUDA_NO_PINNED" not in env
         return env
 
     async def _use_scope(self) -> bool:
@@ -361,5 +356,4 @@ class ManagedOllama:
     def status(self) -> dict[str, Any]:
         return {"managed": True, "url": self.url, "pid": self.pid, "running": self.pid is not None,
                 "restarts": self.restarts, "cuda_visible_devices": self.visible, "own_cgroup": self.scoped,
-                "cuda_pinned_memory": self.pinned,
                 "models": str(self.oc.models)}
