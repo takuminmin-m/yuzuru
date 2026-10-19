@@ -106,10 +106,16 @@ def message_text(msg: dict[str, Any]) -> str:
 
 
 def estimate_tokens(body: dict[str, Any]) -> int:
-    # Conservative: ~3.5 bytes/token for code/English; Japanese is ~3 bytes/char
-    # and ~1 char/token, so bytes/3.5 slightly over-counts it — the safe side.
-    raw = json.dumps(body.get("messages", []), ensure_ascii=False) + json.dumps(body.get("tools", []))
-    return int(len(raw.encode()) / 3.5)
+    """Prompt tokens, slightly on the high side.
+
+    ASCII (English, code, JSON schemas) runs ~4.7 chars/token on Qwen-family
+    tokenizers; counting 4 keeps a margin. CJK and other non-ASCII text is
+    roughly one token per character. Measured against Ollama on a real
+    OpenCode request: 8,883 actual vs 10.4k here (the old bytes/3.5: 11.9k).
+    """
+    raw = json.dumps(body.get("messages", []), ensure_ascii=False) + json.dumps(body.get("tools", []), ensure_ascii=False)
+    non_ascii = sum(1 for ch in raw if ord(ch) > 127)
+    return int((len(raw) - non_ascii) / 4 + non_ascii)
 
 
 def heuristic_level(text: str) -> tuple[int, str]:
