@@ -401,7 +401,12 @@ class Router:
                 p, _ = self.broker.plan(spec, True)
                 if p is not Placement.NONE:
                     return name, p, f"downgraded: {tier} does not fit now"
-        return tier, Placement.NONE, "nothing fits; letting Ollama place it"
+        # Nothing fits the budget: try anyway, but never a model that just failed to load.
+        for name in [tier] + [n for n in reversed(order[:idx])] + order[idx + 1:]:
+            spec = self.catalog.specs.get(name)
+            if spec and not self.broker.is_failed(spec.variant):
+                return name, Placement.NONE, "nothing fits; letting Ollama place it"
+        raise RuntimeError("every local model failed to load recently")
 
     def _log(self, d: Decision, requested: str, agent: str, text: str) -> None:
         rec = {

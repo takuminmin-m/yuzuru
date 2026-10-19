@@ -27,10 +27,17 @@ from typing import Any
 
 from .catalog import Catalog, ModelSpec
 from .config import MB, Config
-from .ollama import LoadedModel, Ollama
+from .ollama import LoadedModel, Ollama, OllamaError
 from .resources import Probe, Snapshot
 
 log = logging.getLogger("yuzuru.broker")
+
+
+class LoadFailed(RuntimeError):
+    """Ollama could not load a model (e.g. CUDA out of memory despite the estimate)."""
+
+
+LOAD_FAILURE_COOLDOWN = 600.0  # seconds a failed variant is not offered again
 
 
 class Placement(str, Enum):
@@ -93,6 +100,7 @@ class Broker:
         self._holders: dict[int, asyncio.subprocess.Process] = {}
         # Called with (lease, exit code or None) whenever a lease ends.
         self.on_lease_end: list[Callable[[Lease, int | None], None]] = []
+        self.failed: dict[str, float] = {}  # variant -> time until which it is not offered
 
     # ------------------------------------------------------------------ state
 
@@ -102,6 +110,13 @@ class Broker:
         for m in self.loaded:
             self.catalog.record_loaded(m.name, m.size)
         self._update_leases()
+
+    def is_failed(self, variant: str) -> bool:
+        until = self.failed.get(variant)
+        if until is not None and time.time() >= until:
+            del self.failed[variant]
+            return False
+        return until is not None
 
     def is_loaded(self, variant: str) -> LoadedModel | None:
         return next((m for m in self.loaded if m.name == variant), None)
@@ -177,6 +192,8 @@ class Broker:
             if spec.cpu_only:
                 return Placement.CPU
             return Placement.GPU if loaded.size_vram >= loaded.size * 0.98 else Placement.OFFLOAD
+        if self.is_failed(spec.variant):
+            return Placement.NONE
         gone = {m.name for m in (evict or [])}
         others = [m for m in self.loaded if m.name not in gone]
         b = self.budget()
@@ -221,6 +238,8 @@ class Broker:
         try:
             if self.is_loaded(spec.variant):
                 return self.place(spec, offload_ok)
+            if self.is_failed(spec.variant):
+                raise LoadFailed(f"{spec.variant} failed to load recently")
             await self.wait_settled()
             async with self.lock:
                 await self.refresh()
@@ -235,7 +254,16 @@ class Broker:
                     log.info("loading %s (%s, ~%.1f GB)", spec.variant, placement.value, spec.estimated_size / 2**30)
                     await self.refresh()
                     host_before = self.snapshot.ollama_host
-                    await self.ollama.load(spec.variant, self.cfg.keep_alive)
+                    try:
+                        await self.ollama.load(spec.variant, self.cfg.keep_alive)
+                    except OllamaError as e:
+                        # Ollama's own placement can disagree with the estimate (another
+                        # process, fragmented VRAM, a GPU it should not use...). Stop
+                        # offering this model for a while so routing falls back.
+                        self.failed[spec.variant] = time.time() + LOAD_FAILURE_COOLDOWN
+                        log.warning("loading %s failed; not offering it for %.0f min: %s",
+                                    spec.variant, LOAD_FAILURE_COOLDOWN / 60, str(e)[:300])
+                        raise LoadFailed(str(e)) from e
                     await self.refresh()
                     if self.is_loaded(spec.variant) and host_before is not None and self.snapshot.ollama_host is not None:
                         actual = self.place(spec, offload_ok)
@@ -527,6 +555,7 @@ class Broker:
                 for name, s in self.catalog.specs.items()
             },
             "classifier": self.catalog.router_spec.variant if self.catalog.router_spec else None,
+            "failed": {v: until for v, until in self.failed.items()},
             "warnings": self.warnings(),
         }
 

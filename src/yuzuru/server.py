@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .broker import Broker, Placement
+from .broker import Broker, LoadFailed, Placement
 from .catalog import Catalog
 from .mcp import MCPServer
 from .config import Config
@@ -137,17 +137,26 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         headers = {k.lower(): v for k, v in request.headers.items()}
         if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
             (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
-        try:
-            decision = await st.router.route(body, headers)
-        except LookupError as e:
-            raise HTTPException(404, str(e)) from e
-        except RuntimeError as e:
-            raise HTTPException(503, str(e)) from e
-        if decision.cloud:
-            return await forward_cloud(body, decision)
-        spec = decision.spec
-        assert spec is not None
-        placement = await st.broker.acquire(spec, force=True)
+        # A load can fail despite the estimate; the failed model is then excluded and
+        # routing runs again, so the request falls back to a model that does load.
+        for _ in range(len(cfg.tiers) + 1):
+            try:
+                decision = await st.router.route(body, headers)
+            except LookupError as e:
+                raise HTTPException(404, str(e)) from e
+            except RuntimeError as e:
+                raise HTTPException(503, str(e)) from e
+            if decision.cloud:
+                return await forward_cloud(body, decision)
+            spec = decision.spec
+            assert spec is not None
+            try:
+                placement = await st.broker.acquire(spec, force=True)
+                break
+            except LoadFailed:
+                continue
+        else:
+            raise HTTPException(503, "no local model could be loaded")
         if placement is not Placement.NONE:
             decision.placement = placement
         body["model"] = spec.variant
