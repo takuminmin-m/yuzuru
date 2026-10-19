@@ -100,7 +100,8 @@ resources:
   gpus: [0]            # index か UUID（GPU-a0d7...）。空 = 全部（既定）
 ollama:
   manage: true         # yuzuru 専用の ollama serve を起動・監視する（下記）
-  # port: 11436
+  # port: auto         # 既定。port_range の空きポートを自動で選ぶ。固定するなら 11437 など
+  # port_range: [11436, 11499]
   # env: {OLLAMA_FLASH_ATTENTION: "1"}   # ollama.service に設定していた環境変数があればここへ
 ```
 
@@ -114,6 +115,12 @@ ollama:
   除外した GPU を hard reserve で埋めても、Ollama はそこに計算バッファを置こうとして OOM する。`manage` を
   有効にすると、yuzuru が自前の `ollama serve` を `CUDA_VISIBLE_DEVICES=<許可した GPU の UUID>` 付きで起動し、
   `ollama_url` をそちらに向ける
+  - ポートは既定で自動選択（`port: auto`）。`port_range`（既定 11436〜11499）の中から、起動時に空いている最初の
+    ポートを使う。手で立てた Ollama や別の yuzuru の管理 Ollama がいても衝突せず、複数同時に動かせる。
+    yuzuru 自身のポート（`port`）と 11434 は選ばない。再起動時は前回のポートが空いていればそのまま使い、
+    埋まっていれば別のポートに移る（yuzuru 内部の接続先も追従する）。実際のポートは `yuzuru status` と
+    `~/.local/state/yuzuru/ollama.json` に出る
+  - `port: 11437` のように固定すると、そのポートが埋まっている間は起動せずに警告を出して待ち、空いたら起動する
   - `OLLAMA_MODELS` は `ollama.models`（既定 `~/.local/share/yuzuru-ollama/models`）。システムのモデル置き場
     （`$OLLAMA_MODELS`、`/usr/share/ollama/.ollama/models`、`~/.ollama/models` の順に探す。`ollama.mirror_from` で指定可、
     `none` で無効）の blob をシンボリックリンクで、manifest をコピーで取り込むので、重みは複製しない。

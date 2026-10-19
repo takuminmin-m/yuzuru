@@ -11,10 +11,13 @@ restarted if it dies and stopped with yuzuru.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import signal
+import socket
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +30,7 @@ from .config import Config
 log = logging.getLogger("yuzuru.managed")
 
 STORE_DIRS = ("manifests", "manifests-v2", "metadata")
+SYSTEM_OLLAMA_PORT = 11434  # never taken by `port: auto`, even while ollama.service is stopped
 
 
 def default_model_store() -> Path | None:
@@ -92,6 +96,46 @@ def _is_ollama_serve(pid: int) -> bool:
     return any(a.endswith(b"ollama") for a in argv) and b"serve" in argv
 
 
+def port_free(host: str, port: int) -> bool:
+    """Whether `ollama serve` could listen on host:port right now."""
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as Go's net.Listen does
+        try:
+            s.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def state_file(cfg: Config) -> Path:
+    return cfg.state_dir / "ollama.json"
+
+
+def running_url(cfg: Config) -> str | None:
+    """URL of the managed server a running yuzuru started (its port may be auto-picked)."""
+    try:
+        info = json.loads(state_file(cfg).read_text())
+    except (OSError, ValueError):
+        return None
+    return info.get("url") if _is_ollama_serve(int(info.get("pid", 0))) else None
+
+
+def _scope_works() -> bool:
+    try:
+        return subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _gone(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state in ("Z", "X")
+
+
 def _kill_group(pid: int, sig: int) -> None:
     try:
         os.killpg(pid, sig)
@@ -103,16 +147,19 @@ def _kill_group(pid: int, sig: int) -> None:
 
 
 class ManagedOllama:
-    def __init__(self, cfg: Config, gpus: Callable[[], list[str]]) -> None:
+    def __init__(self, cfg: Config, gpus: Callable[[], list[str]],
+                 on_url: Callable[[str], None] | None = None) -> None:
         self.cfg = cfg
         self.oc = cfg.ollama
         self.gpus = gpus  # UUIDs of the allowed GPUs (blocking: runs nvidia-smi)
+        self.on_url = on_url  # told where the server listens whenever that changes
         self.proc: asyncio.subprocess.Process | None = None
+        self.port: int | None = None
         self.started_at = 0.0
         self.restarts = 0
         self.scoped = False
         self.visible: str | None = None
-        self._scope_failed = False
+        self._scope_ok: bool | None = None
         self._stopping = False
         self._task: asyncio.Task | None = None
 
@@ -121,8 +168,24 @@ class ManagedOllama:
         return self.proc.pid if self.proc and self.proc.returncode is None else None
 
     @property
+    def url(self) -> str:
+        return f"http://{self.oc.host}:{self.port}" if self.port else self.oc.url
+
+    @property
     def pidfile(self) -> Path:
-        return self.cfg.state_dir / "ollama.pid"
+        return state_file(self.cfg)
+
+    def candidate_ports(self) -> list[int]:
+        if isinstance(self.oc.port, int):
+            return [self.oc.port]
+        lo, hi = self.oc.port_range
+        taken = {self.cfg.port, SYSTEM_OLLAMA_PORT}
+        ports = [p for p in range(lo, hi + 1) if p not in taken]
+        # Keep the previous port across restarts so the URL stays put when possible.
+        return ([self.port] if self.port in ports else []) + ports
+
+    def pick_port(self) -> int | None:
+        return next((p for p in self.candidate_ports() if port_free(self.oc.host, p)), None)
 
     def source(self) -> Path | None:
         if self.oc.mirror_from in ("", "none", "off"):
@@ -141,7 +204,7 @@ class ManagedOllama:
                 log.warning("managed ollama: cannot mirror %s: %r", src, e)
 
     async def env(self) -> dict[str, str]:
-        env = {**os.environ, **self.oc.env, "OLLAMA_HOST": f"{self.oc.host}:{self.oc.port}",
+        env = {**os.environ, **self.oc.env, "OLLAMA_HOST": f"{self.oc.host}:{self.port}",
                "OLLAMA_MODELS": str(self.oc.models)}
         allow = self.cfg.resources.gpus
         if allow:
@@ -155,14 +218,32 @@ class ManagedOllama:
         self.visible = env.get("CUDA_VISIBLE_DEVICES")
         return env
 
-    def _use_scope(self) -> bool:
-        if self.oc.scope == "on":
-            return True
-        return self.oc.scope == "auto" and not self._scope_failed and shutil.which("systemd-run") is not None
+    async def _use_scope(self) -> bool:
+        if self.oc.scope != "auto":
+            return self.oc.scope == "on"
+        if self._scope_ok is None:
+            # No user systemd instance (a container, a bare ssh session): run it without a scope.
+            self._scope_ok = shutil.which("systemd-run") is not None and await asyncio.to_thread(_scope_works)
+            if not self._scope_ok:
+                log.info("managed ollama: systemd-run --user --scope unavailable; measuring its RAM by process")
+        return self._scope_ok
 
-    async def _launch(self) -> None:
+    async def _launch(self) -> bool:
+        """Start the server on a free port; False when there is none."""
+        port = await asyncio.to_thread(self.pick_port)
+        if port is None:
+            ports = self.candidate_ports()
+            what = f"port {ports[0]} is" if len(ports) == 1 else f"ports {self.oc.port_range[0]}-{self.oc.port_range[1]} are"
+            log.warning("managed ollama: %s in use; set ollama.port (or port_range) to free ones", what)
+            self.proc = None
+            return False
+        if port != self.port:
+            self.port = port
+            self.cfg.ollama_url = self.url
+            if self.on_url:
+                self.on_url(self.url)
         argv = [self.oc.binary, "serve"]
-        self.scoped = self._use_scope()
+        self.scoped = await self._use_scope()
         if self.scoped:
             # Runs the command in place (same pid) inside a transient scope = its own cgroup.
             unit = f"yuzuru-ollama-{os.getpid()}-{self.restarts}"
@@ -175,9 +256,10 @@ class ManagedOllama:
                 start_new_session=True,
             )
         self.started_at = time.time()
-        self.pidfile.write_text(str(self.proc.pid))
-        log.info("managed ollama: pid %d on %s, CUDA_VISIBLE_DEVICES=%s%s", self.proc.pid, self.oc.url,
+        self.pidfile.write_text(json.dumps({"pid": self.proc.pid, "url": self.url}))
+        log.info("managed ollama: pid %d on %s, CUDA_VISIBLE_DEVICES=%s%s", self.proc.pid, self.url,
                  self.visible or "(all)", " (own scope)" if self.scoped else "")
+        return True
 
     async def _ready(self) -> bool:
         deadline = time.time() + self.oc.startup_timeout
@@ -186,7 +268,7 @@ class ManagedOllama:
                 if self.proc is None or self.proc.returncode is not None:
                     return False
                 try:
-                    if (await c.get(self.oc.url + "/api/version")).status_code == 200:
+                    if (await c.get(self.url + "/api/version")).status_code == 200:
                         return True
                 except httpx.HTTPError:
                     pass
@@ -196,15 +278,15 @@ class ManagedOllama:
     def _kill_stale(self) -> None:
         """An instance left behind by a yuzuru that was killed would hold the port."""
         try:
-            pid = int(self.pidfile.read_text())
-        except (OSError, ValueError):
+            pid = int(json.loads(self.pidfile.read_text())["pid"])
+        except (OSError, ValueError, KeyError, TypeError):
             return
         if not _is_ollama_serve(pid):
             return
         log.warning("managed ollama: stopping stale pid %d", pid)
         _kill_group(pid, signal.SIGTERM)
         for _ in range(100):
-            if not Path(f"/proc/{pid}").exists() or not _is_ollama_serve(pid):
+            if _gone(pid):  # only then is its port closed (cmdline empties earlier)
                 return
             time.sleep(0.1)
         _kill_group(pid, signal.SIGKILL)
@@ -213,33 +295,34 @@ class ManagedOllama:
         self._stopping = False
         await asyncio.to_thread(self._kill_stale)
         await asyncio.to_thread(self.sync)
-        await self._launch()
-        if not await self._ready() and self.scoped and self.proc and self.proc.returncode is not None:
-            # No user systemd instance (e.g. a container): run it without a scope.
-            log.warning("managed ollama: systemd-run --scope failed (rc %s); starting without it",
-                        self.proc.returncode)
-            self._scope_failed = True
-            await self._launch()
-            await self._ready()
-        if self.proc and self.proc.returncode is not None:
-            log.warning("managed ollama exited with %s at startup; see %s", self.proc.returncode,
-                        self.cfg.state_dir / "ollama.log")
+        for _ in range(3):
+            if not await self._launch() or await self._ready():
+                break
+            if self.proc is None or self.proc.returncode is None:
+                break  # still starting (slow disk): the supervisor keeps watching it
+            # Most likely another server took the port between the check and the bind
+            # (two yuzurus starting at once); `auto` then moves on to the next one.
+            log.warning("managed ollama exited with %s at startup on port %s; see %s", self.proc.returncode,
+                        self.port, self.cfg.state_dir / "ollama.log")
+            if isinstance(self.oc.port, int):
+                break
         self._task = asyncio.create_task(self._supervise())
 
     async def _supervise(self) -> None:
         backoff = 1.0
         while not self._stopping:
-            assert self.proc is not None
-            try:
-                rc = await asyncio.wait_for(self.proc.wait(), 60)
-            except asyncio.TimeoutError:
-                await asyncio.to_thread(self.sync)  # pick up models pulled for the system Ollama
-                continue
-            if self._stopping:
-                return
-            if time.time() - self.started_at > 60:
-                backoff = 1.0
-            log.warning("managed ollama exited with %s; restarting in %.0fs", rc, backoff)
+            if self.proc is not None and self.proc.returncode is None:
+                try:
+                    rc = await asyncio.wait_for(self.proc.wait(), 60)
+                except asyncio.TimeoutError:
+                    await asyncio.to_thread(self.sync)  # pick up models pulled for the system Ollama
+                    continue
+                if self._stopping:
+                    return
+                if time.time() - self.started_at > 60:
+                    backoff = 1.0
+                log.warning("managed ollama exited with %s; restarting in %.0fs", rc, backoff)
+            # else: not started (no free port, or it died at startup): retry the same way.
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
             if self._stopping:
@@ -267,6 +350,6 @@ class ManagedOllama:
         self.pidfile.unlink(missing_ok=True)
 
     def status(self) -> dict[str, Any]:
-        return {"managed": True, "url": self.oc.url, "pid": self.pid, "running": self.pid is not None,
+        return {"managed": True, "url": self.url, "pid": self.pid, "running": self.pid is not None,
                 "restarts": self.restarts, "cuda_visible_devices": self.visible, "own_cgroup": self.scoped,
                 "models": str(self.oc.models)}

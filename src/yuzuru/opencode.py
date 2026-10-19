@@ -20,8 +20,11 @@ def installed_models(cfg: Config) -> list[str]:
     """Enabled, non-embedding models from Ollama, so they can be picked by name in OpenCode."""
     from .catalog import Selection, _is_embedding
 
+    from .managed import running_url
+
+    url = (cfg.ollama.manage and running_url(cfg)) or cfg.ollama_url
     try:
-        tags = httpx.get(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=10).json().get("models", [])
+        tags = httpx.get(url.rstrip("/") + "/api/tags", timeout=10).json().get("models", [])
     except (httpx.HTTPError, ValueError):
         return []
     disabled = Selection(cfg.state_dir / "selection.json").disabled
