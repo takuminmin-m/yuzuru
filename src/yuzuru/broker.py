@@ -412,6 +412,13 @@ class Broker:
         self._holders[proc.pid] = proc
         return proc.pid
 
+    async def shutdown(self) -> None:
+        """Free hard reservations: holders run in their own session and would
+        otherwise keep the VRAM after the server is gone, with nothing tracking them."""
+        for pid in list(self._holders):
+            await self._stop_holder(pid)
+        self.leases = {k: l for k, l in self.leases.items() if not l.hard}
+
     async def _stop_holder(self, pid: int) -> None:
         proc = self._holders.pop(pid, None)
         if proc is None:
