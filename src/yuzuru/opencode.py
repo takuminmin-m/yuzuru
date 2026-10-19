@@ -77,7 +77,9 @@ def add_mcp(conf: dict[str, Any], entry: dict[str, Any], major: int | None) -> N
     """OpenCode 2.x nests servers under mcp.servers; 1.x puts them directly under mcp."""
     mcp = conf.setdefault("mcp", {})
     if major is None or major >= 2:
-        mcp.setdefault("servers", {})["yuzuru"] = entry
+        # 2.x hides MCP tools behind a JavaScript "Code Mode" tool by default, which
+        # small local models rarely manage to drive; expose them as plain tools.
+        mcp.setdefault("servers", {})["yuzuru"] = {**entry, "codemode": False}
     else:
         mcp["yuzuru"] = {**entry, "enabled": True}
 
@@ -97,7 +99,7 @@ def plugin_source() -> str:
     return resources.files("yuzuru").joinpath("opencode/yuzuru.ts").read_text()
 
 
-def install(cfg: Config, project: Path | None, set_default: bool) -> list[str]:
+def install(cfg: Config, project: Path | None, set_default: bool, local_only: bool = False) -> list[str]:
     """Write provider + MCP config (and the plugin for OpenCode 1.x). Returns what changed."""
     if project:
         plugin_dir, config_file = project / ".opencode" / "plugins", project / "opencode.json"
@@ -132,6 +134,12 @@ def install(cfg: Config, project: Path | None, set_default: bool) -> list[str]:
         conf["model"] = "yuzuru/auto"
     if set_default or "small_model" not in conf:
         conf["small_model"] = f"yuzuru/{cfg.tiers[0].name}"
+    if local_only:
+        # If yuzuru is unreachable, OpenCode otherwise falls back to its own free
+        # cloud models, sending the code there. Turn that provider off.
+        disabled = conf.setdefault("disabled_providers", [])
+        if "opencode" not in disabled:
+            disabled.append("opencode")
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n")
     changed.append(str(config_file))
@@ -150,5 +158,6 @@ def cmd_opencode(args: argparse.Namespace, cfg: Config) -> None:
         print(json.dumps(snippet, indent=2))
         print("\n# OpenCode 1.x only: `yuzuru opencode --install` also adds plugins/yuzuru.ts")
         return
-    for path in install(cfg, Path(args.project).resolve() if args.project else None, args.set_default):
+    for path in install(cfg, Path(args.project).resolve() if args.project else None, args.set_default,
+                        args.local_only):
         print(f"wrote {path}" if not path.startswith("removed") else path)

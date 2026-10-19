@@ -11,7 +11,7 @@ tiers:                 # smallest first
   - name: small
     models: []         # empty = auto: largest installed model under auto_params_max_b
     auto_params_max_b: 6
-    num_ctx: 16384
+    num_ctx: 32768     # coding agents send ~20k tokens of system prompt + tools
   - name: medium
     models: []         # or e.g. ["qwen3:14b", "gemma3:12b"] in preference order
     auto_params_max_b: 20

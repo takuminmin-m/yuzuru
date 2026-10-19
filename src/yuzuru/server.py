@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import logging
 import secrets
 import uuid
@@ -17,6 +19,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .broker import Broker, Placement
 from .catalog import Catalog
@@ -99,6 +102,28 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
 
     guarded = [Depends(auth)]
 
+    local_hosts = {"127.0.0.1", "localhost", "::1", cfg.host}
+
+    @app.middleware("http")
+    async def same_machine_clients_only(request: Request, call_next: Any) -> Response:
+        """Keep web pages out: yuzuru can start processes (MCP train tool, leases).
+
+        - Browsers attach Origin to cross-site requests; agent/CLI clients do not.
+        - A Host other than ours means DNS rebinding (unless a token guards the API).
+        - JSON-only POST bodies force a CORS preflight, which is never granted.
+        """
+        origin = request.headers.get("origin")
+        if origin and origin not in cfg.allowed_origins:
+            return JSONResponse({"error": "cross-origin requests are not allowed"}, status_code=403)
+        host = request.headers.get("host", "")
+        hostname = host[1:].split("]")[0] if host.startswith("[") else host.rsplit(":", 1)[0]
+        if not cfg.token and hostname not in local_hosts:
+            return JSONResponse({"error": f"unexpected Host {host!r}"}, status_code=403)
+        if request.method in ("POST", "PUT", "PATCH") and request.headers.get("content-length", "0") != "0":
+            if "application/json" not in request.headers.get("content-type", ""):
+                return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
+        return await call_next(request)
+
     # ------------------------------------------------------------- OpenAI API
 
     @app.get("/v1/models", dependencies=guarded)
@@ -110,6 +135,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
     async def chat(request: Request) -> Response:
         body = await request.json()
         headers = {k.lower(): v for k, v in request.headers.items()}
+        if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
+            (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
         try:
             decision = await st.router.route(body, headers)
         except LookupError as e:
@@ -134,20 +161,31 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             except BaseException:
                 await st.broker.release(spec)
                 raise
+            done = False
+
+            async def finish() -> None:
+                # Runs from the stream's finally and as the response's background
+                # task, so a client that disconnects before the first chunk (the
+                # generator never starts) still frees the model.
+                nonlocal done
+                if not done:
+                    done = True
+                    await upstream.aclose()
+                    await st.broker.release(spec)
 
             async def relay():
                 try:
                     async for chunk in upstream.aiter_bytes():
                         yield chunk
                 finally:
-                    await upstream.aclose()
-                    await st.broker.release(spec)
+                    await finish()
 
             return StreamingResponse(
                 relay(),
                 status_code=upstream.status_code,
                 media_type=upstream.headers.get("content-type", "text/event-stream"),
                 headers=out_headers,
+                background=BackgroundTask(finish),
             )
 
         try:

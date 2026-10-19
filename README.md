@@ -41,6 +41,10 @@ yuzuru opencode --install                          # ~/.config/opencode にプ�
   `--set-default` で上書き）。MCP の書式は OpenCode のバージョン（1.x: `mcp.<name>`、2.x: `mcp.servers.<name>`）に合わせる
 - OpenCode 1.x のときだけ `plugins/yuzuru.ts`（依存なし）を置く。2.x はプロバイダへ `x-opencode-session` を
   自前で送るのでプラグイン不要（2.x のプラグインAPIにはツール実行フックが無いため、学習コマンドの自動ラップは 1.x のみ）
+- OpenCode 2.x では MCP サーバーに `codemode: false` を付ける。2.x の既定では MCP ツールが JavaScript を書いて呼ぶ
+  `execute` ツールの奥に隠れ、ローカルの小さなモデルではまず呼べないため
+- `--local-only` を付けると OpenCode 組み込みの無料クラウドモデル（`opencode` プロバイダ）を無効にする。yuzuru が
+  落ちているとき、OpenCode はそれらに黙って切り替えてコードを外部に送ってしまうので、ローカル専用で使うなら推奨
 - プロジェクト単位にしたい場合は `--project <dir>`
 
 小さいモデルも入れておくと、ルーターがそれで難易度を判定し、軽い作業はそちらに回す:
@@ -191,8 +195,20 @@ OpenCode v2 は「バックグラウンドサーバー + クライアント」�
 3. **手元の OpenCode から yuzuru だけを使う**（`ssh -L 11435:127.0.0.1:11435`）— LLM の推論は GPU マシンで
    行われるが、bash やファイル操作は手元で実行されるので、学習ジョブを GPU マシンで動かす用途には向かない。
 
+yuzuru はジョブを起動できる（MCP の `train` ツールや lease）ので、Webページから叩かれないようにしている。
+`Origin` ヘッダー付きのリクエスト（ブラウザ）は拒否する（許可するなら `allowed_origins`）。トークン未設定時は
+`Host` が localhost 以外のリクエストも拒否する（DNS rebinding 対策）。POST の本文は `application/json` のみ受け付ける。
 yuzuru 自体は既定で `127.0.0.1` にしか bind しない。外部に公開する場合は `YUZURU_TOKEN` を設定すると
 Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を apiKey として送る）。
+
+## トラブルシューティング
+
+- `yuzuru status` の先頭に `!` 付きの警告が出る:
+  - **GPU が応答しない**（カーネルログに `Xid 79, GPU has fallen off the bus`）: yuzuru は残りの GPU だけで動き続ける。
+    再起動か `sudo nvidia-smi -r` で戻ることが多い。繰り返す場合は電源容量・PCIe の挿さり・ライザーを疑う
+  - **Ollama がモデルに対応しない RAM を抱えている**: 強制終了されたランナーの分が残ることがある。`sudo systemctl restart ollama`
+- OpenCode から送られている実際のリクエストを見たいとき: `YUZURU_DUMP=1 yuzuru serve` で、要求モデルごとの最新リクエストを
+  `~/.local/state/yuzuru/last_request_<model>.json` に保存する
 
 ## 開発
 

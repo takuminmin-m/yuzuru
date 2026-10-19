@@ -124,6 +124,9 @@ class ResumeConfig:
     command: list[str] = field(default_factory=lambda: ["opencode", "run", "--session", "{session}", "{message}"])
     # While waiting, unload every model (CPU classifier and RAM-offloaded ones too).
     suspend_all: bool = True
+    # Unload only once the waiting session has been quiet this long: right after
+    # starting a job the agent still sends one more request to wrap up its turn.
+    suspend_idle_seconds: float = 20.0
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40
@@ -136,6 +139,9 @@ class Config:
     port: int = 11435
     # Bearer token required from clients when set (use when not on localhost).
     token: str | None = None
+    # Browser origins allowed to call yuzuru. Empty: any request carrying an Origin
+    # header is refused, so a web page cannot drive the API (it can start jobs).
+    allowed_origins: list[str] = field(default_factory=list)
     keep_alive: str = "30m"
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local" / "state" / "yuzuru")
     tiers: list[TierConfig] = field(default_factory=list)
@@ -162,7 +168,8 @@ class Config:
 
 def default_tiers() -> list[TierConfig]:
     return [
-        TierConfig("small", num_ctx=16384, auto_params_max_b=6, allow_cpu_offload=True, max_cpu_fraction=1.0),
+        # 32k everywhere: a coding agent's system prompt + tool schemas alone is ~20k tokens.
+        TierConfig("small", num_ctx=32768, auto_params_max_b=6, allow_cpu_offload=True, max_cpu_fraction=1.0),
         TierConfig("medium", num_ctx=32768, auto_params_max_b=20),
         TierConfig("large", num_ctx=32768, auto_params_max_b=None),
     ]
