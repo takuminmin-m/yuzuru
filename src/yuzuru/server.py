@@ -19,7 +19,6 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
 
 from .broker import Broker, LoadFailed, Placement
 from .catalog import Catalog
@@ -31,6 +30,8 @@ from .router import Router
 from .waits import Waiter
 
 log = logging.getLogger("yuzuru.server")
+
+KEEPALIVE_SECONDS = 10.0  # SSE comment interval while waiting for the first token
 
 HOP_HEADERS = {"content-length", "transfer-encoding", "connection", "content-encoding"}
 
@@ -131,14 +132,12 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         ids = ["auto"] + st.catalog.tiers + (["cloud"] if cfg.cloud.usable else []) + st.catalog.enabled
         return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "yuzuru"} for i in ids]}
 
-    @app.post("/v1/chat/completions", dependencies=guarded)
-    async def chat(request: Request) -> Response:
-        body = await request.json()
-        headers = {k.lower(): v for k, v in request.headers.items()}
-        if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
-            (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
-        # A load can fail despite the estimate; the failed model is then excluded and
-        # routing runs again, so the request falls back to a model that does load.
+    async def pick(body: dict[str, Any], headers: dict[str, str]) -> tuple[Any, Placement]:
+        """Route and load the model (none for the cloud). Raises HTTPException.
+
+        A load can fail despite the estimate; the failed model is then excluded and
+        routing runs again, so the request falls back to a model that does load.
+        """
         for _ in range(len(cfg.tiers) + 1):
             try:
                 decision = await st.router.route(body, headers)
@@ -147,91 +146,118 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             except RuntimeError as e:
                 raise HTTPException(503, str(e)) from e
             if decision.cloud:
-                return await forward_cloud(body, decision)
-            spec = decision.spec
-            assert spec is not None
+                return decision, Placement.NONE
+            assert decision.spec is not None
             try:
-                placement = await st.broker.acquire(spec, force=True)
-                break
+                placement = await st.broker.acquire(decision.spec, force=True)
             except LoadFailed:
                 continue
-        else:
-            raise HTTPException(503, "no local model could be loaded")
-        if placement is not Placement.NONE:
-            decision.placement = placement
-        body["model"] = spec.variant
-        out_headers = decision.headers()
+            if placement is not Placement.NONE:
+                decision.placement = placement
+            return decision, placement
+        raise HTTPException(503, "no local model could be loaded")
 
+    @app.post("/v1/chat/completions", dependencies=guarded)
+    async def chat(request: Request) -> Response:
+        body = await request.json()
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
+            (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
         if body.get("stream"):
-            try:
-                upstream = await st.http.send(
-                    st.http.build_request("POST", "/v1/chat/completions", json=body), stream=True
-                )
-            except BaseException:
-                await st.broker.release(spec)
-                raise
-            done = False
+            return StreamingResponse(stream_chat(body, headers), media_type="text/event-stream",
+                                     headers={"cache-control": "no-cache"})
 
-            async def finish() -> None:
-                # Runs from the stream's finally and as the response's background
-                # task, so a client that disconnects before the first chunk (the
-                # generator never starts) still frees the model.
-                nonlocal done
-                if not done:
-                    done = True
-                    await upstream.aclose()
-                    await st.broker.release(spec)
-
-            async def relay():
-                try:
-                    async for chunk in upstream.aiter_bytes():
-                        yield chunk
-                finally:
-                    await finish()
-
-            return StreamingResponse(
-                relay(),
-                status_code=upstream.status_code,
-                media_type=upstream.headers.get("content-type", "text/event-stream"),
-                headers=out_headers,
-                background=BackgroundTask(finish),
-            )
-
+        decision, _ = await pick(body, headers)
+        if decision.cloud:
+            return await forward_cloud(body, decision)
+        spec = decision.spec
         try:
-            upstream = await st.http.post("/v1/chat/completions", json=body)
+            upstream = await st.http.post("/v1/chat/completions", json={**body, "model": spec.variant})
         finally:
             await st.broker.release(spec)
         return Response(
             upstream.content,
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type"),
-            headers=out_headers,
+            headers=decision.headers(),
         )
 
-    async def forward_cloud(body: dict[str, Any], decision: Any) -> Response:
-        c = cfg.cloud
-        body = {**body, "model": c.model}
-        headers = {"authorization": f"Bearer {c.api_key}", "content-type": "application/json"}
-        out_headers = decision.headers()
-        log.info("cloud: %s (%s)", c.model, decision.reason)
-        url = c.base_url.rstrip("/") + "/chat/completions"
-        if body.get("stream"):
-            upstream = await st.cloud_http.send(st.cloud_http.build_request("POST", url, json=body, headers=headers),
-                                                stream=True)
+    def sse_error(message: str) -> bytes:
+        return b"data: " + json.dumps({"error": {"message": message, "type": "server_error"}}).encode() + b"\n\n"
 
-            async def relay():
-                try:
-                    async for chunk in upstream.aiter_bytes():
-                        yield chunk
-                finally:
+    async def stream_chat(body: dict[str, Any], headers: dict[str, str]):
+        """Stream a completion, sending headers at once.
+
+        Loading a model or processing a long prompt partly on CPU can take minutes
+        before the first token, and clients (OpenCode) give up when the response
+        headers take that long. So headers go out immediately, SSE comments keep the
+        connection alive meanwhile, and errors arrive as an SSE error event.
+        """
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def produce() -> None:
+            spec = None
+            upstream = None
+            try:
+                decision, _ = await pick(body, headers)
+                await queue.put(f": yuzuru {decision.tier} ({decision.reason})\n\n".encode())
+                if decision.cloud:
+                    c = cfg.cloud
+                    log.info("cloud: %s (%s)", c.model, decision.reason)
+                    req = st.cloud_http.build_request(
+                        "POST", c.base_url.rstrip("/") + "/chat/completions", json={**body, "model": c.model},
+                        headers={"authorization": f"Bearer {c.api_key}"},
+                    )
+                    upstream = await st.cloud_http.send(req, stream=True)
+                else:
+                    spec = decision.spec
+                    req = st.http.build_request("POST", "/v1/chat/completions", json={**body, "model": spec.variant})
+                    upstream = await st.http.send(req, stream=True)
+                if upstream.status_code >= 400:
+                    text = (await upstream.aread()).decode(errors="replace")
+                    await queue.put(sse_error(f"upstream returned {upstream.status_code}: {text[:500]}"))
+                    return
+                async for chunk in upstream.aiter_bytes():
+                    await queue.put(chunk)
+            except HTTPException as e:
+                await queue.put(sse_error(str(e.detail)))
+            except Exception as e:  # noqa: BLE001 - report to the client instead of dropping the stream
+                log.warning("stream failed: %r", e)
+                await queue.put(sse_error(f"yuzuru: {e!r}"))
+            finally:
+                if upstream is not None:
                     await upstream.aclose()
+                if spec is not None:
+                    await st.broker.release(spec)
+                await queue.put(None)
 
-            return StreamingResponse(relay(), status_code=upstream.status_code,
-                                     media_type=upstream.headers.get("content-type", "text/event-stream"),
-                                     headers=out_headers)
-        upstream = await st.cloud_http.post(url, json=body, headers=headers)
+        task = asyncio.create_task(produce())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), KEEPALIVE_SECONDS)
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+                if item is None:
+                    break
+                yield item
+        finally:
+            if not task.done():  # client went away: stop generating and free the model
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def forward_cloud(body: dict[str, Any], decision: Any) -> Response:
+        """Non-streaming cloud call (streaming ones go through stream_chat)."""
+        c = cfg.cloud
+        log.info("cloud: %s (%s)", c.model, decision.reason)
+        upstream = await st.cloud_http.post(
+            c.base_url.rstrip("/") + "/chat/completions", json={**body, "model": c.model},
+            headers={"authorization": f"Bearer {c.api_key}"},
+        )
         return Response(upstream.content, status_code=upstream.status_code,
-                        media_type=upstream.headers.get("content-type"), headers=out_headers)
+                        media_type=upstream.headers.get("content-type"), headers=decision.headers())
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"], dependencies=guarded)
     async def passthrough(path: str, request: Request) -> Response:
