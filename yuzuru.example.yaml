@@ -1,0 +1,40 @@
+# yuzuru config. Copy to ./yuzuru.yaml or ~/.config/yuzuru/config.yaml.
+# Every key is optional; with no file at all, tiers are filled from the models
+# installed in Ollama and memory budgets come from what the machine reports.
+
+ollama_url: http://127.0.0.1:11434
+host: 127.0.0.1        # keep on localhost; use an SSH tunnel for remote access
+port: 11435
+keep_alive: 30m        # how long an idle model stays loaded
+
+tiers:                 # smallest first
+  - name: small
+    models: []         # empty = auto: largest installed model under auto_params_max_b
+    auto_params_max_b: 6
+    num_ctx: 16384
+  - name: medium
+    models: []         # or e.g. ["qwen3:14b", "gemma3:12b"] in preference order
+    auto_params_max_b: 20
+    num_ctx: 32768
+  - name: large
+    models: []
+    num_ctx: 32768
+    allow_cpu_offload: true
+    # max_cpu_fraction: 0.5   # default: 0.7 for MoE, 0.25 for dense
+
+router:
+  classifier: llm      # llm (small model grades difficulty) | heuristic
+  classifier_on_cpu: true
+  prefer_loaded: true  # reuse a resident bigger model instead of swapping
+  error_escalation: 3  # failing tool results in one turn before going up a tier
+
+resources:
+  probe: auto          # auto | nvidia | none (CPU / unified memory)
+  vram_margin_mb: 512  # per GPU
+  ram_reserve_mb: 6144
+
+lease:
+  settle_seconds: 15   # job's VRAM use must be stable this long
+  settle_timeout: 180
+  headroom_mb: 1024    # room for a settled job to grow
+  restore_after: true  # reload the previous models when the job ends

@@ -1,0 +1,177 @@
+"""Minimal MCP server (Streamable HTTP, JSON responses only) exposing yuzuru tools.
+
+Works with any MCP client; OpenCode picks it up from the `mcp` section that
+`yuzuru opencode --install` writes. Tool results are plain text.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import sys
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse
+
+from . import __version__
+
+log = logging.getLogger("yuzuru.mcp")
+
+PROTOCOL_VERSION = "2025-06-18"
+
+INSTRUCTIONS = (
+    "yuzuru serves this assistant from local models sized to the free GPU memory. "
+    "Call yuzuru_model with 'large' when a task needs deeper reasoning than the current model gives. "
+    "Start GPU training / fine-tuning with yuzuru_train rather than bash: it moves the LLM out of VRAM first "
+    "and runs the job in the background with a log file."
+)
+
+Handler = Callable[[dict[str, Any], dict[str, str]], Awaitable[str]]
+
+
+def gb(n: float) -> str:
+    return f"{n / 2**30:.1f} GB"
+
+
+def format_status(s: dict[str, Any]) -> str:
+    lines = [f"GPU{g['index']} {g['name']}: {gb(g['used'])} / {gb(g['total'])} used" for g in s["gpus"]]
+    lines.append(f"RAM: {gb(s['ram']['available'])} free of {gb(s['ram']['total'])}")
+    b = s["budget"]
+    lines.append(f"LLM budget: {gb(b['fast'])} (unified memory)" if b["unified"] else
+                 f"LLM budget: GPU {gb(b['fast'])} + RAM {gb(b['slow'])}")
+    lines.append("Tiers (placement if loaded now):")
+    for name, t in s["tiers"].items():
+        lines.append(f"  {name}: {t['model']}, ctx {t['num_ctx']}, ~{gb(t['estimated_size'])} -> {t['placement']}")
+    if s["loaded"]:
+        lines.append("Loaded: " + ", ".join(f"{m['name']} ({gb(m['size_vram'])} GPU)" for m in s["loaded"]))
+    for l in s["leases"]:
+        lines.append(f"Lease {l['id']}: {l['label']} pid {l['pid']} {l['state']}, using +{gb(l['grown'])}")
+    return "\n".join(lines)
+
+
+class MCPServer:
+    def __init__(self, state: Any) -> None:
+        self.st = state
+        self.tools: dict[str, tuple[dict[str, Any], Handler]] = {}
+        self._register()
+
+    def tool(self, name: str, description: str, properties: dict[str, Any], required: list[str] | None = None):
+        def deco(fn: Handler) -> Handler:
+            schema = {"type": "object", "properties": properties, "required": required or []}
+            self.tools[name] = ({"name": name, "description": description, "inputSchema": schema}, fn)
+            return fn
+
+        return deco
+
+    def _register(self) -> None:
+        st = self.st
+
+        @self.tool("yuzuru_status", "Show GPU/RAM usage, which local model sizes fit right now, loaded models and "
+                   "running training jobs (leases).", {})
+        async def status(args: dict[str, Any], headers: dict[str, str]) -> str:
+            await st.broker.refresh()
+            return format_status(st.broker.status())
+
+        tiers_desc = "auto | " + " | ".join(t.name for t in st.cfg.tiers)
+
+        @self.tool(
+            "yuzuru_model",
+            "Choose the local model size for the rest of this session, from the next model call on: 'large' before "
+            "hard multi-step work (architecture, subtle debugging, math), the smallest tier for trivial chores, "
+            "'auto' to let the router decide per message again.",
+            {"tier": {"type": "string", "description": tiers_desc},
+             "session": {"type": "string", "description": "session id (optional; defaults to the active session)"}},
+            ["tier"],
+        )
+        async def model(args: dict[str, Any], headers: dict[str, str]) -> str:
+            session = args.get("session") or st.router.header_session(headers) or st.router.last_session
+            if not session:
+                raise ValueError("no active session to pin")
+            tier = args["tier"]
+            st.router.pin(session, None if tier in ("", "auto") else tier)
+            return f"model size for session {session}: {tier}"
+
+        @self.tool(
+            "yuzuru_train",
+            "Start a GPU training / fine-tuning job in the background. yuzuru first moves the local LLM out of GPU "
+            "memory, waits for the job's memory use to settle, then lets the LLM use what remains. Returns the PID "
+            "and log file; read the log to follow progress.",
+            {
+                "command": {"type": "string", "description": "shell command, e.g. 'python train.py --epochs 10'"},
+                "cwd": {"type": "string", "description": "absolute working directory (the project root)"},
+                "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional)"},
+                "vram": {"type": "string", "description": "VRAM to reserve, e.g. '10G' (optional; default measured)"},
+                "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
+            },
+            ["command", "cwd"],
+        )
+        async def train(args: dict[str, Any], headers: dict[str, str]) -> str:
+            cwd = Path(args["cwd"]).expanduser()
+            if not cwd.is_dir():
+                raise ValueError(f"cwd does not exist: {cwd}")
+            argv = [sys.executable, "-m", "yuzuru.cli", "--url", st.cfg.url, "run", "--detach", "--label", "train"]
+            if args.get("log"):
+                argv += ["--log", args["log"]]
+            for g in filter(None, (x.strip() for x in (args.get("gpus") or "").split(","))):
+                argv += ["--gpu", g]
+            if args.get("vram"):
+                argv += ["--vram", args["vram"]]
+            if session := st.router.header_session(headers) or st.router.last_session:
+                argv += ["--session", session]
+            argv += ["--", "bash", "-c", args["command"]]
+            r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr or r.stdout)
+            info = json.loads(r.stdout)
+            return f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+
+    async def handle(self, request: Request) -> Response:
+        try:
+            msg = await request.json()
+        except json.JSONDecodeError:
+            return JSONResponse(_error(None, -32700, "parse error"), status_code=400)
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        if isinstance(msg, list):
+            out = [r for m in msg if (r := await self._dispatch(m, headers)) is not None]
+            return JSONResponse(out) if out else Response(status_code=202)
+        result = await self._dispatch(msg, headers)
+        return JSONResponse(result) if result is not None else Response(status_code=202)
+
+    async def _dispatch(self, msg: dict[str, Any], headers: dict[str, str]) -> dict[str, Any] | None:
+        method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+        if mid is None:  # notification
+            return None
+        if method == "initialize":
+            return _ok(mid, {
+                "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "yuzuru", "version": __version__},
+                "instructions": INSTRUCTIONS,
+            })
+        if method == "ping":
+            return _ok(mid, {})
+        if method == "tools/list":
+            return _ok(mid, {"tools": [spec for spec, _ in self.tools.values()]})
+        if method == "tools/call":
+            name = params.get("name")
+            if name not in self.tools:
+                return _error(mid, -32602, f"unknown tool {name!r}")
+            try:
+                text = await self.tools[name][1](params.get("arguments") or {}, headers)
+                return _ok(mid, {"content": [{"type": "text", "text": text}], "isError": False})
+            except Exception as e:  # noqa: BLE001 - report tool errors to the model
+                log.warning("tool %s failed: %s", name, e)
+                return _ok(mid, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
+        return _error(mid, -32601, f"method not found: {method}")
+
+
+def _ok(mid: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def _error(mid: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}

@@ -1,0 +1,29 @@
+[project]
+name = "yuzuru"
+version = "0.1.0"
+description = "Resource-aware local LLM orchestrator: routes between small/large Ollama models and yields GPU memory to training jobs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+    "pyyaml>=6",
+]
+
+[project.scripts]
+yuzuru = "yuzuru.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yuzuru"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
