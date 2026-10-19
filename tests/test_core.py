@@ -437,3 +437,73 @@ async def test_server_forwards_cloud_with_key(cfg, world, http, monkeypatch):
             assert not world.chat_requests  # nothing went to Ollama
     finally:
         await st.stop()
+
+
+async def wait_for(cond, timeout=5.0):
+    import asyncio
+    import time as _t
+
+    end = _t.time() + timeout
+    while not cond():
+        if _t.time() > end:
+            raise AssertionError("condition not met")
+        await asyncio.sleep(0.05)
+
+
+def resume_capture(cfg, tmp_path):
+    import sys
+
+    out = tmp_path / "resumed.json"
+    cfg.resume.command = [sys.executable, "-c",
+                          f"import sys, json; open({str(out)!r}, 'w').write(json.dumps(sys.argv[1:]))",
+                          "{session}", "{message}"]
+    return out
+
+
+async def test_job_lease_suspends_llm_and_resumes_session(cfg, world, http, tmp_path):
+    from yuzuru.waits import Waiter
+
+    out = resume_capture(cfg, tmp_path)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await broker.acquire(catalog.router_spec)  # CPU classifier resident
+    await broker.release(catalog.router_spec, touch=False)
+    log = tmp_path / "train.log"
+    log.write_text("epoch 1 loss 2.0\nepoch 2 loss 1.1\nsaved checkpoint\n")
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="ses_9",
+                                      cwd=str(tmp_path), log=str(log), resume=True, note="評価を回す")
+    assert waiter.watch_lease(lease) is not None
+    await wait_for(lambda: not world.loaded)  # everything unloaded, CPU model too
+    await broker.release_lease(lease.id, rc=0)
+    await wait_for(out.exists)
+    session, message = json.loads(out.read_text())
+    assert session == "ses_9"
+    assert "finished" in message and "saved checkpoint" in message and "評価を回す" in message
+    ev = list(waiter.events)[-1]
+    assert ev.rc == 0 and ev.resumed and not waiter.watches
+
+
+async def test_pid_watch_and_long_poll(cfg, world, http, tmp_path):
+    import asyncio
+    import subprocess
+    import sys
+
+    from yuzuru.waits import Waiter
+
+    cfg.resume.enabled = False
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await broker.acquire(catalog.specs["small"])
+    await broker.release(catalog.specs["small"], touch=False)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    w = await waiter.add(session="s", pid=proc.pid, label="prep", note="")
+    assert not world.loaded  # suspended
+    poll_task = asyncio.create_task(waiter.wait_events(0, 5))
+    proc.wait()
+    await waiter.poll()
+    evs = await poll_task
+    assert [e.watch for e in evs] == [w.id] and evs[0].rc is None
+    # Nothing to resume -> what was resident comes back.
+    await wait_for(lambda: catalog.specs["small"].variant in world.loaded)
+    with pytest.raises(ValueError):
+        await waiter.add(session="s", pid=proc.pid)  # already gone

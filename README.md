@@ -86,6 +86,21 @@ instructions とツール説明でモデルに指示している（bash ツー�
 OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / `accelerate launch` などの bash 実行を
 自動で `yuzuru run` に包む。
 
+### 待っている間は LLM を止め、終わったら自動で再開する
+
+エージェントが学習や前処理の終了を待つ間、LLM はメモリを抱えたまま何もしていない。yuzuru はその間、
+ルーター用の小モデルや RAM に退避したモデルも含めて全モデルをアンロードし、プロセスが終わると
+セッションの tier のモデルを先に読み込んでから、結果（終了コード、ログの末尾、待つ前にモデルが残したメモ）を
+添えてセッションを再開する。OpenCode は再開のターンで会話の履歴をすべて送り直すので、文脈はそのまま戻る。
+
+- MCP `yuzuru_train`: 既定で `resume_when_done: true`。ジョブを起動したらモデルはターンを終える
+- MCP `yuzuru_wait`: 自分で起動したわけではないプロセス（PID または lease）を待つ
+- CLI: `yuzuru run --resume --session <id> --note "..." --log train.log -- python train.py`、
+  `yuzuru wait --pid 1234 --session <id>`、`yuzuru events -f`
+
+再開は `opencode run --session <id> "<結果>"` で行う（OpenCode 1.x / 2.x 共通。`resume.command` で変更可）。
+OpenCode のバックグラウンドサービスにつながっている TUI なら、再開したターンがそのまま表示される。
+
 ### ルーティング
 
 | 何で決まるか | 例 |

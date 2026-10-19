@@ -20,6 +20,7 @@ import sys
 import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -55,6 +56,10 @@ class Lease:
     vram: int | None  # explicit reservation in bytes; None = measure it
     session: str | None = None  # OpenCode session that started the job, if any
     kind: str = "job"  # job | reservation (user-forced, no job yet)
+    cwd: str | None = None  # where the job runs (for resuming its session)
+    log: str | None = None  # the job's log file, if any
+    resume: bool = False  # resume `session` when the job ends
+    note: str = ""  # what the agent meant to do next
     hard: bool = False  # reservation backed by a holder process that occupies the VRAM
     expires: float | None = None
     created: float = field(default_factory=time.time)
@@ -86,6 +91,8 @@ class Broker:
         self._settled.set()
         self._restore_task: asyncio.Task | None = None
         self._holders: dict[int, asyncio.subprocess.Process] = {}
+        # Called with (lease, exit code or None) whenever a lease ends.
+        self.on_lease_end: list[Callable[[Lease, int | None], None]] = []
 
     # ------------------------------------------------------------------ state
 
@@ -292,11 +299,11 @@ class Broker:
 
     async def create_lease(
         self, pid: int, label: str, gpus: list[str], vram: int | None, session: str | None = None,
-        drain: bool = True,
+        drain: bool = True, **extra: Any,
     ) -> Lease:
         await self.refresh()
         resolved = self._resolve_gpus(gpus)
-        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session)
+        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session, **extra)
         self._settled.clear()
         self.leases[lease.id] = lease
         await self._clear_gpus(lease, drain)
@@ -398,17 +405,19 @@ class Broker:
         log.info("reservation %s handed to pid %d", lease_id, pid)
         return lease
 
-    async def release_lease(self, lease_id: str) -> Lease | None:
+    async def release_lease(self, lease_id: str, rc: int | None = None) -> Lease | None:
         lease = self.leases.pop(lease_id, None)
         if lease is None:
             return None
         if lease.hard:
             await self._stop_holder(lease.pid)
-        log.info("lease %s released", lease_id)
-        self._ended(lease)
+        log.info("lease %s released (rc=%s)", lease_id, rc)
+        self._ended(lease, rc)
         return lease
 
-    def _ended(self, lease: Lease) -> None:
+    def _ended(self, lease: Lease, rc: int | None = None) -> None:
+        for cb in self.on_lease_end:
+            cb(lease, rc)
         self._update_leases()
         if self.cfg.lease.restore_after and not self.leases and lease.restore:
             self._restore_task = asyncio.create_task(self._restore(lease.restore))
@@ -433,6 +442,8 @@ class Broker:
             if gone or expired:
                 log.info("lease %s: %s", lease.id, "expired" if expired else f"pid {lease.pid} gone")
                 self.leases.pop(lease.id)
+                for cb in self.on_lease_end:
+                    cb(lease, None)
                 if lease.hard:
                     holder = self._holders.pop(lease.pid, None)
                     if holder and holder.returncode is None:

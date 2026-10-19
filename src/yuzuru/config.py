@@ -115,6 +115,21 @@ class LeaseConfig:
 
 
 @dataclass
+class ResumeConfig:
+    """Free the LLM while an agent waits for a process, and resume it afterwards."""
+
+    enabled: bool = True
+    # Command that continues an OpenCode session; {session}, {message} and {cwd}
+    # are substituted. `opencode run --session` works for OpenCode 1.x and 2.x.
+    command: list[str] = field(default_factory=lambda: ["opencode", "run", "--session", "{session}", "{message}"])
+    # While waiting, unload every model (CPU classifier and RAM-offloaded ones too).
+    suspend_all: bool = True
+    # Reload the session's model before resuming so the prompt does not wait on a load.
+    warm_before_resume: bool = True
+    log_tail_lines: int = 40
+
+
+@dataclass
 class Config:
     ollama_url: str = "http://127.0.0.1:11434"
     host: str = "127.0.0.1"
@@ -126,6 +141,7 @@ class Config:
     tiers: list[TierConfig] = field(default_factory=list)
     router: RouterConfig = field(default_factory=RouterConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
+    resume: ResumeConfig = field(default_factory=ResumeConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
 
@@ -180,6 +196,8 @@ def load_config(path: str | Path | None = None) -> Config:
             kwargs["lease"] = _build(LeaseConfig, value)
         elif key == "cloud":
             kwargs["cloud"] = _build(CloudConfig, value)
+        elif key == "resume":
+            kwargs["resume"] = _build(ResumeConfig, value)
         elif key == "state_dir":
             kwargs["state_dir"] = Path(value).expanduser()
         else:
