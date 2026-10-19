@@ -80,6 +80,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
 # ------------------------------------------------------------------------ run
 
 
+def allowlist(config: str | None) -> list[str]:
+    try:
+        return load_config(config).resources.gpus
+    except Exception as e:  # noqa: BLE001 - a broken config must not stop the job
+        print(f"[yuzuru] cannot read config ({e}); not restricting GPUs", file=sys.stderr)
+        return []
+
+
 def cmd_run(args: argparse.Namespace, client: Client) -> None:
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
@@ -116,13 +124,18 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
                 timeout=300,
             )
         lease_id = lease["id"]
-        if lease["gpus"]:
+        # The lease's GPUs, else every GPU of resources.gpus (older servers send no "visible").
+        if visible := lease.get("visible") or lease["gpus"]:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(lease["gpus"])
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
         env["YUZURU_LEASE"] = lease_id
         print(f"[yuzuru] lease {lease_id}: LLM moved out of GPU memory", file=sys.stderr)
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         print(f"[yuzuru] server unreachable ({e.__class__.__name__}); running without a lease", file=sys.stderr)
+        if allow := allowlist(args.config):
+            # Still keep the job off the GPUs yuzuru was told not to use (indices in nvidia-smi order).
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(allow)
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     out = None
     if args.log:
@@ -163,6 +176,13 @@ def print_status(s: dict[str, Any]) -> None:
     b = s["budget"]
     pool = f"{gb(b['fast'])} (unified memory)" if b["unified"] else f"GPU {gb(b['fast'])} + RAM {gb(b['slow'])}"
     print(f"LLM may use: {pool}")
+    if s.get("gpu_allowlist"):
+        print(f"GPUs limited to: {', '.join(s['gpu_allowlist'])} (resources.gpus)")
+    o = s.get("ollama") or {}
+    if o.get("managed"):
+        state = f"pid {o['pid']}" if o["running"] else "NOT RUNNING"
+        print(f"Ollama (managed): {o['url']} {state}, CUDA_VISIBLE_DEVICES={o['cuda_visible_devices'] or 'all'}"
+              + (f", {o['restarts']} restarts" if o["restarts"] else ""))
     print("\nTiers:")
     for name, t in s["tiers"].items():
         est = gb(t["estimated_size"]) + ("" if t["measured"] else "*")

@@ -25,6 +25,7 @@ from .catalog import Catalog
 from .mcp import MCPServer
 from .config import Config
 from .ollama import Ollama
+from .managed import ManagedOllama
 from .resources import Probe, make_probe
 from .router import Router
 from .waits import Waiter
@@ -42,13 +43,22 @@ class State:
         self.http = http or httpx.AsyncClient(base_url=cfg.ollama_url, timeout=httpx.Timeout(None, connect=5))
         self.ollama = Ollama(cfg.ollama_url, self.http)
         self.catalog = Catalog(cfg, self.ollama)
-        self.broker = Broker(cfg, probe or make_probe(cfg.resources.probe, cfg.resources.ollama_cgroup), self.ollama, self.catalog)
+        self.managed: ManagedOllama | None = None
+        if probe is None:
+            probe = make_probe(cfg.resources.probe, cfg.resources.ollama_cgroup, cfg.resources.gpus)
+            if cfg.ollama.manage:
+                probe.host.pid = lambda: self.managed.pid if self.managed else None
+        if cfg.ollama.manage:
+            self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus])
+        self.broker = Broker(cfg, probe, self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
         self.waiter = Waiter(cfg, self.broker, self.router)
         self.tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
+        if self.managed:
+            await self.managed.start()
         # Come up even if Ollama (or the GPU driver) is not ready yet, as at boot
         # when both are services; the loops below keep retrying.
         try:
@@ -67,6 +77,8 @@ class State:
         for t in self.tasks:
             t.cancel()
         await self.broker.shutdown()
+        if self.managed:
+            await self.managed.stop()
         await self.http.aclose()
         await self.cloud_http.aclose()
 
@@ -301,7 +313,9 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         cloud = {"enabled": c.enabled, "usable": c.usable, "model": c.model, "auto": c.auto,
                  "calls_last_hour": len(st.router.cloud_calls), "limit_per_hour": c.max_requests_per_hour}
         return st.broker.status() | {"sessions": st.router.sessions_status(), "cloud": cloud,
-                                     "waits": st.waiter.status()}
+                                     "waits": st.waiter.status(),
+                                     "ollama": st.managed.status() if st.managed else {"managed": False},
+                                     "gpu_allowlist": cfg.resources.gpus}
 
     @app.post("/yuzuru/leases", dependencies=guarded)
     async def create_lease(payload: dict[str, Any]) -> dict[str, Any]:
@@ -317,7 +331,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
         watch = st.waiter.watch_lease(lease)
-        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state, "watch": watch.id if watch else None}
+        return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
+                "watch": watch.id if watch else None}
 
     def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
         return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
@@ -348,7 +363,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         for k, v in job_fields(payload).items():
             setattr(lease, k, v)
         watch = st.waiter.watch_lease(lease)
-        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state, "watch": watch.id if watch else None}
+        return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
+                "watch": watch.id if watch else None}
 
     @app.get("/yuzuru/leases", dependencies=guarded)
     async def list_leases() -> list[dict[str, Any]]:

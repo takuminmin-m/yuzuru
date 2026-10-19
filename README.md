@@ -90,6 +90,42 @@ instructions とツール説明でモデルに指示している（bash ツー�
 OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / `accelerate launch` などの bash 実行を
 自動で `yuzuru run` に包む。
 
+### 使う GPU を限定する（GPU 許可リスト）
+
+「この GPU（と CPU）だけを使う」は設定 1 か所で済む。
+
+```yaml
+# ~/.config/yuzuru/config.yaml
+resources:
+  gpus: [0]            # index か UUID（GPU-a0d7...）。空 = 全部（既定）
+ollama:
+  manage: true         # yuzuru 専用の ollama serve を起動・監視する（下記）
+  # port: 11436
+  # env: {OLLAMA_FLASH_ATTENTION: "1"}   # ollama.service に設定していた環境変数があればここへ
+```
+
+- **`resources.gpus`**: リソース probe は許可した GPU だけを報告する。予算、lease（`yuzuru run`）、
+  `yuzuru reserve`（許可した GPU が 1 枚なら `--gpu` 省略可）、`yuzuru status` はそれ以外の GPU を一切見ない。
+  `--gpu` に許可外の GPU を指定するとエラーになる
+- `yuzuru run` / MCP の `yuzuru_train` で起動したジョブには、`--gpu` を付けなくても `CUDA_VISIBLE_DEVICES` が
+  許可した GPU の UUID に設定される（呼び出し側の `CUDA_VISIBLE_DEVICES` は上書きする）。サーバーに繋がらない
+  ときも設定ファイルの値をそのまま使う
+- **`ollama.manage: true`**: `resources.gpus` だけでは、システムの Ollama（`ollama.service`）は全 GPU を見たまま。
+  除外した GPU を hard reserve で埋めても、Ollama はそこに計算バッファを置こうとして OOM する。`manage` を
+  有効にすると、yuzuru が自前の `ollama serve` を `CUDA_VISIBLE_DEVICES=<許可した GPU の UUID>` 付きで起動し、
+  `ollama_url` をそちらに向ける
+  - `OLLAMA_MODELS` は `ollama.models`（既定 `~/.local/share/yuzuru-ollama/models`）。システムのモデル置き場
+    （`$OLLAMA_MODELS`、`/usr/share/ollama/.ollama/models`、`~/.ollama/models` の順に探す。`ollama.mirror_from` で指定可、
+    `none` で無効）の blob をシンボリックリンクで、manifest をコピーで取り込むので、重みは複製しない。
+    システム側で `ollama pull` したモデルは 1 分以内に取り込まれる。yuzuru が作る派生モデルはこちらの置き場に書かれる
+  - 可能なら `systemd-run --user --scope` で専用の cgroup に入れて起動するので、ホスト RAM の実測
+    （`memory.current`）はシステムの `ollama.service` ではなくこのプロセスが対象になる（`ollama.scope: off` で無効。
+    scope が使えない環境ではプロセスツリーの RSS で測る）
+  - 落ちたら自動で再起動し、yuzuru の終了時に止める。yuzuru が強制終了されて残ったものは、次の起動時に止めてから
+    起動し直す。ログは `~/.local/state/yuzuru/ollama.log`、状態は `yuzuru status` の `Ollama (managed)` 行
+  - システムの `ollama.service` は 11434 で動いたままでよい（止めるなら `sudo systemctl disable --now ollama`）。
+    OpenCode などは yuzuru 経由で使う（11434 を直接使うと、その分は yuzuru から見て他プロセスの使用量になる）
+
 ### 待っている間は LLM を止め、終わったら自動で再開する
 
 エージェントが学習や前処理の終了を待つ間、LLM はメモリを抱えたまま何もしていない。yuzuru はその間、

@@ -98,6 +98,48 @@ class ResourceConfig:
     ollama_cgroup: str = "auto"
     vram_margin_mb: int = 512  # per GPU, never handed to the LLM
     ram_reserve_mb: int = 6144  # kept free for the OS, dataloaders, etc.
+    # GPUs yuzuru may use, by index or UUID. Empty = all. The others are
+    # invisible to budgets, leases, reservations, status and started jobs.
+    gpus: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.gpus = [str(g).strip() for g in self.gpus if str(g).strip()]
+
+
+@dataclass
+class OllamaConfig:
+    """Optionally run a private `ollama serve` instead of using the system one.
+
+    With `manage: true`, yuzuru starts it with CUDA_VISIBLE_DEVICES limited to
+    `resources.gpus` (a hard reservation alone cannot stop Ollama placing
+    compute buffers on an excluded GPU), restarts it if it dies and stops it
+    on shutdown. `ollama_url` then points at it.
+    """
+
+    manage: bool = False
+    binary: str = "ollama"
+    host: str = "127.0.0.1"
+    port: int = 11436
+    # OLLAMA_MODELS of the managed server. Blobs of `mirror_from` are symlinked
+    # in (no copies), manifests are copied, so models pulled for the system
+    # Ollama show up and variants yuzuru creates stay in this directory.
+    models: Path = field(default_factory=lambda: Path.home() / ".local" / "share" / "yuzuru-ollama" / "models")
+    # auto: $OLLAMA_MODELS, /usr/share/ollama/.ollama/models or ~/.ollama/models; none: no mirroring.
+    mirror_from: str = "auto"
+    # Run it in its own systemd user scope so its cgroup measures exactly its
+    # host RAM: auto | on | off.
+    scope: str = "auto"
+    # Extra environment, e.g. OLLAMA_FLASH_ATTENTION: "1" as set for ollama.service.
+    env: dict[str, str] = field(default_factory=dict)
+    startup_timeout: float = 60.0
+
+    def __post_init__(self) -> None:
+        self.models = Path(self.models).expanduser()
+        self.env = {str(k): str(v) for k, v in self.env.items()}
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
 
 @dataclass
@@ -150,10 +192,13 @@ class Config:
     resume: ResumeConfig = field(default_factory=ResumeConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
 
     def __post_init__(self) -> None:
         if not self.tiers:
             self.tiers = default_tiers()
+        if self.ollama.manage:
+            self.ollama_url = self.ollama.url
 
     @property
     def url(self) -> str:
@@ -205,13 +250,15 @@ def load_config(path: str | Path | None = None) -> Config:
             kwargs["cloud"] = _build(CloudConfig, value)
         elif key == "resume":
             kwargs["resume"] = _build(ResumeConfig, value)
+        elif key == "ollama":
+            kwargs["ollama"] = _build(OllamaConfig, value)
         elif key == "state_dir":
             kwargs["state_dir"] = Path(value).expanduser()
         else:
             kwargs[key] = value
     cfg = _build(Config, kwargs)
 
-    if env_url := os.environ.get("OLLAMA_HOST_URL"):
+    if (env_url := os.environ.get("OLLAMA_HOST_URL")) and not cfg.ollama.manage:
         cfg.ollama_url = env_url
     if env_token := os.environ.get("YUZURU_TOKEN"):
         cfg.token = env_token

@@ -320,6 +320,14 @@ class Broker:
             resolved.append(gpu.uuid)
         return resolved
 
+    def visible_gpus(self, lease: Lease) -> list[str]:
+        """CUDA_VISIBLE_DEVICES for a lease's job: its GPUs, else every allowed one.
+
+        Empty means "do not restrict" (no allowlist configured)."""
+        if lease.gpus or not self.cfg.resources.gpus:
+            return lease.gpus
+        return [g.uuid for g in self.snapshot.gpus] or list(self.cfg.resources.gpus)
+
     async def _clear_gpus(self, lease: Lease, drain: bool = True) -> None:
         """Unload GPU-resident models for `lease` and take its baseline."""
         deadline = time.time() + (self.cfg.lease.drain_timeout if drain else 0)
