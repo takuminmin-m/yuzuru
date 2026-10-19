@@ -204,6 +204,14 @@ class Router:
         spec = self.catalog.router_spec
         if self.cfg.router.classifier != "llm" or spec is None:
             return h_level, h_reason
+        # The classifier is a CPU-only copy of the smallest tier's model. If that
+        # model is resident already, ask it instead: loading a second copy makes
+        # Ollama evict the first, so every request paid for two reloads.
+        resident = next(
+            (s for s in self.catalog.specs.values() if s.base == spec.base and self.broker.is_loaded(s.variant)),
+            None,
+        )
+        spec = resident or spec
         prompt = f"Conversation length so far: {n_messages} messages.\nNext user message:\n<<<\n{text[:3000]}\n>>>"
         placement = Placement.NONE
         try:
