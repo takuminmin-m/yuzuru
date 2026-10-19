@@ -62,7 +62,8 @@ CLASSIFIER_SCHEMA = {
 
 @dataclass
 class SessionState:
-    tier: str | None = None
+    tier: str | None = None  # what the current turn wants
+    served: str | None = None  # what actually answered it (may be smaller: memory)
     pinned: str | None = None
     escalated: bool = False
     updated: float = field(default_factory=time.time)
@@ -321,13 +322,18 @@ class Router:
                     return decision
                 reason += f"; {why}"
         else:
-            wanted, reason = (sess.tier if sess.tier in names else names[-1]), "continuation"
+            # Stay on the model that answered this turn so far: switching mid-turn means
+            # a reload (minutes for a big model partly on CPU) and a different mind
+            # halfway through a tool loop. The wanted tier is retried next turn.
+            stay = sess.served if sess.served in names else sess.tier
+            wanted, reason = (stay if stay in names else names[-1]), "continuation"
+            turn_tier = sess.tier if sess.tier in names else wanted  # escalation starts from what the turn wanted
             errors = sum(
                 1 for m in _since_last_user(msgs) if m.get("role") == "tool" and TOOL_ERROR_RE.search(message_text(m))
             )
             if errors >= self.cfg.router.error_escalation and not sess.escalated:
                 sess.escalated = True
-                i = names.index(wanted)
+                i = names.index(turn_tier)
                 at_top = self.catalog.nearest_tier(names[i]) == self.catalog.tiers[-1] if self.catalog.tiers else True
                 if i + 1 < len(names) and not at_top:
                     wanted, reason = names[i + 1], f"escalated after {errors} tool errors"
@@ -364,6 +370,7 @@ class Router:
                 return decision
         if new_turn or escalate:
             sess.tier = wanted
+        sess.served = tier
         decision = Decision(
             tier=tier,
             spec=self.catalog.specs[tier],
