@@ -86,6 +86,19 @@ OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / 
 載らなければ RAM 退避 → 小さい tier へ降格、の順に試す。判定はすべて `~/.local/state/yuzuru/decisions.jsonl`
 に記録されるので、後でルーターの評価や学習に使える。
 
+### モデルを選ぶ
+
+```bash
+yuzuru models                       # 入っているモデル、担当 tier、MoE かどうか、無効化状態
+yuzuru models use medium qwen3:14b  # medium をこのモデルに固定（auto で自動割り当てに戻す）
+yuzuru models disable llama3:70b    # 自動割り当て・一覧から外す / enable で戻す
+```
+
+選択は `~/.local/state/yuzuru/selection.json` に保存され、設定ファイルの `models` や自動割り当てより優先される。
+OpenCode からは tier だけでなく、有効なモデルを名前で直接選べる（`yuzuru/qwen3:14b`。メモリ管理は同じく
+yuzuru が行い、tier の自動切り替えはしない）。モデル自身も MCP の `yuzuru_models` で一覧を見て、
+`yuzuru_model` に名前を渡してセッションを固定できる。
+
 ### 確認
 
 ```bash

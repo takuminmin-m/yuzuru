@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import subprocess
+
+import httpx
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -14,7 +16,22 @@ from typing import Any
 from .config import Config
 
 
-def provider_config(cfg: Config, base_url: str | None = None) -> dict[str, Any]:
+def installed_models(cfg: Config) -> list[str]:
+    """Enabled, non-embedding models from Ollama, so they can be picked by name in OpenCode."""
+    from .catalog import Selection, _is_embedding
+
+    try:
+        tags = httpx.get(cfg.ollama_url.rstrip("/") + "/api/tags", timeout=10).json().get("models", [])
+    except (httpx.HTTPError, ValueError):
+        return []
+    disabled = Selection(cfg.state_dir / "selection.json").disabled
+    return sorted(
+        m["name"] for m in tags
+        if not m["name"].startswith("yuzuru-") and m["name"] not in disabled and not _is_embedding(m)
+    )
+
+
+def provider_config(cfg: Config, base_url: str | None = None, models_by_name: list[str] | None = None) -> dict[str, Any]:
     url = (base_url or cfg.url).rstrip("/") + "/v1"
     max_ctx = max(t.num_ctx for t in cfg.tiers)
     models: dict[str, Any] = {
@@ -29,6 +46,13 @@ def provider_config(cfg: Config, base_url: str | None = None) -> dict[str, Any]:
             "name": f"{t.name.capitalize()} (yuzuru)",
             "tool_call": True,
             "limit": {"context": t.num_ctx, "output": min(16384, t.num_ctx // 4)},
+        }
+    top = cfg.tiers[-1].num_ctx
+    for name in models_by_name or []:
+        models[name] = {
+            "name": f"{name} (yuzuru, fixed)",
+            "tool_call": True,
+            "limit": {"context": top, "output": min(16384, top // 4)},
         }
     options: dict[str, Any] = {"baseURL": url}
     if cfg.token:
@@ -96,7 +120,7 @@ def install(cfg: Config, project: Path | None, set_default: bool) -> list[str]:
         except json.JSONDecodeError as e:
             raise SystemExit(f"{config_file} is not plain JSON ({e}); add the config by hand (see `yuzuru opencode`)")
         shutil.copy(config_file, config_file.with_suffix(".json.bak"))
-    conf.setdefault("provider", {})["yuzuru"] = provider_config(cfg)
+    conf.setdefault("provider", {})["yuzuru"] = provider_config(cfg, models_by_name=installed_models(cfg))
     add_mcp(conf, mcp_config(cfg), major)
     if set_default or "model" not in conf:
         conf["model"] = "yuzuru/auto"
@@ -114,7 +138,7 @@ def cmd_opencode(args: argparse.Namespace, cfg: Config) -> None:
             "$schema": "https://opencode.ai/config.json",
             "model": "yuzuru/auto",
             "small_model": f"yuzuru/{cfg.tiers[0].name}",
-            "provider": {"yuzuru": provider_config(cfg)},
+            "provider": {"yuzuru": provider_config(cfg, models_by_name=installed_models(cfg))},
         }
         add_mcp(snippet, mcp_config(cfg), opencode_major())
         print(json.dumps(snippet, indent=2))

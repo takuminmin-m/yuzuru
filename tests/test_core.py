@@ -184,7 +184,8 @@ async def test_server_routes_and_streams(cfg, world, http):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://yuzuru") as c:
             r = await c.get("/v1/models")
-            assert [m["id"] for m in r.json()["data"]] == ["auto", "small", "medium", "large"]
+            ids = [m["id"] for m in r.json()["data"]]
+            assert ids[:4] == ["auto", "small", "medium", "large"] and "qwen3:14b" in ids
             r = await c.post("/v1/chat/completions", json=user("ありがとう"), headers={"x-yuzuru-session": "a"})
             assert r.status_code == 200 and r.headers["x-yuzuru-tier"] == "small"
             assert world.chat_requests[-1]["model"] == catalog_variant(st, "small")
@@ -260,3 +261,35 @@ async def test_leaked_ollama_memory_is_not_counted_as_freeable(cfg, world, http)
     await broker.refresh()
     assert broker.budget().slow <= before - 15 * GB
     assert broker.warnings() and "restart" in broker.warnings()[0]
+
+async def test_model_selection_assign_disable_persist(cfg, world, http):
+    catalog, _, _ = await make(cfg, world, http)
+    catalog.assign("medium", "qwen3.6")  # ':latest' optional
+    catalog.set_enabled("qwen3:4b", False)
+    await catalog.refresh()
+    assert catalog.specs["medium"].base == "qwen3.6:latest"
+    assert "small" not in catalog.specs  # only candidate disabled
+    assert "qwen3:4b" not in catalog.enabled
+    # Survives a restart.
+    catalog2, _, _ = await make(cfg, world, http)
+    assert catalog2.specs["medium"].base == "qwen3.6:latest"
+    catalog2.assign("medium", None)
+    catalog2.set_enabled("qwen3:4b", True)
+    await catalog2.refresh()
+    assert catalog2.specs["medium"].base == "qwen3:14b" and catalog2.specs["small"].base == "qwen3:4b"
+    with pytest.raises(ValueError):
+        catalog2.assign("medium", "nope:1b")
+
+
+async def test_route_direct_model_and_model_pin(cfg, world, http):
+    cfg.router = RouterConfig(classifier="heuristic")
+    catalog, _, router = await make(cfg, world, http)
+    d = await router.route({**user("hi"), "model": "yuzuru/qwen3:14b"}, {})
+    assert d.tier == "qwen3:14b" and d.spec.tier == "direct" and d.spec.num_ctx == cfg.tiers[-1].num_ctx
+    router.pin("s", "qwen3:4b")
+    d = await router.route(user("設計して"), {"x-yuzuru-session": "s"})
+    assert d.spec.base == "qwen3:4b" and "pin" in d.reason
+    with pytest.raises(LookupError):
+        await router.route({**user("hi"), "model": "missing:7b"}, {})
+    with pytest.raises(ValueError):
+        router.pin("s", "missing:7b")

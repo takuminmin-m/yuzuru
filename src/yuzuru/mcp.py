@@ -77,13 +77,26 @@ class MCPServer:
             await st.broker.refresh()
             return format_status(st.broker.status())
 
-        tiers_desc = "auto | " + " | ".join(t.name for t in st.cfg.tiers)
+        tiers_desc = "auto | " + " | ".join(t.name for t in st.cfg.tiers) + " | an installed model name"
+
+        @self.tool("yuzuru_models", "List the local models installed in Ollama, which tier each serves, and whether "
+                   "each is enabled.", {})
+        async def models(args: dict[str, Any], headers: dict[str, str]) -> str:
+            lines = []
+            for m in st.catalog.models_info():
+                if m["embedding"]:
+                    continue
+                flags = [f"tier={m['tier']}" if m["tier"] else "", "disabled" if not m["enabled"] else "",
+                         "moe" if m["moe"] else ""]
+                lines.append(f"{m['name']} ({m['params_b']:.1f}B, {gb(m['size'])}) " + " ".join(f for f in flags if f))
+            return "\n".join(lines) or "no models installed"
 
         @self.tool(
             "yuzuru_model",
-            "Choose the local model size for the rest of this session, from the next model call on: 'large' before "
-            "hard multi-step work (architecture, subtle debugging, math), the smallest tier for trivial chores, "
-            "'auto' to let the router decide per message again.",
+            "Choose the local model for the rest of this session, from the next model call on: a size tier "
+            "('large' before hard multi-step work such as architecture, subtle debugging or math; the smallest tier "
+            "for trivial chores), a specific installed model name (see yuzuru_models), or 'auto' to let the router "
+            "decide per message again.",
             {"tier": {"type": "string", "description": tiers_desc},
              "session": {"type": "string", "description": "session id (optional; defaults to the active session)"}},
             ["tier"],
@@ -94,7 +107,7 @@ class MCPServer:
                 raise ValueError("no active session to pin")
             tier = args["tier"]
             st.router.pin(session, None if tier in ("", "auto") else tier)
-            return f"model size for session {session}: {tier}"
+            return f"model for session {session}: {st.router.sessions[session].pinned or 'auto'}"
 
         @self.tool(
             "yuzuru_train",

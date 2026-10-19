@@ -143,10 +143,14 @@ class Router:
         system = next((message_text(m) for m in msgs if m.get("role") == "system"), "")
         return "h:" + hashlib.sha1((system[:2000] + "\0" + first_user[:2000]).encode()).hexdigest()[:12]
 
-    def pin(self, session: str, tier: str | None) -> None:
-        if tier is not None and self.cfg.tier(tier) is None:
-            raise ValueError(f"unknown tier {tier!r}")
-        self.sessions.setdefault(session, SessionState()).pinned = tier
+    def pin(self, session: str, target: str | None) -> None:
+        """Pin a session to a tier or to a specific installed model (None = auto)."""
+        if target is not None and self.cfg.tier(target) is None:
+            name = self.catalog.resolve(target)
+            if name is None:
+                raise ValueError(f"{target!r} is neither a tier nor an installed model")
+            target = name
+        self.sessions.setdefault(session, SessionState()).pinned = target
 
     def _gc(self) -> None:
         cutoff = time.time() - 6 * 3600
@@ -208,6 +212,27 @@ class Router:
             sess.escalated = False
         override = OVERRIDE_RE.search(last_user) if new_turn else None
 
+        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
+        ctx_need = estimate_tokens(body) + min(int(max_tokens), 8192)
+
+        # A model chosen by name (request or session pin) bypasses tiers entirely.
+        direct = None
+        if requested not in names and requested != "auto":
+            direct, reason = self.catalog.resolve(requested), "requested model"
+            if direct is None:
+                raise LookupError(f"unknown model {requested!r}")
+        elif requested == "auto" and sess.pinned and sess.pinned not in names:
+            direct, reason = self.catalog.resolve(sess.pinned), "session pin (model)"
+        if direct:
+            spec = await self.catalog.direct_spec(direct)
+            placement, _ = self.broker.plan(spec, True)
+            why = "fits" if placement is Placement.GPU else placement.value
+            if ctx_need > spec.num_ctx:
+                why += f"; context needs {ctx_need} > {spec.num_ctx}"
+            decision = Decision(direct, spec, placement, direct, f"{reason}; {why}", key, ctx_need)
+            self._log(decision, requested, agent, last_user)
+            return decision
+
         if requested in names:
             wanted, reason = requested, "requested"
         elif override and override.group(1).lower() in names:
@@ -231,8 +256,6 @@ class Router:
                     escalate = True
                 sess.escalated = True
 
-        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
-        ctx_need = estimate_tokens(body) + min(int(max_tokens), 8192)
         floor = next((t.name for t in self.cfg.tiers if t.num_ctx >= ctx_need), names[-1])
         if names.index(floor) > names.index(wanted):
             wanted, reason = floor, reason + f"; context needs {ctx_need} tokens"
