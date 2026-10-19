@@ -47,6 +47,12 @@ def provider_config(cfg: Config, base_url: str | None = None, models_by_name: li
             "tool_call": True,
             "limit": {"context": t.num_ctx, "output": min(16384, t.num_ctx // 4)},
         }
+    if cfg.cloud.enabled and cfg.cloud.model:
+        models["cloud"] = {
+            "name": f"Cloud: {cfg.cloud.model} (yuzuru)",
+            "tool_call": True,
+            "limit": {"context": cfg.cloud.context, "output": 16384},
+        }
     top = cfg.tiers[-1].num_ctx
     for name in models_by_name or []:
         models[name] = {
