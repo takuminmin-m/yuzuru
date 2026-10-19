@@ -11,7 +11,7 @@ tiers:                 # smallest first
   - name: small
     models: []         # empty = auto: largest installed model under auto_params_max_b
     auto_params_max_b: 6
-    num_ctx: 16384
+    num_ctx: 32768     # coding agents send ~20k tokens of system prompt + tools
   - name: medium
     models: []         # or e.g. ["qwen3:14b", "gemma3:12b"] in preference order
     auto_params_max_b: 20
@@ -49,3 +49,10 @@ cloud:                 # paid API for what local models cannot do (off by defaul
   when_no_memory: false  # use the cloud instead of a smaller local model while the GPU is busy
   when_context: true   # use the cloud when the prompt exceeds every local context
   max_requests_per_hour: 60   # cap for automatic use; explicit requests are not capped
+
+resume:                # free the LLM while waiting on a process, resume the session afterwards
+  enabled: true
+  command: ["opencode", "run", "--session", "{session}", "{message}"]
+  suspend_all: true    # unload every model while waiting (CPU classifier too)
+  warm_before_resume: true
+  log_tail_lines: 40

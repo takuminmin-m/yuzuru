@@ -55,7 +55,7 @@ Answer with JSON only."""
 
 CLASSIFIER_SCHEMA = {
     "type": "object",
-    "properties": {"difficulty": {"enum": list(LEVELS)}, "reason": {"type": "string"}},
+    "properties": {"difficulty": {"enum": list(LEVELS)}, "reason": {"type": "string", "maxLength": 120}},
     "required": ["difficulty"],
 }
 
@@ -209,12 +209,20 @@ class Router:
                     "messages": [{"role": "system", "content": CLASSIFIER_SYSTEM}, {"role": "user", "content": prompt}],
                     "format": CLASSIFIER_SCHEMA,
                     "think": False,
-                    "options": {"temperature": 0, "num_predict": 80},
+                    "options": {"temperature": 0, "num_predict": 160},
                     "keep_alive": self.cfg.keep_alive,
                 },
                 timeout=self.cfg.router.classifier_timeout,
             )
-            out = json.loads(resp["message"]["content"])
+            content = resp["message"]["content"]
+            try:
+                out = json.loads(content)
+            except json.JSONDecodeError:
+                # Cut off mid-"reason": the difficulty field comes first and is enough.
+                m = re.search(r'"difficulty"\s*:\s*"(easy|medium|hard)"', content)
+                if not m:
+                    raise
+                out = {"difficulty": m.group(1)}
             level = LEVELS.index(out["difficulty"])
             return level, f"classifier:{out['difficulty']}" + (f" ({out['reason'][:80]})" if out.get("reason") else "")
         except Exception as e:  # noqa: BLE001 - routing must never fail on the classifier

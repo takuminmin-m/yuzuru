@@ -41,6 +41,10 @@ yuzuru opencode --install                          # ~/.config/opencode にプ�
   `--set-default` で上書き）。MCP の書式は OpenCode のバージョン（1.x: `mcp.<name>`、2.x: `mcp.servers.<name>`）に合わせる
 - OpenCode 1.x のときだけ `plugins/yuzuru.ts`（依存なし）を置く。2.x はプロバイダへ `x-opencode-session` を
   自前で送るのでプラグイン不要（2.x のプラグインAPIにはツール実行フックが無いため、学習コマンドの自動ラップは 1.x のみ）
+- OpenCode 2.x では MCP サーバーに `codemode: false` を付ける。2.x の既定では MCP ツールが JavaScript を書いて呼ぶ
+  `execute` ツールの奥に隠れ、ローカルの小さなモデルではまず呼べないため
+- `--local-only` を付けると OpenCode 組み込みの無料クラウドモデル（`opencode` プロバイダ）を無効にする。yuzuru が
+  落ちているとき、OpenCode はそれらに黙って切り替えてコードを外部に送ってしまうので、ローカル専用で使うなら推奨
 - プロジェクト単位にしたい場合は `--project <dir>`
 
 小さいモデルも入れておくと、ルーターがそれで難易度を判定し、軽い作業はそちらに回す:
@@ -85,6 +89,21 @@ OpenCode 上では MCP の `yuzuru_train` ツール（バックグラウンド�
 instructions とツール説明でモデルに指示している（bash ツールはタイムアウトがあるので長い学習に向かない）。
 OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / `accelerate launch` などの bash 実行を
 自動で `yuzuru run` に包む。
+
+### 待っている間は LLM を止め、終わったら自動で再開する
+
+エージェントが学習や前処理の終了を待つ間、LLM はメモリを抱えたまま何もしていない。yuzuru はその間、
+ルーター用の小モデルや RAM に退避したモデルも含めて全モデルをアンロードし、プロセスが終わると
+セッションの tier のモデルを先に読み込んでから、結果（終了コード、ログの末尾、待つ前にモデルが残したメモ）を
+添えてセッションを再開する。OpenCode は再開のターンで会話の履歴をすべて送り直すので、文脈はそのまま戻る。
+
+- MCP `yuzuru_train`: 既定で `resume_when_done: true`。ジョブを起動したらモデルはターンを終える
+- MCP `yuzuru_wait`: 自分で起動したわけではないプロセス（PID または lease）を待つ
+- CLI: `yuzuru run --resume --session <id> --note "..." --log train.log -- python train.py`、
+  `yuzuru wait --pid 1234 --session <id>`、`yuzuru events -f`
+
+再開は `opencode run --session <id> "<結果>"` で行う（OpenCode 1.x / 2.x 共通。`resume.command` で変更可）。
+OpenCode のバックグラウンドサービスにつながっている TUI なら、再開したターンがそのまま表示される。
 
 ### ルーティング
 
@@ -176,8 +195,20 @@ OpenCode v2 は「バックグラウンドサーバー + クライアント」�
 3. **手元の OpenCode から yuzuru だけを使う**（`ssh -L 11435:127.0.0.1:11435`）— LLM の推論は GPU マシンで
    行われるが、bash やファイル操作は手元で実行されるので、学習ジョブを GPU マシンで動かす用途には向かない。
 
+yuzuru はジョブを起動できる（MCP の `train` ツールや lease）ので、Webページから叩かれないようにしている。
+`Origin` ヘッダー付きのリクエスト（ブラウザ）は拒否する（許可するなら `allowed_origins`）。トークン未設定時は
+`Host` が localhost 以外のリクエストも拒否する（DNS rebinding 対策）。POST の本文は `application/json` のみ受け付ける。
 yuzuru 自体は既定で `127.0.0.1` にしか bind しない。外部に公開する場合は `YUZURU_TOKEN` を設定すると
 Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を apiKey として送る）。
+
+## トラブルシューティング
+
+- `yuzuru status` の先頭に `!` 付きの警告が出る:
+  - **GPU が応答しない**（カーネルログに `Xid 79, GPU has fallen off the bus`）: yuzuru は残りの GPU だけで動き続ける。
+    再起動か `sudo nvidia-smi -r` で戻ることが多い。繰り返す場合は電源容量・PCIe の挿さり・ライザーを疑う
+  - **Ollama がモデルに対応しない RAM を抱えている**: 強制終了されたランナーの分が残ることがある。`sudo systemctl restart ollama`
+- OpenCode から送られている実際のリクエストを見たいとき: `YUZURU_DUMP=1 yuzuru serve` で、要求モデルごとの最新リクエストを
+  `~/.local/state/yuzuru/last_request_<model>.json` に保存する
 
 ## 開発
 

@@ -89,6 +89,9 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
         log = Path(args.log or f".yuzuru/logs/run-{os.getpid()}.log")
         log.parent.mkdir(parents=True, exist_ok=True)
         argv = [a for a in sys.argv[1:] if a != "--detach"]
+        if not args.log:
+            i = argv.index("run") + 1
+            argv[i:i] = ["--log", str(log.resolve())]
         with log.open("ab") as f:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "yuzuru.cli", *argv],
@@ -100,15 +103,16 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
     env = os.environ.copy()
     lease_id = None
     session = args.session or os.environ.get("YUZURU_SESSION")
+    job = {"pid": os.getpid(), "session": session, "cwd": os.getcwd(),
+           "log": str(Path(args.log).resolve()) if args.log else None,
+           "resume": args.resume, "note": args.note}
     try:
         if args.use:
-            lease = client.call("POST", f"/yuzuru/leases/{args.use}/handover",
-                                {"pid": os.getpid(), "session": session}, timeout=60)
+            lease = client.call("POST", f"/yuzuru/leases/{args.use}/handover", job, timeout=60)
         else:
             lease = client.call(
                 "POST", "/yuzuru/leases",
-                {"pid": os.getpid(), "label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [],
-                 "vram": parse_size(args.vram), "session": session},
+                job | {"label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [], "vram": parse_size(args.vram)},
                 timeout=300,
             )
         lease_id = lease["id"]
@@ -133,12 +137,13 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, forward)
+    rc = -1  # killed before the job finished
     try:
         rc = proc.wait()
     finally:
         if lease_id:
             try:
-                client.call("DELETE", f"/yuzuru/leases/{lease_id}")
+                client.call("DELETE", f"/yuzuru/leases/{lease_id}?rc={rc}")
             except (httpx.HTTPError, SystemExit):
                 pass  # the server also reaps leases whose pid is gone
         if out:
@@ -219,6 +224,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--detach", action="store_true", help="run in the background; print pid and log path")
     p.add_argument("--session", help=argparse.SUPPRESS)  # OpenCode session that started the job
     p.add_argument("--use", metavar="ID", help="run inside a reservation made with `yuzuru reserve`")
+    p.add_argument("--resume", action="store_true", help="resume the OpenCode --session when the job ends")
+    p.add_argument("--note", default="", help="what to do next, passed back when resuming")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
     p = sub.add_parser("reserve", help="force-reserve VRAM / GPUs now (LLM is moved out, memory is held)")
@@ -227,6 +234,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--for", dest="ttl", help="expire after e.g. 30m, 2h (default: until released)")
     p.add_argument("--soft", action="store_true", help="only subtract from the LLM budget; do not allocate")
     p.add_argument("--label", default="reserved")
+
+    p = sub.add_parser("wait", help="free the LLM until a process ends, then resume an OpenCode session")
+    p.add_argument("--pid", type=int)
+    p.add_argument("--lease")
+    p.add_argument("--session", help="OpenCode session to resume (default: the most recently active)")
+    p.add_argument("--note", default="")
+    p.add_argument("--log", help="log file whose tail is passed back on resume")
+    p.add_argument("--no-suspend", action="store_true", help="keep the LLM loaded while waiting")
+    p.add_argument("--no-resume", action="store_true", help="only record the event")
+
+    p = sub.add_parser("events", help="show process-finished events")
+    p.add_argument("--follow", "-f", action="store_true")
 
     p = sub.add_parser("release", help="end a reservation or lease")
     p.add_argument("id")
@@ -263,6 +282,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--install", action="store_true", help="write into the OpenCode config directory")
     p.add_argument("--project", help="install into this project instead of the global config")
     p.add_argument("--set-default", action="store_true", help="make yuzuru/auto the default model")
+    p.add_argument("--local-only", action="store_true",
+                   help="disable OpenCode's built-in cloud models so nothing leaves the machine if yuzuru is down")
 
     args = ap.parse_args(argv)
     if args.command == "serve":
@@ -307,6 +328,24 @@ def main(argv: list[str] | None = None) -> None:
             print(f"reserved {gb(r['vram'] or 0)} on {where} ({'held' if r['hard'] else 'soft'}) as {r['id']}")
             print(f"  run a job in it:  yuzuru run --use {r['id']} -- python train.py")
             print(f"  give it back:     yuzuru release {r['id']}")
+        elif args.command == "wait":
+            r = client.call("POST", "/yuzuru/watches", {
+                "pid": args.pid, "lease": args.lease, "session": args.session, "note": args.note,
+                "log": str(Path(args.log).resolve()) if args.log else None, "cwd": os.getcwd(),
+                "suspend": not args.no_suspend, "resume": not args.no_resume,
+            }, timeout=120)
+            print(f"watching ({r['id']}); session {r['session']} resumes when it ends")
+        elif args.command == "events":
+            after = 0
+            while True:
+                evs = client.call("GET", f"/yuzuru/events?after={after}&wait={60 if args.follow else 0}", timeout=90)
+                for e in evs:
+                    after = max(after, e["id"])
+                    when = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+                    print(f"{when} #{e['id']} {e['label']} rc={e['rc']} after {e['duration'] / 60:.1f} min"
+                          + (f" -> resumed {e['session']}" if e["resumed"] else ""))
+                if not args.follow:
+                    break
         elif args.command == "release":
             print(json.dumps(client.call("DELETE", f"/yuzuru/leases/{args.id}", timeout=60)))
         elif args.command == "pin":

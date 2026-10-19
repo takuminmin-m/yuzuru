@@ -1,0 +1,247 @@
+"""Suspend the LLM while an agent waits on a process; resume the session when it ends.
+
+A *watch* ties a process (a job's lease, or any PID) to an OpenCode session.
+While anything is watched with `suspend`, every model is unloaded so the job
+gets the whole machine. When the process ends, an event is recorded and, if
+asked, the session's model is warmed and the session is continued with the
+outcome (exit code, log tail, the agent's own note). OpenCode resends the
+whole conversation on that turn, so the context comes back with it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import subprocess
+import time
+import uuid
+from collections import deque
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .broker import Broker, Lease, Placement, _pid_alive
+from .config import Config
+
+log = logging.getLogger("yuzuru.waits")
+
+
+@dataclass
+class Watch:
+    id: str
+    session: str | None
+    pid: int | None = None
+    lease: str | None = None
+    label: str = "process"
+    note: str = ""
+    cwd: str | None = None
+    log: str | None = None
+    suspend: bool = True
+    resume: bool = True
+    created: float = field(default_factory=time.time)
+
+
+@dataclass
+class Event:
+    id: int
+    watch: str
+    session: str | None
+    label: str
+    rc: int | None
+    duration: float
+    log: str | None
+    log_tail: str
+    note: str
+    ts: float = field(default_factory=time.time)
+    resumed: bool = False
+    resume_error: str | None = None
+
+
+def tail(path: str | None, cwd: str | None, lines: int) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.is_absolute() and cwd:
+        p = Path(cwd) / p
+    try:
+        with p.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 64 * 1024))
+            data = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(data.splitlines()[-lines:])
+
+
+class Waiter:
+    def __init__(self, cfg: Config, broker: Broker, router: Any) -> None:
+        self.cfg = cfg
+        self.broker = broker
+        self.router = router
+        self.watches: dict[str, Watch] = {}
+        self.events: deque[Event] = deque(maxlen=200)
+        self._next = 1
+        self._changed = asyncio.Event()
+        self.suspended_models: list[str] = []
+        self.suspend_pending = False  # suspend once the waiting sessions go quiet
+        self._tasks: set[asyncio.Task] = set()
+        broker.on_lease_end.append(self._lease_ended)
+
+    # ---------------------------------------------------------------- watches
+
+    async def add(self, **kw: Any) -> Watch:
+        w = Watch(id=uuid.uuid4().hex[:8], **kw)
+        if w.lease and w.lease not in self.broker.leases:
+            raise KeyError(w.lease)
+        if w.pid is not None and not _pid_alive(w.pid):
+            raise ValueError(f"pid {w.pid} is not running")
+        self.watches[w.id] = w
+        log.info("watch %s: %s (session %s, suspend=%s, resume=%s)", w.id, w.label, w.session, w.suspend, w.resume)
+        if w.suspend and self.cfg.resume.suspend_all:
+            self.suspend_pending = True
+        return w
+
+    def watch_lease(self, lease: Lease) -> Watch | None:
+        """Jobs started for a session with resume=True get a watch automatically."""
+        if not (lease.resume and lease.session):
+            return None
+        w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
+                  note=lease.note, cwd=lease.cwd, log=lease.log)
+        self.watches[w.id] = w
+        if self.cfg.resume.suspend_all:
+            self.suspend_pending = True
+        return w
+
+    def _lease_ended(self, lease: Lease, rc: int | None) -> None:
+        for w in [w for w in self.watches.values() if w.lease == lease.id]:
+            self._finish(w, rc)
+
+    async def poll(self) -> None:
+        """Check plain-PID watches (no lease to tell us the exit); suspend when quiet."""
+        for w in [w for w in self.watches.values() if w.pid is not None and not w.lease]:
+            if not _pid_alive(w.pid):
+                self._finish(w, None)
+        if self.suspend_pending and self.watches and self._quiet():
+            self.suspend_pending = False
+            await self.suspend()
+
+    def _quiet(self) -> bool:
+        """No generation in flight and every waiting session idle for a while."""
+        if any(self.broker.inflight.values()):
+            return False
+        cutoff = time.time() - self.cfg.resume.suspend_idle_seconds
+        for w in self.watches.values():
+            st = self.router.sessions.get(w.session) if w.session else None
+            if st and st.updated > cutoff:
+                return False
+        return True
+
+    def _finish(self, w: Watch, rc: int | None) -> None:
+        self.watches.pop(w.id, None)
+        ev = Event(
+            id=self._next, watch=w.id, session=w.session, label=w.label, rc=rc,
+            duration=time.time() - w.created, log=w.log,
+            log_tail=tail(w.log, w.cwd, self.cfg.resume.log_tail_lines), note=w.note,
+        )
+        self._next += 1
+        if not self.watches:
+            self.suspend_pending = False
+        self.events.append(ev)
+        self._changed.set()
+        self._changed = asyncio.Event()
+        log.info("event %d: %s ended (rc=%s) after %.0fs", ev.id, w.label, rc, ev.duration)
+        if w.resume and w.session and self.cfg.resume.enabled:
+            self._spawn(self.resume(ev, w))
+        elif not self.watches:
+            self._spawn(self.unsuspend())
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    # -------------------------------------------------------- suspend/resume
+
+    async def suspend(self) -> None:
+        loaded = [m.name for m in self.broker.loaded]
+        for name in loaded:
+            if name not in self.suspended_models:
+                self.suspended_models.append(name)
+        if loaded:
+            log.info("suspending LLM while waiting: unloading %s", ", ".join(loaded))
+            await self.broker.unload()
+
+    async def unsuspend(self) -> None:
+        """Bring back what was resident before the wait (best effort)."""
+        names, self.suspended_models = self.suspended_models, []
+        for name in names:
+            spec = self.broker.catalog.by_variant(name)
+            if spec and not self.watches:
+                try:
+                    if await self.broker.acquire(spec) is not Placement.NONE:
+                        await self.broker.release(spec)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("reloading %s failed: %s", name, e)
+
+    def message(self, ev: Event) -> str:
+        status = "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
+        minutes = ev.duration / 60
+        parts = [f"[yuzuru] The process you were waiting for ({ev.label}) {status} after {minutes:.1f} min."]
+        if ev.note:
+            parts.append(f"Your note for this moment: {ev.note}")
+        if ev.log_tail:
+            parts.append(f"Last lines of {ev.log}:\n```\n{ev.log_tail}\n```")
+        parts.append("Continue the task from here.")
+        return "\n\n".join(parts)
+
+    async def resume(self, ev: Event, w: Watch) -> None:
+        if not self.watches:
+            if self.cfg.resume.warm_before_resume:
+                await self._warm(ev.session)
+            self.suspended_models = []
+        argv = [a.format(session=ev.session, message=self.message(ev), cwd=w.cwd or "") for a in self.cfg.resume.command]
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=w.cwd or None, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            ev.resumed = True
+            log.info("resumed session %s (pid %d)", ev.session, proc.pid)
+        except OSError as e:
+            ev.resume_error = str(e)
+            log.warning("could not resume session %s: %s", ev.session, e)
+
+    async def _warm(self, session: str | None) -> None:
+        st = self.router.sessions.get(session) if session else None
+        tier = (st.pinned or st.tier) if st else None
+        spec = self.broker.catalog.specs.get(tier or "") if tier else None
+        names = [spec.variant] if spec else list(self.suspended_models)
+        for name in names:
+            s = self.broker.catalog.by_variant(name)
+            if s:
+                try:
+                    if await self.broker.acquire(s) is not Placement.NONE:
+                        await self.broker.release(s)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("warming %s failed: %s", name, e)
+
+    # ----------------------------------------------------------------- events
+
+    async def wait_events(self, after: int, timeout: float) -> list[Event]:
+        """Long-poll: events with id > after, waiting up to `timeout` for one."""
+        found = [e for e in self.events if e.id > after]
+        if found or timeout <= 0:
+            return found
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout)
+        except asyncio.TimeoutError:
+            return []
+        return [e for e in self.events if e.id > after]
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "watches": [asdict(w) for w in self.watches.values()],
+            "suspended": bool(self.suspended_models),
+            "recent_events": [asdict(e) | {"log_tail": e.log_tail[-500:]} for e in list(self.events)[-5:]],
+        }

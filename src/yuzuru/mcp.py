@@ -1,11 +1,15 @@
 """Minimal MCP server (Streamable HTTP, JSON responses only) exposing yuzuru tools.
 
+Tool names are unprefixed; clients namespace them by server (OpenCode shows
+`yuzuru_status`, `yuzuru_train`, ...).
+
 Works with any MCP client; OpenCode picks it up from the `mcp` section that
 `yuzuru opencode --install` writes. Tool results are plain text.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -25,8 +29,8 @@ PROTOCOL_VERSION = "2025-06-18"
 
 INSTRUCTIONS = (
     "yuzuru serves this assistant from local models sized to the free GPU memory. "
-    "Call yuzuru_model with 'large' when a task needs deeper reasoning than the current model gives. "
-    "Start GPU training / fine-tuning with yuzuru_train rather than bash: it moves the LLM out of VRAM first "
+    "Call this server's `model` tool with 'large' when a task needs deeper reasoning than the current model gives. "
+    "Start GPU training / fine-tuning with its `train` tool rather than bash: it moves the LLM out of VRAM first "
     "and runs the job in the background with a log file."
 )
 
@@ -71,7 +75,7 @@ class MCPServer:
     def _register(self) -> None:
         st = self.st
 
-        @self.tool("yuzuru_status", "Show GPU/RAM usage, which local model sizes fit right now, loaded models and "
+        @self.tool("status", "Show GPU/RAM usage, which local model sizes fit right now, loaded models and "
                    "running training jobs (leases).", {})
         async def status(args: dict[str, Any], headers: dict[str, str]) -> str:
             await st.broker.refresh()
@@ -81,7 +85,7 @@ class MCPServer:
                       + (" | cloud (paid API, for problems local models cannot solve)" if st.cfg.cloud.usable else "")
                       + " | an installed model name")
 
-        @self.tool("yuzuru_models", "List the local models installed in Ollama, which tier each serves, and whether "
+        @self.tool("models", "List the local models installed in Ollama, which tier each serves, and whether "
                    "each is enabled.", {})
         async def models(args: dict[str, Any], headers: dict[str, str]) -> str:
             lines = []
@@ -94,10 +98,10 @@ class MCPServer:
             return "\n".join(lines) or "no models installed"
 
         @self.tool(
-            "yuzuru_model",
+            "model",
             "Choose the local model for the rest of this session, from the next model call on: a size tier "
             "('large' before hard multi-step work such as architecture, subtle debugging or math; the smallest tier "
-            "for trivial chores), a specific installed model name (see yuzuru_models), or 'auto' to let the router "
+            "for trivial chores), a specific installed model name (see the `models` tool), or 'auto' to let the router "
             "decide per message again.",
             {"tier": {"type": "string", "description": tiers_desc},
              "session": {"type": "string", "description": "session id (optional; defaults to the active session)"}},
@@ -112,7 +116,7 @@ class MCPServer:
             return f"model for session {session}: {st.router.sessions[session].pinned or 'auto'}"
 
         @self.tool(
-            "yuzuru_train",
+            "train",
             "Start a GPU training / fine-tuning job in the background. yuzuru first moves the local LLM out of GPU "
             "memory, waits for the job's memory use to settle, then lets the LLM use what remains. Returns the PID "
             "and log file; read the log to follow progress.",
@@ -122,6 +126,9 @@ class MCPServer:
                 "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional)"},
                 "vram": {"type": "string", "description": "VRAM to reserve, e.g. '10G' (optional; default measured)"},
                 "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
+                "resume_when_done": {"type": "boolean", "description": "free the LLM while the job runs and "
+                                     "resume this session when it ends (default true); end your turn after starting"},
+                "note": {"type": "string", "description": "what you will do when the job ends (handed back to you)"},
             },
             ["command", "cwd"],
         )
@@ -136,14 +143,47 @@ class MCPServer:
                 argv += ["--gpu", g]
             if args.get("vram"):
                 argv += ["--vram", args["vram"]]
-            if session := st.router.header_session(headers) or st.router.last_session:
+            session = st.router.header_session(headers) or st.router.last_session
+            resume = args.get("resume_when_done", True) and session is not None
+            if session:
                 argv += ["--session", session]
+            if resume:
+                argv += ["--resume", "--note", args.get("note") or ""]
             argv += ["--", "bash", "-c", args["command"]]
-            r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
-            return f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+            text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+            if resume:
+                text += ("\nThe local LLM is released while the job runs. End your turn now: this session is "
+                         "resumed automatically with the exit status and the log tail when the job ends.")
+            return text
+
+        @self.tool(
+            "wait",
+            "Wait for a running process to finish without holding GPU/RAM: yuzuru unloads the local LLM, then "
+            "resumes this session with the outcome (exit status, log tail, your note) when the process exits. "
+            "Use it instead of polling or sleeping. End your turn right after calling it.",
+            {
+                "pid": {"type": "integer", "description": "process id to wait for"},
+                "lease": {"type": "string", "description": "or a yuzuru lease id (from the `status` tool)"},
+                "note": {"type": "string", "description": "what you will do when it ends (handed back to you)"},
+                "log": {"type": "string", "description": "log file whose last lines to hand back (optional)"},
+                "cwd": {"type": "string", "description": "working directory for resolving the log path (optional)"},
+            },
+        )
+        async def wait(args: dict[str, Any], headers: dict[str, str]) -> str:
+            session = st.router.header_session(headers) or st.router.last_session
+            if not (args.get("pid") or args.get("lease")):
+                raise ValueError("give pid or lease")
+            w = await st.waiter.add(
+                session=session, pid=int(args["pid"]) if args.get("pid") else None, lease=args.get("lease"),
+                label=f"pid {args['pid']}" if args.get("pid") else f"lease {args['lease']}",
+                note=args.get("note") or "", log=args.get("log"), cwd=args.get("cwd"),
+            )
+            return (f"waiting ({w.id}); the local LLM is unloaded. End your turn now: session {session} is "
+                    "resumed automatically when the process exits.")
 
     async def handle(self, request: Request) -> Response:
         try:

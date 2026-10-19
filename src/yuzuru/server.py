@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import logging
 import secrets
 import uuid
@@ -17,6 +19,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .broker import Broker, Placement
 from .catalog import Catalog
@@ -25,6 +28,7 @@ from .config import Config
 from .ollama import Ollama
 from .resources import Probe, make_probe
 from .router import Router
+from .waits import Waiter
 
 log = logging.getLogger("yuzuru.server")
 
@@ -40,6 +44,7 @@ class State:
         self.broker = Broker(cfg, probe or make_probe(cfg.resources.probe, cfg.resources.ollama_cgroup), self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
+        self.waiter = Waiter(cfg, self.broker, self.router)
         self.tasks: list[asyncio.Task] = []
 
     async def start(self) -> None:
@@ -47,12 +52,21 @@ class State:
         await self.broker.refresh()
         self.tasks.append(asyncio.create_task(self.broker.monitor()))
         self.tasks.append(asyncio.create_task(self._refresh_catalog()))
+        self.tasks.append(asyncio.create_task(self._poll_watches()))
 
     async def stop(self) -> None:
         for t in self.tasks:
             t.cancel()
         await self.http.aclose()
         await self.cloud_http.aclose()
+
+    async def _poll_watches(self) -> None:
+        while True:
+            await asyncio.sleep(2)
+            try:
+                await self.waiter.poll()
+            except Exception as e:  # noqa: BLE001
+                log.warning("watch poll: %r", e)
 
     async def _refresh_catalog(self) -> None:
         """Pick up models pulled/removed while running."""
@@ -88,6 +102,28 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
 
     guarded = [Depends(auth)]
 
+    local_hosts = {"127.0.0.1", "localhost", "::1", cfg.host}
+
+    @app.middleware("http")
+    async def same_machine_clients_only(request: Request, call_next: Any) -> Response:
+        """Keep web pages out: yuzuru can start processes (MCP train tool, leases).
+
+        - Browsers attach Origin to cross-site requests; agent/CLI clients do not.
+        - A Host other than ours means DNS rebinding (unless a token guards the API).
+        - JSON-only POST bodies force a CORS preflight, which is never granted.
+        """
+        origin = request.headers.get("origin")
+        if origin and origin not in cfg.allowed_origins:
+            return JSONResponse({"error": "cross-origin requests are not allowed"}, status_code=403)
+        host = request.headers.get("host", "")
+        hostname = host[1:].split("]")[0] if host.startswith("[") else host.rsplit(":", 1)[0]
+        if not cfg.token and hostname not in local_hosts:
+            return JSONResponse({"error": f"unexpected Host {host!r}"}, status_code=403)
+        if request.method in ("POST", "PUT", "PATCH") and request.headers.get("content-length", "0") != "0":
+            if "application/json" not in request.headers.get("content-type", ""):
+                return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
+        return await call_next(request)
+
     # ------------------------------------------------------------- OpenAI API
 
     @app.get("/v1/models", dependencies=guarded)
@@ -99,6 +135,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
     async def chat(request: Request) -> Response:
         body = await request.json()
         headers = {k.lower(): v for k, v in request.headers.items()}
+        if os.environ.get("YUZURU_DUMP"):  # debugging aid: keep the last request as sent by the client
+            (cfg.state_dir / f"last_request_{str(body.get('model', '')).split('/')[-1]}.json").write_text(json.dumps(body, ensure_ascii=False, indent=1))
         try:
             decision = await st.router.route(body, headers)
         except LookupError as e:
@@ -123,20 +161,31 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             except BaseException:
                 await st.broker.release(spec)
                 raise
+            done = False
+
+            async def finish() -> None:
+                # Runs from the stream's finally and as the response's background
+                # task, so a client that disconnects before the first chunk (the
+                # generator never starts) still frees the model.
+                nonlocal done
+                if not done:
+                    done = True
+                    await upstream.aclose()
+                    await st.broker.release(spec)
 
             async def relay():
                 try:
                     async for chunk in upstream.aiter_bytes():
                         yield chunk
                 finally:
-                    await upstream.aclose()
-                    await st.broker.release(spec)
+                    await finish()
 
             return StreamingResponse(
                 relay(),
                 status_code=upstream.status_code,
                 media_type=upstream.headers.get("content-type", "text/event-stream"),
                 headers=out_headers,
+                background=BackgroundTask(finish),
             )
 
         try:
@@ -207,7 +256,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         c = cfg.cloud
         cloud = {"enabled": c.enabled, "usable": c.usable, "model": c.model, "auto": c.auto,
                  "calls_last_hour": len(st.router.cloud_calls), "limit_per_hour": c.max_requests_per_hour}
-        return st.broker.status() | {"sessions": st.router.sessions_status(), "cloud": cloud}
+        return st.broker.status() | {"sessions": st.router.sessions_status(), "cloud": cloud,
+                                     "waits": st.waiter.status()}
 
     @app.post("/yuzuru/leases", dependencies=guarded)
     async def create_lease(payload: dict[str, Any]) -> dict[str, Any]:
@@ -218,10 +268,16 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                 gpus=[str(g) for g in payload.get("gpus") or []],
                 vram=int(payload["vram"]) if payload.get("vram") else None,
                 session=payload.get("session"),
+                **job_fields(payload),
             )
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
-        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
+        watch = st.waiter.watch_lease(lease)
+        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state, "watch": watch.id if watch else None}
+
+    def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
+        return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
+                "note": str(payload.get("note") or "")}
 
     @app.post("/yuzuru/reservations", dependencies=guarded)
     async def reserve(payload: dict[str, Any]) -> dict[str, Any]:
@@ -245,18 +301,47 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             lease = await st.broker.handover(lease_id, int(payload["pid"]), payload.get("session"))
         except KeyError as e:
             raise HTTPException(404, f"no reservation {lease_id}") from e
-        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
+        for k, v in job_fields(payload).items():
+            setattr(lease, k, v)
+        watch = st.waiter.watch_lease(lease)
+        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state, "watch": watch.id if watch else None}
 
     @app.get("/yuzuru/leases", dependencies=guarded)
     async def list_leases() -> list[dict[str, Any]]:
         return st.broker.status()["leases"]
 
     @app.delete("/yuzuru/leases/{lease_id}", dependencies=guarded)
-    async def release_lease(lease_id: str) -> dict[str, Any]:
-        lease = await st.broker.release_lease(lease_id)
+    async def release_lease(lease_id: str, rc: int | None = None) -> dict[str, Any]:
+        lease = await st.broker.release_lease(lease_id, rc)
         if lease is None:
             raise HTTPException(404, "no such lease")
         return {"released": lease_id}
+
+    @app.post("/yuzuru/watches", dependencies=guarded)
+    async def add_watch(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        session = payload.get("session") or st.router.header_session(headers) or st.router.last_session
+        try:
+            w = await st.waiter.add(
+                session=session, pid=int(payload["pid"]) if payload.get("pid") else None, lease=payload.get("lease"),
+                label=str(payload.get("label") or "process"), note=str(payload.get("note") or ""),
+                cwd=payload.get("cwd"), log=payload.get("log"),
+                suspend=bool(payload.get("suspend", True)), resume=bool(payload.get("resume", True)),
+            )
+        except KeyError as e:
+            raise HTTPException(404, f"no lease {e}") from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        if w.pid is None and w.lease is None:
+            st.waiter.watches.pop(w.id, None)
+            raise HTTPException(400, "give pid or lease")
+        return {"id": w.id, "session": w.session}
+
+    @app.get("/yuzuru/events", dependencies=guarded)
+    async def events(after: int = 0, wait: float = 0) -> list[dict[str, Any]]:
+        from dataclasses import asdict
+
+        return [asdict(e) for e in await st.waiter.wait_events(after, min(wait, 300))]
 
     @app.post("/yuzuru/unload", dependencies=guarded)
     async def unload(payload: dict[str, Any] | None = None) -> dict[str, Any]:

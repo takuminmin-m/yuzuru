@@ -8,6 +8,7 @@ backend (ROCm, Apple unified memory, ...) means adding one probe class.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -36,6 +37,7 @@ class Snapshot:
     ram_total: int = 0
     ram_available: int = 0
     ollama_host: int | None = None  # bytes of host RAM held by Ollama, if measurable
+    lost_gpus: list[str] = field(default_factory=list)  # present but not answering
     ts: float = field(default_factory=time.time)
 
     @property
@@ -136,7 +138,9 @@ class Probe:
 
     def snapshot(self) -> Snapshot:
         total, avail = read_ram()
-        return Snapshot(gpus=self.gpus(), ram_total=total, ram_available=avail, ollama_host=self.host.read())
+        gpus = self.gpus()
+        return Snapshot(gpus=gpus, ram_total=total, ram_available=avail, ollama_host=self.host.read(),
+                        lost_gpus=list(getattr(self, "lost", [])))  # only NvidiaSmiProbe tracks this
 
     def gpus(self) -> list[GPU]:
         return []
@@ -147,26 +151,47 @@ class NvidiaSmiProbe(Probe):
 
     name = "nvidia"
 
+    QUERY = "--query-gpu=index,uuid,name,memory.total,memory.used"
+
     def __init__(self, ollama_cgroup: str = "auto", binary: str = "nvidia-smi") -> None:
         super().__init__(ollama_cgroup)
         self.binary = binary
+        self.lost: list[str] = []  # GPUs that stopped answering (e.g. Xid 79, fallen off the bus)
 
-    def gpus(self) -> list[GPU]:
-        out = subprocess.run(
-            [
-                self.binary,
-                "--query-gpu=index,uuid,name,memory.total,memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout
+    def _query(self, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [self.binary, *extra, self.QUERY, "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+
+    @staticmethod
+    def _parse(out: str) -> list[GPU]:
         gpus = []
         for line in out.strip().splitlines():
             idx, uuid, name, total, used = (p.strip() for p in line.split(","))
             gpus.append(GPU(int(idx), uuid, name, int(total) * MB, int(used) * MB))
+        return gpus
+
+    def gpus(self) -> list[GPU]:
+        r = self._query()
+        if r.returncode == 0:
+            self.lost = []
+            return self._parse(r.stdout)
+        # One dead GPU makes the bulk query fail; ask the others one by one so
+        # the LLM keeps running on what is left instead of everything erroring.
+        listing = subprocess.run([self.binary, "-L"], capture_output=True, text=True, timeout=10)
+        # Query by index: selecting by UUID still touches the dead device and fails.
+        indices = re.findall(r"^GPU (\d+): ", listing.stdout, re.M)
+        if not indices:
+            raise RuntimeError(f"nvidia-smi failed: {(r.stderr or r.stdout).strip()}")
+        gpus = []
+        for index in indices:
+            one = self._query("-i", index)
+            if one.returncode == 0:
+                gpus.extend(self._parse(one.stdout))
+        errors = "\n".join((r.stderr, r.stdout, listing.stdout, listing.stderr))
+        found = re.findall(r"for (?:GPU|gpu) ?([0-9a-fA-F:.]+): (.+)", errors)
+        self.lost = sorted({f"{bus} ({msg.strip()})" for bus, msg in found})
         return gpus
 
 
