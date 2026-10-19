@@ -51,6 +51,8 @@ class State:
         if cfg.ollama.manage:
             self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus], self._ollama_moved)
         self.broker = Broker(cfg, probe, self.ollama, self.catalog)
+        if self.managed:
+            self.broker.pinned = lambda: self.managed.pinned
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
         self.waiter = Waiter(cfg, self.broker, self.router)

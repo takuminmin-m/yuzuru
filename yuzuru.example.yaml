@@ -42,6 +42,7 @@ ollama:
   mirror_from: auto    # auto | none | <system models dir>
   scope: auto          # own systemd user scope, so its cgroup = its host RAM: auto | on | off
   env: {}              # e.g. {OLLAMA_FLASH_ATTENTION: "1"}
+  cuda_pinned_memory: auto  # off on Linux 6.11, which leaks it until reboot: auto | on | off
 
 lease:
   settle_seconds: 15   # job's VRAM use must be stable this long

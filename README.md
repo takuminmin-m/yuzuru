@@ -130,6 +130,10 @@ ollama:
     scope が使えない環境ではプロセスツリーの RSS で測る）
   - 落ちたら自動で再起動し、yuzuru の終了時に止める。yuzuru が強制終了されて残ったものは、次の起動時に止めてから
     起動し直す。ログは `~/.local/state/yuzuru/ollama.log`、状態は `yuzuru status` の `Ollama (managed)` 行
+  - GPU を限定したときは `OLLAMA_VULKAN=0` も付ける。Ollama は CUDA とは別に Vulkan でも GPU を探し、
+    Vulkan は `CUDA_VISIBLE_DEVICES` を見ないので、除外した GPU が Vulkan のデバイスとして現れて使われてしまうため
+    （`ollama.env` に `OLLAMA_VULKAN` を書けばそちらが優先）
+  - Linux 6.11 では `GGML_CUDA_NO_PINNED=1` も付ける（`ollama.cuda_pinned_memory: auto`。下の「RAM が解放されない」）
   - システムの `ollama.service` は 11434 で動いたままでよい（止めるなら `sudo systemctl disable --now ollama`）。
     OpenCode などは yuzuru 経由で使う（11434 を直接使うと、その分は yuzuru から見て他プロセスの使用量になる）
 
@@ -249,7 +253,19 @@ Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を ap
 - `yuzuru status` の先頭に `!` 付きの警告が出る:
   - **GPU が応答しない**（カーネルログに `Xid 79, GPU has fallen off the bus`）: yuzuru は残りの GPU だけで動き続ける。
     再起動か `sudo nvidia-smi -r` で戻ることが多い。繰り返す場合は電源容量・PCIe の挿さり・ライザーを疑う
+  - **RAM がどのプロセスにも属さないまま保持されている**（どのプロセスも持っていないのに RAM が戻らない）: 下記
   - **Ollama がモデルに対応しない RAM を抱えている**: 強制終了されたランナーの分が残ることがある。`sudo systemctl restart ollama`
+- **RAM が再起動するまで解放されない（Linux 6.11）**: CPU に一部を逃がしたモデル（例: 8 GB GPU 上の qwen3.6）を
+  読み込むと、llama.cpp は CPU 側の重みを pinned メモリに置こうとする。6.11 のカーネルは数 GB を超える固定（pin）に
+  失敗すると、固定済みのページを解放しないバグがある（[kernel bug 219427](https://bugzilla.kernel.org/show_bug.cgi?id=219427)、
+  修正は 6.12）。llama.cpp は通常のメモリで動き続けるが、固定されたページは誰のものでもないまま残り、
+  Ollama を止めても戻らない。qwen3.6 では 1 回の読み込みで約 16 GB 失われた
+  - 根本対策はカーネルの更新（6.12 以降。NVIDIA ドライバも新しいカーネルに対応するものへ）。失われた分は再起動でしか戻らない
+  - `ollama.manage: true` なら、6.11 では Ollama を `GGML_CUDA_NO_PINNED=1` 付きで起動して pinned メモリを使わせない
+    （`ollama.cuda_pinned_memory`、既定 `auto`）。システムの `ollama.service` を使う場合は
+    `sudo systemctl edit ollama` で `Environment="GGML_CUDA_NO_PINNED=1"` を足す
+  - それでも読み込みで RAM が失われたら、yuzuru はそのモデルをすぐアンロードし、このカーネルでは CPU に逃がす配置を
+    しない（`~/.local/state/yuzuru/pinned_leaks.json`、カーネルを更新すると無効）。`yuzuru status` にも警告が出る
 - OpenCode から送られている実際のリクエストを見たいとき: `YUZURU_DUMP=1 yuzuru serve` で、要求モデルごとの最新リクエストを
   `~/.local/state/yuzuru/last_request_<model>.json` に保存する
 

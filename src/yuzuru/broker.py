@@ -28,6 +28,7 @@ from typing import Any
 from .catalog import Catalog, ModelSpec
 from .config import MB, Config
 from .ollama import LoadedModel, Ollama, OllamaError
+from .pinleak import LEAK_THRESHOLD, LeakRecord, kernel_leaks_pins, record_path
 from .resources import Probe, Snapshot
 
 log = logging.getLogger("yuzuru.broker")
@@ -101,6 +102,11 @@ class Broker:
         # Called with (lease, exit code or None) whenever a lease ends.
         self.on_lease_end: list[Callable[[Lease, int | None], None]] = []
         self.failed: dict[str, float] = {}  # variant -> time until which it is not offered
+        # Variants whose offloaded load leaked pinned host RAM on this kernel (see pinleak.py).
+        self.pin_leaks = LeakRecord(record_path(cfg.state_dir))
+        # Whether Ollama's llama.cpp may pin host memory: False only when we know it
+        # runs with GGML_CUDA_NO_PINNED (the managed server tells us).
+        self.pinned: Callable[[], bool | None] = lambda: None
 
     # ------------------------------------------------------------------ state
 
@@ -175,6 +181,9 @@ class Broker:
             return spec.measured_host[placement]
         return m.size_ram
 
+    def leaks_when_offloaded(self, variant: str) -> bool:
+        return self.pin_leaks.blocks(variant, self.pinned() is not False)
+
     # -------------------------------------------------------------- placement
 
     def _evictable(self, keep: str) -> list[LoadedModel]:
@@ -208,7 +217,7 @@ class Broker:
         tier = self.cfg.tier(spec.tier)
         spill = need - max(0, free_fast)
         max_frac = tier.max_cpu_fraction if tier and tier.max_cpu_fraction is not None else (0.7 if spec.moe else 0.25)
-        allowed = offload_ok and (tier is None or tier.allow_cpu_offload)
+        allowed = offload_ok and (tier is None or tier.allow_cpu_offload) and not self.leaks_when_offloaded(spec.variant)
         if allowed and not b.unified and spill <= need * max_frac and spec.host_need("offload") <= free_slow:
             return Placement.OFFLOAD
         return Placement.NONE
@@ -254,6 +263,7 @@ class Broker:
                     log.info("loading %s (%s, ~%.1f GB)", spec.variant, placement.value, spec.estimated_size / 2**30)
                     await self.refresh()
                     host_before = self.snapshot.ollama_host
+                    unowned_before = self.snapshot.ram_unowned
                     try:
                         await self.ollama.load(spec.variant, self.cfg.keep_alive)
                     except OllamaError as e:
@@ -265,6 +275,7 @@ class Broker:
                                     spec.variant, LOAD_FAILURE_COOLDOWN / 60, str(e)[:300])
                         raise LoadFailed(str(e)) from e
                     await self.refresh()
+                    await self._check_pin_leak(spec, unowned_before)
                     if self.is_loaded(spec.variant) and host_before is not None and self.snapshot.ollama_host is not None:
                         actual = self.place(spec, offload_ok)
                         taken = self.snapshot.ollama_host - host_before
@@ -275,6 +286,26 @@ class Broker:
         except BaseException:
             self.inflight[spec.variant] -= 1
             raise
+
+    async def _check_pin_leak(self, spec: ModelSpec, before: int | None) -> None:
+        """Unload a model whose load left host RAM pinned and owned by no process.
+
+        That memory is gone until reboot; the model also holds its own copy, so
+        keeping it loaded would push the machine into swap. Remember it so this
+        variant is not offloaded again on this kernel (and fall back for now).
+        """
+        after = self.snapshot.ram_unowned
+        if before is None or after is None or after - before < LEAK_THRESHOLD:
+            return
+        leaked = after - before
+        pinned = self.pinned() is not False
+        self.pin_leaks.add(spec.variant, leaked, pinned)
+        log.error("loading %s leaked %.1f GB of pinned host RAM (kernel %s; only a reboot frees it); "
+                  "unloading it and not offloading it to the CPU again on this kernel",
+                  spec.variant, leaked / 2**30, self.pin_leaks.release)
+        await self.ollama.unload(spec.variant)
+        await self.refresh()
+        raise LoadFailed(f"{spec.variant} leaked {leaked / 2**30:.1f} GB of pinned host RAM while loading")
 
     async def release(self, spec: ModelSpec, touch: bool = True) -> None:
         self.inflight[spec.variant] = max(0, self.inflight[spec.variant] - 1)
@@ -586,7 +617,18 @@ class Broker:
             "usually brings it back; repeated Xid 79 points at power, PCIe seating or riser issues"
             for g in self.snapshot.lost_gpus
         ]
-        if (leak := self.ollama_unattributed()) > 2 * 2**30:
+        unowned = self.snapshot.ram_unowned or 0
+        if unowned > LEAK_THRESHOLD:
+            hint = "a kernel with the fix (6.12 or later) prevents it"
+            if self.pinned() is None:  # the system Ollama: we cannot set its environment
+                hint += ("; until then run Ollama with GGML_CUDA_NO_PINNED=1 (ollama.service) "
+                         "or let yuzuru run it (ollama.manage)")
+            what = ("Linux 6.11 leaks them when llama.cpp pins a large host buffer for a model offloaded to the CPU"
+                    if kernel_leaks_pins(self.pin_leaks.release) else "most likely a failed large pin")
+            out.append(f"{unowned / 2**30:.1f} GB of RAM is held by no process: pinned pages the kernel never "
+                       f"released ({what}). Restarting Ollama does not free it, only a reboot does; {hint}")
+        # Leaked pins charged to Ollama's cgroup are explained above.
+        if (leak := self.ollama_unattributed() - unowned) > 2 * 2**30:
             out.append(
                 f"Ollama holds {leak / 2**30:.1f} GB of RAM that no loaded model accounts for "
                 "(memory from killed runners is sometimes not returned); restarting Ollama frees it, "

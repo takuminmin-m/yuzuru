@@ -17,6 +17,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .pinleak import read_unowned
+
 MB = 1024 * 1024
 
 log = logging.getLogger("yuzuru.resources")
@@ -41,6 +43,7 @@ class Snapshot:
     ram_total: int = 0
     ram_available: int = 0
     ollama_host: int | None = None  # bytes of host RAM held by Ollama, if measurable
+    ram_unowned: int | None = None  # anonymous RAM no process maps (leaked pins), if measurable
     lost_gpus: list[str] = field(default_factory=list)  # present but not answering
     ts: float = field(default_factory=time.time)
 
@@ -212,7 +215,7 @@ class Probe:
         total, avail = read_ram()
         gpus = self.allowed(self.gpus())
         return Snapshot(gpus=gpus, ram_total=total, ram_available=avail, ollama_host=self.host.read(),
-                        lost_gpus=list(getattr(self, "lost", [])))  # only NvidiaSmiProbe tracks this
+                        ram_unowned=read_unowned(), lost_gpus=list(getattr(self, "lost", [])))  # only NvidiaSmiProbe tracks this
 
     def gpus(self) -> list[GPU]:
         return []

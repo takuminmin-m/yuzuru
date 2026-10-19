@@ -182,6 +182,7 @@ def print_status(s: dict[str, Any]) -> None:
     if o.get("managed"):
         state = f"pid {o['pid']}" if o["running"] else "NOT RUNNING"
         print(f"Ollama (managed): {o['url']} {state}, CUDA_VISIBLE_DEVICES={o['cuda_visible_devices'] or 'all'}"
+              + (", no pinned host memory" if o.get("cuda_pinned_memory") is False else "")
               + (f", {o['restarts']} restarts" if o["restarts"] else ""))
     print("\nTiers:")
     for name, t in s["tiers"].items():
