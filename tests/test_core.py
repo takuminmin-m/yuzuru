@@ -293,3 +293,55 @@ async def test_route_direct_model_and_model_pin(cfg, world, http):
         await router.route({**user("hi"), "model": "missing:7b"}, {})
     with pytest.raises(ValueError):
         router.pin("s", "missing:7b")
+
+
+async def test_soft_reservation_shrinks_budget_and_expires(cfg, world, http):
+    catalog, broker, _ = await make(cfg, world, http)
+    before = broker.budget().fast
+    lease = await broker.create_reservation(gpus=["1"], vram=8 * GB, ttl=None, label="mine", hard=False)
+    assert lease.kind == "reservation" and lease.state == "reserved"
+    assert before - broker.budget().fast >= 8 * GB - 1
+    assert broker._settled.is_set()  # a reservation never blocks routing
+    lease.expires = 0  # expire now
+    await broker.refresh()
+    assert lease.id not in broker.leases
+
+
+async def test_whole_gpu_reservation_and_handover(cfg, world, http):
+    catalog, broker, _ = await make(cfg, world, http)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    lease = await broker.create_reservation(gpus=["1"], vram=None, ttl=3600, label="gpu1", hard=False)
+    assert catalog.specs["medium"].variant in world.unloads  # forced out
+    assert 11 * GB < lease.vram <= 12 * GB
+    assert broker.plan(catalog.specs["medium"], True)[0] is not Placement.GPU
+    job = await broker.handover(lease.id, pid=os.getpid())
+    assert job.kind == "job" and job.state == "settling" and job.vram == lease.vram
+    with pytest.raises(KeyError):
+        await broker.handover(lease.id, pid=os.getpid())
+
+
+async def test_reservation_validation(cfg, world, http):
+    _, broker, _ = await make(cfg, world, http)
+    with pytest.raises(ValueError):
+        await broker.create_reservation(gpus=[], vram=4 * GB, ttl=None, label="x", hard=True)  # 2 GPUs: which?
+    with pytest.raises(ValueError):
+        await broker.create_reservation(gpus=["7"], vram=None, ttl=None, label="x", hard=False)
+
+
+async def test_handover_from_hard_reservation_keeps_lease(cfg, world, http, monkeypatch):
+    _, broker, _ = await make(cfg, world, http)
+    holder_pid = 2**22 + 777  # not alive, like a holder that just exited
+
+    async def fake_spawn(gpus, sizes, ttl):
+        return os.getpid()
+
+    async def fake_stop(pid):
+        world.foreign[1] = 0
+
+    monkeypatch.setattr(broker, "_spawn_holder", fake_spawn)
+    monkeypatch.setattr(broker, "_stop_holder", fake_stop)
+    lease = await broker.create_reservation(gpus=["1"], vram=6 * GB, ttl=None, label="h", hard=True)
+    lease.pid = holder_pid  # the holder is gone by the time the job takes over
+    job = await broker.handover(lease.id, pid=os.getpid())
+    assert job.id in broker.leases and job.state == "settling"

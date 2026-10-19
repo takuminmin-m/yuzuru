@@ -13,8 +13,10 @@ models across any number of GPUs and spills to RAM; the broker only decides
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import sys
 import time
 import uuid
 from collections import Counter
@@ -52,8 +54,12 @@ class Lease:
     gpus: list[str]  # GPU uuids; empty = the whole pool
     vram: int | None  # explicit reservation in bytes; None = measure it
     session: str | None = None  # OpenCode session that started the job, if any
+    kind: str = "job"  # job | reservation (user-forced, no job yet)
+    hard: bool = False  # reservation backed by a holder process that occupies the VRAM
+    expires: float | None = None
     created: float = field(default_factory=time.time)
-    state: str = "draining"  # draining (LLM leaving) -> settling (job allocating) -> active
+    # job: draining (LLM leaving) -> settling (job allocating) -> active; reservation: reserved
+    state: str = "draining"
     baseline: int = 0  # memory in use on the leased devices once the LLM left
     level: int = 0
     last_change: float = field(default_factory=time.time)
@@ -79,6 +85,7 @@ class Broker:
         self._settled = asyncio.Event()
         self._settled.set()
         self._restore_task: asyncio.Task | None = None
+        self._holders: dict[int, asyncio.subprocess.Process] = {}
 
     # ------------------------------------------------------------------ state
 
@@ -101,6 +108,9 @@ class Broker:
 
     def _lease_reserve(self, lease: Lease) -> int:
         snap = self.snapshot
+        if lease.kind == "reservation":
+            # A hard reservation's holder shows up as growth, so it nets to ~0 here.
+            return max(0, (lease.vram or 0) - lease.grown)
         if lease.state in ("draining", "settling"):
             # Hold every free byte on the leased devices until the job settles.
             devs = [g for g in snap.gpus if not lease.gpus or g.uuid in lease.gpus]
@@ -255,24 +265,19 @@ class Broker:
             except asyncio.TimeoutError:
                 log.warning("lease settle wait timed out; continuing")
 
-    async def create_lease(
-        self, pid: int, label: str, gpus: list[str], vram: int | None, session: str | None = None
-    ) -> Lease:
-        await self.refresh()
+    def _resolve_gpus(self, gpus: list[str]) -> list[str]:
         resolved = []
         for g in gpus:
             gpu = self.snapshot.gpu(g)
             if gpu is None:
                 raise ValueError(f"unknown GPU {g!r}")
             resolved.append(gpu.uuid)
-        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session)
-        self._settled.clear()
-        self.leases[lease.id] = lease
+        return resolved
 
-        deadline = time.time() + self.cfg.lease.drain_timeout
-        while time.time() < deadline and any(
-            self.inflight[m.name] for m in self.loaded if m.size_vram > 0
-        ):
+    async def _clear_gpus(self, lease: Lease, drain: bool = True) -> None:
+        """Unload GPU-resident models for `lease` and take its baseline."""
+        deadline = time.time() + (self.cfg.lease.drain_timeout if drain else 0)
+        while time.time() < deadline and any(self.inflight[m.name] for m in self.loaded if m.size_vram > 0):
             await asyncio.sleep(0.5)
         async with self.lock:
             await self.refresh()
@@ -284,19 +289,129 @@ class Broker:
             await self.refresh()
             lease.baseline = lease.level = self._device_level(lease.gpus)
             lease.last_change = time.time()
-            lease.state = "settling"
+
+    async def create_lease(
+        self, pid: int, label: str, gpus: list[str], vram: int | None, session: str | None = None,
+        drain: bool = True,
+    ) -> Lease:
+        await self.refresh()
+        resolved = self._resolve_gpus(gpus)
+        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session)
+        self._settled.clear()
+        self.leases[lease.id] = lease
+        await self._clear_gpus(lease, drain)
+        lease.state = "settling"
         log.info("lease %s (%s, pid %d) created", lease.id, label, pid)
+        return lease
+
+    async def create_reservation(
+        self, gpus: list[str], vram: int | None, ttl: float | None, label: str, hard: bool = True,
+    ) -> Lease:
+        """User-forced reservation of VRAM/GPUs, with or without a job.
+
+        hard: a holder process allocates the memory so nothing can take it
+        (NVIDIA only). soft: the budget subtracts it (any hardware). With no
+        `vram`, the whole free memory of the chosen GPUs is reserved.
+        """
+        await self.refresh()
+        resolved = self._resolve_gpus(gpus)
+        if not resolved and len(self.snapshot.gpus) == 1:
+            resolved = [self.snapshot.gpus[0].uuid]
+        if hard and not resolved:
+            raise ValueError("a hard reservation needs --gpu (several GPUs present)")
+        if vram is None and not resolved:
+            raise ValueError("give --vram, --gpu, or both")
+        lease = Lease(
+            id=uuid.uuid4().hex[:8], pid=os.getpid(), label=label, gpus=resolved, vram=vram, kind="reservation",
+            hard=hard, state="reserved", expires=time.time() + ttl if ttl else None,
+        )
+        self.leases[lease.id] = lease
+        try:
+            await self._clear_gpus(lease, drain=False)
+            devs = [g for g in self.snapshot.gpus if g.uuid in resolved]
+            margin = self.cfg.resources.vram_margin_mb * MB
+            if vram is None:
+                sizes = [max(0, g.free - margin) for g in devs]
+                lease.vram = sum(sizes)
+            else:
+                sizes = [vram // len(devs)] * len(devs) if devs else []
+            if hard:
+                lease.pid = await self._spawn_holder(resolved, sizes, ttl)
+                await asyncio.sleep(1.0)
+                await self.refresh()
+                lease.level = self._device_level(resolved)
+        except BaseException:
+            self.leases.pop(lease.id, None)
+            raise
+        log.info("reservation %s: %.1f GB on %s (%s)", lease.id, (lease.vram or 0) / 2**30,
+                 ",".join(resolved) or "pool", "hard" if hard else "soft")
+        return lease
+
+    async def _spawn_holder(self, gpus: list[str], sizes: list[int], ttl: float | None) -> int:
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(gpus), "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "yuzuru.holder", "--bytes", ",".join(map(str, sizes)), "--ttl", str(ttl or 0),
+            env=env, stdout=asyncio.subprocess.PIPE, stdin=asyncio.subprocess.DEVNULL, start_new_session=True,
+        )
+        assert proc.stdout is not None
+        try:
+            line = await asyncio.wait_for(proc.stdout.readline(), 120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("VRAM holder did not start in time")
+        info = json.loads(line or b'{"ok": false, "error": "holder exited"}')
+        if not info.get("ok"):
+            await proc.wait()
+            raise RuntimeError(info.get("error", "holder failed"))
+        self._holders[proc.pid] = proc
+        return proc.pid
+
+    async def _stop_holder(self, pid: int) -> None:
+        proc = self._holders.pop(pid, None)
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), 10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+    async def handover(self, lease_id: str, pid: int, session: str | None = None) -> Lease:
+        """Turn a reservation into the lease of the job that will use it."""
+        lease = self.leases.get(lease_id)
+        if lease is None or lease.kind != "reservation":
+            raise KeyError(lease_id)
+        self._settled.clear()
+        # Switch owner first: a refresh while the holder is gone must not reap the lease.
+        holder, was_hard = lease.pid, lease.hard
+        lease.kind, lease.hard, lease.pid, lease.expires = "job", False, pid, None
+        lease.state = "draining"
+        if was_hard:
+            await self._stop_holder(holder)
+            await asyncio.sleep(1.0)
+            await self.refresh()
+        lease.session = session or lease.session
+        lease.baseline = lease.level = self._device_level(lease.gpus)
+        lease.created = lease.last_change = time.time()
+        lease.state = "settling"
+        log.info("reservation %s handed to pid %d", lease_id, pid)
         return lease
 
     async def release_lease(self, lease_id: str) -> Lease | None:
         lease = self.leases.pop(lease_id, None)
         if lease is None:
             return None
+        if lease.hard:
+            await self._stop_holder(lease.pid)
         log.info("lease %s released", lease_id)
+        self._ended(lease)
+        return lease
+
+    def _ended(self, lease: Lease) -> None:
         self._update_leases()
         if self.cfg.lease.restore_after and not self.leases and lease.restore:
             self._restore_task = asyncio.create_task(self._restore(lease.restore))
-        return lease
 
     async def _restore(self, variants: list[str]) -> None:
         await asyncio.sleep(2.0)
@@ -312,9 +427,21 @@ class Broker:
     def _update_leases(self) -> None:
         now = time.time()
         for lease in list(self.leases.values()):
-            if not _pid_alive(lease.pid):
-                log.info("lease %s: pid %d gone", lease.id, lease.pid)
+            gone = not _pid_alive(lease.pid) or (lease.hard and lease.pid in self._holders
+                                                  and self._holders[lease.pid].returncode is not None)
+            expired = lease.expires is not None and now >= lease.expires
+            if gone or expired:
+                log.info("lease %s: %s", lease.id, "expired" if expired else f"pid {lease.pid} gone")
                 self.leases.pop(lease.id)
+                if lease.hard:
+                    holder = self._holders.pop(lease.pid, None)
+                    if holder and holder.returncode is None:
+                        holder.terminate()
+                if self.cfg.lease.restore_after and not self.leases and lease.restore:
+                    try:
+                        self._restore_task = asyncio.get_running_loop().create_task(self._restore(lease.restore))
+                    except RuntimeError:
+                        pass
                 continue
             if lease.state == "draining":
                 continue
@@ -328,7 +455,7 @@ class Broker:
                 if (quiet and allocated) or now - lease.created >= self.cfg.lease.settle_timeout:
                     lease.state = "active"
                     log.info("lease %s settled at +%.1f GB", lease.id, lease.grown / 2**30)
-        if all(l.state == "active" for l in self.leases.values()):
+        if all(l.state in ("active", "reserved") for l in self.leases.values()):
             self._settled.set()
         else:
             self._settled.clear()

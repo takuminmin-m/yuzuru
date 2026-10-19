@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,16 @@ def parse_size(text: str | None) -> int | None:
     if not m:
         raise SystemExit(f"bad size: {text!r}")
     return int(float(m.group(1)) * UNITS[m.group(2)])
+
+
+def parse_duration(text: str | None) -> float | None:
+    """'90s', '30m', '2h', '1d', '45' (minutes) -> seconds."""
+    if not text:
+        return None
+    m = re.fullmatch(r"\s*([\d.]+)\s*([smhd]?)\s*", text.lower())
+    if not m:
+        raise SystemExit(f"bad duration: {text!r}")
+    return float(m.group(1)) * {"s": 1, "m": 60, "": 60, "h": 3600, "d": 86400}[m.group(2)]
 
 
 def gb(n: float) -> str:
@@ -88,13 +99,18 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
 
     env = os.environ.copy()
     lease_id = None
+    session = args.session or os.environ.get("YUZURU_SESSION")
     try:
-        lease = client.call(
-            "POST", "/yuzuru/leases",
-            {"pid": os.getpid(), "label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [],
-             "vram": parse_size(args.vram), "session": args.session or os.environ.get("YUZURU_SESSION")},
-            timeout=300,
-        )
+        if args.use:
+            lease = client.call("POST", f"/yuzuru/leases/{args.use}/handover",
+                                {"pid": os.getpid(), "session": session}, timeout=60)
+        else:
+            lease = client.call(
+                "POST", "/yuzuru/leases",
+                {"pid": os.getpid(), "label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [],
+                 "vram": parse_size(args.vram), "session": session},
+                timeout=300,
+            )
         lease_id = lease["id"]
         if lease["gpus"]:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
@@ -158,7 +174,11 @@ def print_status(s: dict[str, Any]) -> None:
         print("\nLeases:")
         for l in s["leases"]:
             where = ",".join(g[:12] for g in l["gpus"]) or "any GPU"
-            print(f"  {l['id']} {l['label']:<20} pid {l['pid']:<8} {l['state']:<9} +{gb(l['grown'])} on {where}")
+            if l["kind"] == "reservation":
+                left = f", {int((l['expires'] - time.time()) / 60)} min left" if l["expires"] else ""
+                print(f"  {l['id']} {l['label']:<20} {'held' if l['hard'] else 'soft':<13} {gb(l['vram'] or 0)} on {where}{left}")
+            else:
+                print(f"  {l['id']} {l['label']:<20} pid {l['pid']:<8} {l['state']:<9} +{gb(l['grown'])} on {where}")
 
 
 def print_models(r: dict[str, Any]) -> None:
@@ -194,7 +214,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--log", help="write the job's output to this file")
     p.add_argument("--detach", action="store_true", help="run in the background; print pid and log path")
     p.add_argument("--session", help=argparse.SUPPRESS)  # OpenCode session that started the job
+    p.add_argument("--use", metavar="ID", help="run inside a reservation made with `yuzuru reserve`")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    p = sub.add_parser("reserve", help="force-reserve VRAM / GPUs now (LLM is moved out, memory is held)")
+    p.add_argument("--gpu", action="append", help="GPU index or UUID (repeatable); default: the only GPU")
+    p.add_argument("--vram", help="amount, e.g. 10G (default: everything free on the chosen GPUs)")
+    p.add_argument("--for", dest="ttl", help="expire after e.g. 30m, 2h (default: until released)")
+    p.add_argument("--soft", action="store_true", help="only subtract from the LLM budget; do not allocate")
+    p.add_argument("--label", default="reserved")
+
+    p = sub.add_parser("release", help="end a reservation or lease")
+    p.add_argument("id")
 
     p = sub.add_parser("status", help="show memory, tiers, models, leases")
     p.add_argument("--json", action="store_true")
@@ -263,6 +294,17 @@ def main(argv: list[str] | None = None) -> None:
                 print("tiers: " + ", ".join(f"{t}={m}" for t, m in r["tiers"].items()))
             else:
                 print_models(client.call("GET", "/yuzuru/models"))
+        elif args.command == "reserve":
+            r = client.call("POST", "/yuzuru/reservations", {
+                "gpus": args.gpu or [], "vram": parse_size(args.vram), "ttl": parse_duration(args.ttl),
+                "label": args.label, "hard": not args.soft,
+            }, timeout=300)
+            where = ",".join(g[:12] for g in r["gpus"]) or "GPU pool"
+            print(f"reserved {gb(r['vram'] or 0)} on {where} ({'held' if r['hard'] else 'soft'}) as {r['id']}")
+            print(f"  run a job in it:  yuzuru run --use {r['id']} -- python train.py")
+            print(f"  give it back:     yuzuru release {r['id']}")
+        elif args.command == "release":
+            print(json.dumps(client.call("DELETE", f"/yuzuru/leases/{args.id}", timeout=60)))
         elif args.command == "pin":
             print(json.dumps(client.call("POST", f"/yuzuru/sessions/{args.session}/pin", {"tier": args.tier})))
     except httpx.ConnectError:

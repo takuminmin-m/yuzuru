@@ -64,6 +64,23 @@ yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
 
+### VRAM / GPU を強制的に確保する
+
+ジョブを始める前に「この GPU（この量）は空けておいて」と押さえておける。
+
+```bash
+yuzuru reserve --gpu 1                 # GPU1 の空きを丸ごと確保（LLM は即座に退く）
+yuzuru reserve --gpu 1 --vram 10G --for 2h
+yuzuru reserve --vram 8G --soft        # 予算から差し引くだけ（GPUの種類を問わない）
+yuzuru run --use <id> -- python train.py   # 確保した枠でジョブを実行（そのまま lease に引き継ぐ）
+yuzuru release <id>
+```
+
+既定は **hard**: 小さなホルダープロセスが libcuda（NVIDIA ドライバ同梱。torch 不要）経由で実際に VRAM を
+確保するので、Ollama も他のプロセスもその分を使えない。`run --use` するとホルダーが解放した直後に
+ジョブへ引き継ぐ（間に LLM が割り込まない）。`--soft` は確保量を LLM の予算から引くだけで、NVIDIA 以外でも使える。
+`--for` を過ぎるか、ホルダーが落ちると自動で解放され、元のモデルが戻る。
+
 OpenCode 上では MCP の `yuzuru_train` ツール（バックグラウンド実行 + ログファイル）を使うよう、MCP の
 instructions とツール説明でモデルに指示している（bash ツールはタイムアウトがあるので長い学習に向かない）。
 OpenCode 1.x ではさらにプラグインが `python train.py` / `torchrun` / `accelerate launch` などの bash 実行を

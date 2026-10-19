@@ -190,6 +190,30 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             raise HTTPException(400, str(e)) from e
         return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
 
+    @app.post("/yuzuru/reservations", dependencies=guarded)
+    async def reserve(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            lease = await st.broker.create_reservation(
+                gpus=[str(g) for g in payload.get("gpus") or []],
+                vram=int(payload["vram"]) if payload.get("vram") else None,
+                ttl=float(payload["ttl"]) if payload.get("ttl") else None,
+                label=str(payload.get("label", "reserved")),
+                hard=bool(payload.get("hard", True)),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        return {"id": lease.id, "gpus": lease.gpus, "vram": lease.vram, "hard": lease.hard, "expires": lease.expires}
+
+    @app.post("/yuzuru/leases/{lease_id}/handover", dependencies=guarded)
+    async def handover(lease_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            lease = await st.broker.handover(lease_id, int(payload["pid"]), payload.get("session"))
+        except KeyError as e:
+            raise HTTPException(404, f"no reservation {lease_id}") from e
+        return {"id": lease.id, "gpus": lease.gpus, "state": lease.state}
+
     @app.get("/yuzuru/leases", dependencies=guarded)
     async def list_leases() -> list[dict[str, Any]]:
         return st.broker.status()["leases"]
