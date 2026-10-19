@@ -254,8 +254,14 @@ class Broker:
         if not touch:
             return
         # OpenAI-endpoint requests reset keep_alive to Ollama's default; restore ours.
+        # The same call loads a model that is not resident, so only touch one that
+        # still is: a lease or a wait may have unloaded it while this request ran,
+        # and reloading it here would take the memory a training job just got.
         try:
-            await self.ollama.load(spec.variant, self.cfg.keep_alive)
+            if not self._settled.is_set() or self.inflight[spec.variant]:
+                return
+            if spec.variant in {m.name for m in await self.ollama.ps()}:
+                await self.ollama.load(spec.variant, self.cfg.keep_alive)
         except Exception as e:  # noqa: BLE001 - best effort
             log.debug("keep_alive refresh failed: %s", e)
 
