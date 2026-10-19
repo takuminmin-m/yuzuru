@@ -128,12 +128,38 @@ class ProfileStore:
         self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True))
 
 
+class Selection:
+    """The user's model choices, persisted across restarts.
+
+    `assign` pins a model to a tier (beats config and auto-assignment);
+    `disabled` models are never auto-assigned or offered.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.assign: dict[str, str] = {}
+        self.disabled: set[str] = set()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                self.assign = dict(data.get("assign", {}))
+                self.disabled = set(data.get("disabled", []))
+            except json.JSONDecodeError:
+                log.warning("ignoring corrupt selection file %s", path)
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"assign": self.assign, "disabled": sorted(self.disabled)}, indent=1))
+
+
 class Catalog:
     def __init__(self, cfg: Config, ollama: Ollama) -> None:
         self.cfg = cfg
         self.ollama = ollama
         self.profiles = ProfileStore(cfg.state_dir / "profiles.json")
+        self.selection = Selection(cfg.state_dir / "selection.json")
         self.specs: dict[str, ModelSpec] = {}  # tier -> spec
+        self.direct: dict[str, ModelSpec] = {}  # model name -> spec, for explicitly chosen models
         self.router_spec: ModelSpec | None = None
         self.installed: dict[str, dict[str, Any]] = {}
 
@@ -143,8 +169,73 @@ class Catalog:
         return [t.name for t in self.cfg.tiers if t.name in self.specs]
 
     def by_variant(self, variant: str) -> ModelSpec | None:
-        specs = list(self.specs.values()) + ([self.router_spec] if self.router_spec else [])
+        specs = list(self.specs.values()) + list(self.direct.values())
+        specs += [self.router_spec] if self.router_spec else []
         return next((s for s in specs if s.variant == variant), None)
+
+    def resolve(self, name: str) -> str | None:
+        """Installed model name for `name` (accepts a missing ':latest')."""
+        for key in (name, f"{name}:latest"):
+            if key in self.installed:
+                return key
+        return None
+
+    @property
+    def enabled(self) -> list[str]:
+        return sorted(n for n, m in self.installed.items() if n not in self.selection.disabled and not _is_embedding(m))
+
+    async def direct_spec(self, model: str) -> ModelSpec:
+        """Spec for a model chosen by name, outside the tier mapping."""
+        name = self.resolve(model)
+        if name is None:
+            raise KeyError(model)
+        if name not in self.direct:
+            top = self.cfg.tiers[-1]
+            self.direct[name] = await self._spec(top, name, tier="direct")
+        return self.direct[name]
+
+    def models_info(self) -> list[dict[str, Any]]:
+        tier_of = {s.base: t for t, s in self.specs.items()}
+        out = []
+        for name, m in sorted(self.installed.items()):
+            d = m.get("details", {})
+            out.append({
+                "name": name,
+                "params_b": parse_params_b(d),
+                "size": m.get("size", 0),
+                "quantization": d.get("quantization_level"),
+                "family": d.get("family"),
+                "moe": self.profiles.get(name).get("moe"),
+                "tier": tier_of.get(name),
+                "pinned_to": next((t for t, n in self.selection.assign.items() if self.resolve(n) == name), None),
+                "enabled": name not in self.selection.disabled,
+                "embedding": _is_embedding(m),
+            })
+        return out
+
+    def assign(self, tier: str, model: str | None) -> None:
+        if self.cfg.tier(tier) is None:
+            raise ValueError(f"unknown tier {tier!r}")
+        if model is None:
+            self.selection.assign.pop(tier, None)
+        else:
+            name = self.resolve(model)
+            if name is None:
+                raise ValueError(f"model {model!r} is not installed in Ollama")
+            self.selection.assign[tier] = name
+            self.selection.disabled.discard(name)
+        self.selection.save()
+
+    def set_enabled(self, model: str, enabled: bool) -> None:
+        name = self.resolve(model)
+        if name is None:
+            raise ValueError(f"model {model!r} is not installed in Ollama")
+        if enabled:
+            self.selection.disabled.discard(name)
+        else:
+            self.selection.disabled.add(name)
+            self.selection.assign = {t: n for t, n in self.selection.assign.items() if n != name}
+        self.selection.save()
 
     def nearest_tier(self, wanted: str) -> str | None:
         """`wanted` if it has a model, else the closest larger tier, else the closest smaller."""
@@ -163,6 +254,7 @@ class Catalog:
             m["name"]: m for m in models if not m["name"].startswith("yuzuru-")
         }
         self.specs = {}
+        self.direct = {k: v for k, v in self.direct.items() if k in self.installed}
         assigned = self._assign()
         for tier_cfg in self.cfg.tiers:
             base = assigned.get(tier_cfg.name)
@@ -180,31 +272,36 @@ class Catalog:
         log.debug("tiers: %s", {t: s.base for t, s in self.specs.items()})
 
     def _assign(self) -> dict[str, str]:
-        """Pick a base model for each tier: explicit candidates first, then by size."""
+        """Pick a base model per tier: user selection, then config candidates, then by size."""
         out: dict[str, str] = {}
         taken: set[str] = set()
+        disabled = self.selection.disabled
 
         def resolve(name: str) -> str | None:
-            for key in (name, f"{name}:latest"):
-                if key in self.installed:
-                    return key
-            return None
+            found = self.resolve(name)
+            return found if found and found not in disabled else None
 
         for t in self.cfg.tiers:
+            if (name := resolve(self.selection.assign.get(t.name, ""))) is not None:
+                out[t.name] = name
+                taken.add(name)
+        for t in self.cfg.tiers:
+            if t.name in out:
+                continue
             for cand in t.models:
                 if (name := resolve(cand)) is not None:
                     out[t.name] = name
                     taken.add(name)
                     break
 
-        auto = [t for t in self.cfg.tiers if not t.models]
+        auto = [t for t in self.cfg.tiers if not t.models and t.name not in out]
         if not auto:
             return out
         pool = sorted(
             (
                 (parse_params_b(m.get("details", {})), name)
                 for name, m in self.installed.items()
-                if name not in taken and not _is_embedding(m)
+                if name not in taken and name not in disabled and not _is_embedding(m)
             ),
             reverse=True,
         )

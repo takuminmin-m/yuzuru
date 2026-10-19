@@ -90,7 +90,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
 
     @app.get("/v1/models", dependencies=guarded)
     async def models() -> dict[str, Any]:
-        ids = ["auto"] + st.catalog.tiers
+        ids = ["auto"] + st.catalog.tiers + st.catalog.enabled
         return {"object": "list", "data": [{"id": i, "object": "model", "owned_by": "yuzuru"} for i in ids]}
 
     @app.post("/v1/chat/completions", dependencies=guarded)
@@ -99,6 +99,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         headers = {k.lower(): v for k, v in request.headers.items()}
         try:
             decision = await st.router.route(body, headers)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
         except RuntimeError as e:
             raise HTTPException(503, str(e)) from e
         spec = decision.spec
@@ -240,6 +242,29 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         return {"session": session, "pinned": st.router.sessions[session].pinned}
+
+    @app.get("/yuzuru/models", dependencies=guarded)
+    async def list_models() -> dict[str, Any]:
+        return {"models": st.catalog.models_info(), "tiers": {t: s.base for t, s in st.catalog.specs.items()}}
+
+    @app.post("/yuzuru/models/assign", dependencies=guarded)
+    async def assign_model(payload: dict[str, Any]) -> dict[str, Any]:
+        model = payload.get("model")
+        try:
+            st.catalog.assign(str(payload.get("tier", "")), None if model in (None, "", "auto") else model)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        await st.catalog.refresh()
+        return {"tiers": {t: s.base for t, s in st.catalog.specs.items()}}
+
+    @app.post("/yuzuru/models/enable", dependencies=guarded)
+    async def enable_model(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            st.catalog.set_enabled(str(payload.get("model", "")), bool(payload.get("enabled", True)))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        await st.catalog.refresh()
+        return {"tiers": {t: s.base for t, s in st.catalog.specs.items()}, "enabled": st.catalog.enabled}
 
     @app.post("/yuzuru/refresh", dependencies=guarded)
     async def refresh() -> dict[str, Any]:

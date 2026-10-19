@@ -161,6 +161,18 @@ def print_status(s: dict[str, Any]) -> None:
             print(f"  {l['id']} {l['label']:<20} pid {l['pid']:<8} {l['state']:<9} +{gb(l['grown'])} on {where}")
 
 
+def print_models(r: dict[str, Any]) -> None:
+    print(f"{'MODEL':<32} {'PARAMS':>7} {'SIZE':>8}  {'QUANT':<8} {'TIER':<8} STATE")
+    for m in r["models"]:
+        if m["embedding"]:
+            continue
+        state = "disabled" if not m["enabled"] else ("pinned" if m["pinned_to"] else "")
+        moe = " moe" if m["moe"] else ""
+        print(f"{m['name']:<32} {m['params_b']:>6.1f}B {gb(m['size']):>8}  {m['quantization'] or '':<8} "
+              f"{m['tier'] or '-':<8} {state}{moe}")
+    print("\nchange with: yuzuru models use <tier> <model|auto> / yuzuru models disable <model>")
+
+
 # ----------------------------------------------------------------------- main
 
 
@@ -201,6 +213,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("session")
     p.add_argument("tier")
 
+    p = sub.add_parser("models", help="list models / choose which model serves a tier")
+    msub = p.add_subparsers(dest="models_cmd")
+    msub.add_parser("list", help="installed models and their tiers (default)")
+    q = msub.add_parser("use", help="serve TIER with MODEL ('auto' = back to automatic)")
+    q.add_argument("tier")
+    q.add_argument("model")
+    q = msub.add_parser("disable", help="never use MODEL")
+    q.add_argument("model")
+    q = msub.add_parser("enable", help="allow MODEL again")
+    q.add_argument("model")
+
     p = sub.add_parser("opencode", help="print or install the OpenCode provider + plugin")
     p.add_argument("--install", action="store_true", help="write into the OpenCode config directory")
     p.add_argument("--project", help="install into this project instead of the global config")
@@ -230,6 +253,16 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(client.call("POST", "/yuzuru/warm", {"tier": args.tier, "force": args.force}, timeout=600)))
         elif args.command == "unload":
             print(json.dumps(client.call("POST", "/yuzuru/unload", {"tier": args.tier}, timeout=120)))
+        elif args.command == "models":
+            mc = args.models_cmd or "list"
+            if mc == "use":
+                r = client.call("POST", "/yuzuru/models/assign", {"tier": args.tier, "model": args.model}, timeout=120)
+                print("tiers: " + ", ".join(f"{t}={m}" for t, m in r["tiers"].items()))
+            elif mc in ("enable", "disable"):
+                r = client.call("POST", "/yuzuru/models/enable", {"model": args.model, "enabled": mc == "enable"}, timeout=120)
+                print("tiers: " + ", ".join(f"{t}={m}" for t, m in r["tiers"].items()))
+            else:
+                print_models(client.call("GET", "/yuzuru/models"))
         elif args.command == "pin":
             print(json.dumps(client.call("POST", f"/yuzuru/sessions/{args.session}/pin", {"tier": args.tier})))
     except httpx.ConnectError:
