@@ -32,6 +32,15 @@ resources:
   probe: auto          # auto | nvidia | none (CPU / unified memory)
   vram_margin_mb: 512  # per GPU
   ram_reserve_mb: 6144
+  gpus: []             # only these GPUs (index or UUID), e.g. [0]; empty = all
+
+ollama:
+  manage: false        # true: run our own `ollama serve` limited to resources.gpus (ollama_url is ignored)
+  port: 11436
+  models: ~/.local/share/yuzuru-ollama/models   # blobs symlinked from the system store
+  mirror_from: auto    # auto | none | <system models dir>
+  scope: auto          # own systemd user scope, so its cgroup = its host RAM: auto | on | off
+  env: {}              # e.g. {OLLAMA_FLASH_ATTENTION: "1"}
 
 lease:
   settle_seconds: 15   # job's VRAM use must be stable this long

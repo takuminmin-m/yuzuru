@@ -137,3 +137,82 @@ def cfg(tmp_path) -> Config:
 @pytest.fixture
 def http(world: FakeWorld) -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url="http://ollama", transport=httpx.MockTransport(world.handler))
+
+
+# ------------------------------------------------------------ GPU allowlist
+
+
+class AllowlistProbe(FakeProbe):
+    """FakeProbe that applies `resources.gpus` like the real probes do."""
+
+    def __init__(self, world: FakeWorld, allow: list[str]) -> None:
+        super().__init__(world)
+        self.allow = [a.lower() for a in allow]
+        self._unmatched_warned = False
+
+    def snapshot(self) -> Snapshot:
+        snap = self.world.snapshot()
+        snap.gpus = self.allowed(snap.gpus)
+        return snap
+
+
+FAKE_NVIDIA_SMI = """#!{python}
+import sys
+if "-L" in sys.argv:
+    print("GPU 0: Fake 3050 (UUID: GPU-aaa)\\nGPU 1: Fake 3060 (UUID: GPU-bbb)")
+else:
+    print("0, GPU-aaa, Fake 3050, 8192, 100\\n1, GPU-bbb, Fake 3060, 12288, 11000")
+"""
+
+# Stands in for `ollama serve`: records its environment and answers /api/version.
+FAKE_OLLAMA = """#!{python}
+import http.server, json, os, sys
+assert sys.argv[1:] == ["serve"], sys.argv
+host, port = os.environ["OLLAMA_HOST"].rsplit(":", 1)
+keys = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OLLAMA_MODELS", "OLLAMA_HOST", "OLLAMA_FLASH_ATTENTION")
+with open({record!r}, "a") as f:
+    f.write(json.dumps({{"pid": os.getpid(), **{{k: os.environ.get(k) for k in keys}}}}) + "\\n")
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{{"version": "0.0.0"}}')
+
+    def log_message(self, *a):
+        pass
+
+http.server.HTTPServer((host, int(port)), H).serve_forever()
+"""
+
+
+def write_script(path, template: str, **kw) -> str:
+    import stat
+    import sys
+
+    path.write_text(template.format(python=sys.executable, **kw))
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return str(path)
+
+
+@pytest.fixture
+def fake_nvidia_smi(tmp_path) -> str:
+    return write_script(tmp_path / "nvidia-smi", FAKE_NVIDIA_SMI)
+
+
+@pytest.fixture
+def fake_ollama(tmp_path):
+    """(binary, record file): each start appends its pid and environment to the record."""
+    d = tmp_path / "bin"
+    d.mkdir()
+    record = tmp_path / "ollama-starts.jsonl"
+    return write_script(d / "ollama", FAKE_OLLAMA, record=str(record)), record
+
+
+@pytest.fixture
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
