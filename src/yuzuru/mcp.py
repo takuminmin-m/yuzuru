@@ -9,6 +9,7 @@ Works with any MCP client; OpenCode picks it up from the `mcp` section that
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -149,7 +150,7 @@ class MCPServer:
             if resume:
                 argv += ["--resume", "--note", args.get("note") or ""]
             argv += ["--", "bash", "-c", args["command"]]
-            r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)

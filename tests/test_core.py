@@ -10,7 +10,7 @@ from yuzuru.broker import Broker, Placement
 from yuzuru.catalog import Catalog, kv_bytes_per_token, variant_name
 from yuzuru.config import GB, RouterConfig, TierConfig
 from yuzuru.ollama import Ollama
-from yuzuru.router import Router, heuristic_level
+from yuzuru.router import Router, SessionState, heuristic_level
 from yuzuru.server import State, create_app
 
 from .conftest import FakeProbe
@@ -184,7 +184,7 @@ async def test_server_routes_and_streams(cfg, world, http):
     await st.start()
     try:
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://yuzuru") as c:
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:11435") as c:
             r = await c.get("/v1/models")
             ids = [m["id"] for m in r.json()["data"]]
             assert ids[:4] == ["auto", "small", "medium", "large"] and "qwen3:14b" in ids
@@ -204,7 +204,7 @@ async def test_token_required_when_configured(cfg, world, http):
     cfg.token = "secret"
     st = State(cfg, probe=FakeProbe(world), http=http)
     app = create_app(cfg, st)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://y") as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
         assert (await c.get("/v1/models")).status_code == 401
         r = await c.get("/v1/models", headers={"authorization": "Bearer secret"})
         assert r.status_code == 200
@@ -220,7 +220,7 @@ async def test_mcp_tools(cfg, world, http):
     app = create_app(cfg, st)
     await st.start()
     try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://y") as c:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
             r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
             assert r.json()["result"]["serverInfo"]["name"] == "yuzuru"
             assert (await c.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})).status_code == 202
@@ -428,7 +428,7 @@ async def test_server_forwards_cloud_with_key(cfg, world, http, monkeypatch):
     app = create_app(cfg, st)
     await st.start()
     try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://y") as c:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
             assert "cloud" in [m["id"] for m in (await c.get("/v1/models")).json()["data"]]
             r = await c.post("/v1/chat/completions", json={**user("hi"), "model": "yuzuru/cloud"})
             assert r.status_code == 200 and r.headers["x-yuzuru-tier"] == "cloud"
@@ -474,7 +474,12 @@ async def test_job_lease_suspends_llm_and_resumes_session(cfg, world, http, tmp_
     lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="ses_9",
                                       cwd=str(tmp_path), log=str(log), resume=True, note="評価を回す")
     assert waiter.watch_lease(lease) is not None
-    await wait_for(lambda: not world.loaded)  # everything unloaded, CPU model too
+    router.sessions["ses_9"] = SessionState()  # the session that just started the job
+    await waiter.poll()
+    assert world.loaded  # the session just spoke: give it time to wrap up its turn
+    cfg.resume.suspend_idle_seconds = 0
+    await waiter.poll()
+    assert not world.loaded  # everything unloaded, CPU model too
     await broker.release_lease(lease.id, rc=0)
     await wait_for(out.exists)
     session, message = json.loads(out.read_text())
@@ -497,7 +502,9 @@ async def test_pid_watch_and_long_poll(cfg, world, http, tmp_path):
     await broker.acquire(catalog.specs["small"])
     await broker.release(catalog.specs["small"], touch=False)
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    cfg.resume.suspend_idle_seconds = 0
     w = await waiter.add(session="s", pid=proc.pid, label="prep", note="")
+    await waiter.poll()
     assert not world.loaded  # suspended
     poll_task = asyncio.create_task(waiter.wait_events(0, 5))
     proc.wait()
@@ -575,3 +582,24 @@ def test_nvidia_probe_survives_a_dead_gpu(monkeypatch):
     snap = probe.snapshot()
     assert [g.uuid for g in snap.gpus] == ["GPU-403d"]
     assert snap.lost_gpus and "0000:04:00.0" in snap.lost_gpus[0]
+
+
+async def test_web_pages_cannot_drive_the_api(cfg, world, http):
+    st = State(cfg, probe=FakeProbe(world), http=http)
+    app = create_app(cfg, st)
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
+        assert (await c.post("/mcp", json=call)).status_code == 200
+        # A page on another site: the browser adds Origin.
+        r = await c.post("/mcp", json=call, headers={"origin": "https://evil.example"})
+        assert r.status_code == 403
+        # A "simple" cross-site request needs no preflight; refuse non-JSON bodies.
+        r = await c.post("/mcp", content=json.dumps(call), headers={"content-type": "text/plain"})
+        assert r.status_code == 415
+    # DNS rebinding: the attacker's name resolves to 127.0.0.1, Host stays theirs.
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://evil.example:11435") as c:
+        assert (await c.post("/mcp", json=call)).status_code == 403
+    cfg.allowed_origins = ["http://localhost:3000"]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:11435") as c:
+        r = await c.post("/mcp", json=call, headers={"origin": "http://localhost:3000"})
+        assert r.status_code == 200

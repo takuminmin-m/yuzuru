@@ -84,6 +84,7 @@ class Waiter:
         self._next = 1
         self._changed = asyncio.Event()
         self.suspended_models: list[str] = []
+        self.suspend_pending = False  # suspend once the waiting sessions go quiet
         self._tasks: set[asyncio.Task] = set()
         broker.on_lease_end.append(self._lease_ended)
 
@@ -98,7 +99,7 @@ class Waiter:
         self.watches[w.id] = w
         log.info("watch %s: %s (session %s, suspend=%s, resume=%s)", w.id, w.label, w.session, w.suspend, w.resume)
         if w.suspend and self.cfg.resume.suspend_all:
-            await self.suspend()
+            self.suspend_pending = True
         return w
 
     def watch_lease(self, lease: Lease) -> Watch | None:
@@ -108,7 +109,8 @@ class Waiter:
         w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
                   note=lease.note, cwd=lease.cwd, log=lease.log)
         self.watches[w.id] = w
-        self._spawn(self.suspend())
+        if self.cfg.resume.suspend_all:
+            self.suspend_pending = True
         return w
 
     def _lease_ended(self, lease: Lease, rc: int | None) -> None:
@@ -116,10 +118,24 @@ class Waiter:
             self._finish(w, rc)
 
     async def poll(self) -> None:
-        """Check plain-PID watches (no lease to tell us the exit)."""
+        """Check plain-PID watches (no lease to tell us the exit); suspend when quiet."""
         for w in [w for w in self.watches.values() if w.pid is not None and not w.lease]:
             if not _pid_alive(w.pid):
                 self._finish(w, None)
+        if self.suspend_pending and self.watches and self._quiet():
+            self.suspend_pending = False
+            await self.suspend()
+
+    def _quiet(self) -> bool:
+        """No generation in flight and every waiting session idle for a while."""
+        if any(self.broker.inflight.values()):
+            return False
+        cutoff = time.time() - self.cfg.resume.suspend_idle_seconds
+        for w in self.watches.values():
+            st = self.router.sessions.get(w.session) if w.session else None
+            if st and st.updated > cutoff:
+                return False
+        return True
 
     def _finish(self, w: Watch, rc: int | None) -> None:
         self.watches.pop(w.id, None)
@@ -129,6 +145,8 @@ class Waiter:
             log_tail=tail(w.log, w.cwd, self.cfg.resume.log_tail_lines), note=w.note,
         )
         self._next += 1
+        if not self.watches:
+            self.suspend_pending = False
         self.events.append(ev)
         self._changed.set()
         self._changed = asyncio.Event()

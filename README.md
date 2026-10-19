@@ -195,6 +195,9 @@ OpenCode v2 は「バックグラウンドサーバー + クライアント」�
 3. **手元の OpenCode から yuzuru だけを使う**（`ssh -L 11435:127.0.0.1:11435`）— LLM の推論は GPU マシンで
    行われるが、bash やファイル操作は手元で実行されるので、学習ジョブを GPU マシンで動かす用途には向かない。
 
+yuzuru はジョブを起動できる（MCP の `train` ツールや lease）ので、Webページから叩かれないようにしている。
+`Origin` ヘッダー付きのリクエスト（ブラウザ）は拒否する（許可するなら `allowed_origins`）。トークン未設定時は
+`Host` が localhost 以外のリクエストも拒否する（DNS rebinding 対策）。POST の本文は `application/json` のみ受け付ける。
 yuzuru 自体は既定で `127.0.0.1` にしか bind しない。外部に公開する場合は `YUZURU_TOKEN` を設定すると
 Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を apiKey として送る）。
 

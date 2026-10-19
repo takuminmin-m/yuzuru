@@ -124,6 +124,9 @@ class ResumeConfig:
     command: list[str] = field(default_factory=lambda: ["opencode", "run", "--session", "{session}", "{message}"])
     # While waiting, unload every model (CPU classifier and RAM-offloaded ones too).
     suspend_all: bool = True
+    # Unload only once the waiting session has been quiet this long: right after
+    # starting a job the agent still sends one more request to wrap up its turn.
+    suspend_idle_seconds: float = 20.0
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40
@@ -136,6 +139,9 @@ class Config:
     port: int = 11435
     # Bearer token required from clients when set (use when not on localhost).
     token: str | None = None
+    # Browser origins allowed to call yuzuru. Empty: any request carrying an Origin
+    # header is refused, so a web page cannot drive the API (it can start jobs).
+    allowed_origins: list[str] = field(default_factory=list)
     keep_alive: str = "30m"
     state_dir: Path = field(default_factory=lambda: Path.home() / ".local" / "state" / "yuzuru")
     tiers: list[TierConfig] = field(default_factory=list)
