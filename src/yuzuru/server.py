@@ -49,12 +49,17 @@ class State:
             if cfg.ollama.manage:
                 probe.host.pid = lambda: self.managed.pid if self.managed else None
         if cfg.ollama.manage:
-            self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus])
+            self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus], self._ollama_moved)
         self.broker = Broker(cfg, probe, self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
         self.waiter = Waiter(cfg, self.broker, self.router)
         self.tasks: list[asyncio.Task] = []
+
+    def _ollama_moved(self, url: str) -> None:
+        """The managed server picked its port (`ollama.port: auto`) only now."""
+        self.http.base_url = url
+        self.ollama.base_url = url
 
     async def start(self) -> None:
         if self.managed:

@@ -36,7 +36,8 @@ resources:
 
 ollama:
   manage: false        # true: run our own `ollama serve` limited to resources.gpus (ollama_url is ignored)
-  port: 11436
+  port: auto           # first free port of port_range (or a fixed number)
+  port_range: [11436, 11499]
   models: ~/.local/share/yuzuru-ollama/models   # blobs symlinked from the system store
   mirror_from: auto    # auto | none | <system models dir>
   scope: auto          # own systemd user scope, so its cgroup = its host RAM: auto | on | off

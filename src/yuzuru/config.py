@@ -119,7 +119,10 @@ class OllamaConfig:
     manage: bool = False
     binary: str = "ollama"
     host: str = "127.0.0.1"
-    port: int = 11436
+    # A fixed port, or "auto": the first free port of `port_range` (inclusive),
+    # so several managed servers (or a hand-started one) never collide.
+    port: int | str = "auto"
+    port_range: list[int] = field(default_factory=lambda: [11436, 11499])
     # OLLAMA_MODELS of the managed server. Blobs of `mirror_from` are symlinked
     # in (no copies), manifests are copied, so models pulled for the system
     # Ollama show up and variants yuzuru creates stay in this directory.
@@ -136,10 +139,19 @@ class OllamaConfig:
     def __post_init__(self) -> None:
         self.models = Path(self.models).expanduser()
         self.env = {str(k): str(v) for k, v in self.env.items()}
+        if str(self.port).isdigit():
+            self.port = int(self.port)
+        elif self.port != "auto":
+            raise ValueError(f"ollama.port must be a number or 'auto', not {self.port!r}")
+        lo, hi = (int(p) for p in self.port_range)
+        if not 0 < lo <= hi < 65536:
+            raise ValueError(f"ollama.port_range must be [low, high], not {self.port_range!r}")
+        self.port_range = [lo, hi]
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        """Where it listens; with port "auto" only a guess until it is started."""
+        return f"http://{self.host}:{self.port if isinstance(self.port, int) else self.port_range[0]}"
 
 
 @dataclass
