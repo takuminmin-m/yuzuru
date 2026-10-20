@@ -490,6 +490,25 @@ async def test_job_lease_suspends_llm_and_resumes_session(cfg, world, http, tmp_
     assert ev.rc == 0 and ev.resumed and not waiter.watches
 
 
+async def test_waiting_on_a_resuming_job_resumes_once(cfg, world, http, tmp_path):
+    from yuzuru.waits import Waiter
+
+    out = resume_capture(cfg, tmp_path)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    # The agent calls `wait` on the job `train` just started, before its lease exists...
+    w = await waiter.add(session="ses_9", pid=os.getpid(), label="pid", note="次は評価", log="train.log")
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="ses_9",
+                                      cwd=str(tmp_path), log=None, resume=True, note="")
+    assert waiter.watch_lease(lease) is w and w.lease == lease.id
+    # ...or after it.
+    assert await waiter.add(session="ses_9", pid=os.getpid()) is w
+    assert len(waiter.watches) == 1
+    await broker.release_lease(lease.id, rc=0)
+    await wait_for(out.exists)
+    assert [e.watch for e in waiter.events] == [w.id] and "次は評価" in json.loads(out.read_text())[1]
+
+
 async def test_pid_watch_and_long_poll(cfg, world, http, tmp_path):
     import asyncio
     import subprocess

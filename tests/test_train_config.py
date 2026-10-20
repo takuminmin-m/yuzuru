@@ -35,3 +35,34 @@ def test_no_config_file_passes_none(tmp_path, monkeypatch):
     monkeypatch.delenv("YUZURU_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     assert load_config().source is None
+
+
+async def test_jobs_do_not_inherit_the_servers_venv(cfg, monkeypatch, tmp_path):
+    import os
+    import sys
+
+    from yuzuru.waits import outside_env
+
+    if sys.prefix == sys.base_prefix:
+        monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
+    own = os.path.join(sys.prefix, "bin")
+    monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)
+    monkeypatch.setenv("PATH", os.pathsep.join([own, "/usr/bin"]))
+    env = outside_env()
+    assert "VIRTUAL_ENV" not in env and env["PATH"] == "/usr/bin"
+
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "project-venv"))  # someone else's venv stays
+    assert outside_env()["VIRTUAL_ENV"] == str(tmp_path / "project-venv")
+
+    st = State(cfg)
+    seen = []
+
+    def run(argv, cwd, env=None, **kw):
+        seen.append(env)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"pid": 1, "log": "/l"}), "")
+
+    monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)
+    monkeypatch.setattr(subprocess, "run", run)
+    await MCPServer(st).tools["train"][1]({"command": "uv run python train.py", "cwd": str(tmp_path),
+                                           "resume_when_done": False}, {})
+    assert "VIRTUAL_ENV" not in seen[0] and own not in seen[0]["PATH"].split(os.pathsep)
