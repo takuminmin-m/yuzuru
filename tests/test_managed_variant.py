@@ -21,9 +21,15 @@ def managed_ollama(cfg, tmp_path, mirror=True):
     return ManagedOllama(cfg, lambda: []), src
 
 
-def answering(status, body, created=None):
-    """An Ollama /api/create that answers `status` and records what it was asked."""
+def answering(status, body, created=None, store=None):
+    """An Ollama /api/create that answers `status` and records what it was asked.
+
+    /api/show finds a model once its manifest is in `store` (the managed store)."""
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/show":
+            name, tag = json.loads(request.content)["model"].split(":")
+            found = store is not None and (store / "manifests" / "registry.ollama.ai" / "library" / name / tag).exists()
+            return httpx.Response(200, json={}) if found else httpx.Response(404, text='{"error":"not found"}')
         if created is not None:
             created.append(json.loads(request.content))
         return httpx.Response(status, text=body)
@@ -70,7 +76,8 @@ async def test_shared_blobs_it_cannot_touch_go_through_the_system_ollama(cfg, tm
     m, src = managed_ollama(cfg, tmp_path)
     SystemOllama.store = src
     m.system_url = f"http://127.0.0.1:{system_ollama.server_port}"
-    await m.create_variant(answering(500, CHTIMES), "yuzuru-medium:x-32k", "x", {"num_ctx": 32768, "num_gpu": 0})
+    await m.create_variant(answering(500, CHTIMES, store=tmp_path / "models"), "yuzuru-medium:x-32k", "x",
+                           {"num_ctx": 32768, "num_gpu": 0})
     assert SystemOllama.asked == [{"model": "yuzuru-medium:x-32k", "from": "x",
                                    "parameters": {"num_ctx": 32768, "num_gpu": 0}, "stream": False}]
     # Mirrored right away, so the managed server can load it.
@@ -98,3 +105,11 @@ def test_catalog_creates_variants_through_the_managed_server(cfg, tmp_path):
     cfg.ollama = OllamaConfig(manage=True, models=tmp_path / "models", mirror_from="none")
     st = State(cfg)
     assert st.catalog.create_variant.func == st.managed.create_variant
+
+
+async def test_system_ollama_with_another_store_is_reported(cfg, tmp_path, system_ollama):
+    m, _ = managed_ollama(cfg, tmp_path)
+    SystemOllama.store = tmp_path / "elsewhere"  # not what mirror_from points at
+    m.system_url = f"http://127.0.0.1:{system_ollama.server_port}"
+    with pytest.raises(OllamaError, match="mirror_from"):
+        await m.create_variant(answering(500, CHTIMES, store=tmp_path / "models"), "yuzuru-small:x-8k", "x", {})

@@ -360,6 +360,11 @@ class ManagedOllama:
         finally:
             await system.aclose()
         await asyncio.to_thread(self.sync)
+        try:
+            await ollama.show(name)
+        except OllamaError as e:  # the system Ollama keeps its models somewhere else than mirror_from
+            raise OllamaError(f"creating {name}: the system Ollama created it, but not in {self.source()} "
+                              "(ollama.mirror_from), so the managed Ollama cannot see it") from e
 
     async def stop(self) -> None:
         self._stopping = True
