@@ -156,6 +156,7 @@ class Catalog:
     def __init__(self, cfg: Config, ollama: Ollama) -> None:
         self.cfg = cfg
         self.ollama = ollama
+        self.create_variant = ollama.create_variant  # the managed server routes this elsewhere
         self.profiles = ProfileStore(cfg.state_dir / "profiles.json")
         self.selection = Selection(cfg.state_dir / "selection.json")
         self.specs: dict[str, ModelSpec] = {}  # tier -> spec
@@ -341,7 +342,7 @@ class Catalog:
             params["num_gpu"] = 0
         vprof = self.profiles.get(variant)
         if vprof.get("digest") != digest or vprof.get("params") != params:
-            await self.ollama.create_variant(variant, base, params)
+            await self.create_variant(variant, base, params)
             self.profiles.update(variant, digest=digest, params=params, measured_size=None, measured_host={})
             vprof = self.profiles.get(variant)
 
