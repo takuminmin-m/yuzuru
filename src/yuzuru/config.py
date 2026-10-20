@@ -205,6 +205,8 @@ class Config:
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    # The file this was loaded from (absolute), handed on to the CLI processes yuzuru starts.
+    source: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.tiers:
@@ -269,6 +271,7 @@ def load_config(path: str | Path | None = None) -> Config:
         else:
             kwargs[key] = value
     cfg = _build(Config, kwargs)
+    cfg.source = Path(path).expanduser().resolve() if path is not None else None
 
     if (env_url := os.environ.get("OLLAMA_HOST_URL")) and not cfg.ollama.manage:
         cfg.ollama_url = env_url

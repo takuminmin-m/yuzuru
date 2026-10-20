@@ -136,7 +136,9 @@ class MCPServer:
             cwd = Path(args["cwd"]).expanduser()
             if not cwd.is_dir():
                 raise ValueError(f"cwd does not exist: {cwd}")
-            argv = [sys.executable, "-m", "yuzuru.cli", "--url", st.cfg.url, "run", "--detach", "--label", "train"]
+            # The job runs in `cwd`: a relative config path (YUZURU_CONFIG, ./yuzuru.yaml) would not resolve there.
+            argv = [sys.executable, "-m", "yuzuru.cli", *(["--config", str(st.cfg.source)] if st.cfg.source else []),
+                    "--url", st.cfg.url, "run", "--detach", "--label", "train"]
             if args.get("log"):
                 argv += ["--log", args["log"]]
             for g in filter(None, (x.strip() for x in (args.get("gpus") or "").split(","))):
