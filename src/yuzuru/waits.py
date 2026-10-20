@@ -105,6 +105,8 @@ class Waiter:
         self.suspended_models: list[str] = []
         self.suspend_pending = False  # suspend once the waiting sessions go quiet
         self._tasks: set[asyncio.Task] = set()
+        # Outcomes held back until their session's turn ends: one resume reports them all.
+        self._held: dict[str, list[tuple[Event, Watch]]] = {}
         broker.on_lease_end.append(self._lease_ended)
 
     # ---------------------------------------------------------------- watches
@@ -225,10 +227,17 @@ class Waiter:
                 except Exception as e:  # noqa: BLE001
                     log.warning("reloading %s failed: %s", name, e)
 
-    def message(self, ev: Event) -> str:
+    @staticmethod
+    def _status(ev: Event) -> str:
+        status = "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
+        return f"{ev.label} {status} after {ev.duration / 60:.1f} min"
+
+    def message(self, ev: Event, earlier: list[Event] | None = None) -> str:
         status = "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
         minutes = ev.duration / 60
         parts = [f"[yuzuru] The process you were waiting for ({ev.label}) {status} after {minutes:.1f} min."]
+        if earlier:
+            parts.append("Before that, while you were still working: " + "; ".join(self._status(e) for e in earlier) + ".")
         if ev.note:
             parts.append(f"Your note for this moment: {ev.note}")
         if ev.log_tail:
@@ -237,17 +246,31 @@ class Waiter:
         return "\n\n".join(parts)
 
     async def resume(self, ev: Event, w: Watch) -> None:
-        if await self._turn_over(ev.session):
+        earlier: list[Event] = []
+        if ev.session in self._held:
+            # Another outcome already waits for this turn to end; that one resume reports both.
+            self._held[ev.session].append((ev, w))
+            return
+        if self.router.in_turn(ev.session, self.cfg.resume.turn_idle_seconds):
+            self._held[ev.session] = [(ev, w)]
+            try:
+                await self._turn_over(ev.session)
+            finally:
+                held = self._held.pop(ev.session, [(ev, w)])
             # The agent kept working after the job ended and started another one: it has
             # seen this outcome, and the new job's own resume will continue the session.
             if any(x.session == ev.session for x in self.watches.values()):
-                log.info("session %s moved on to another job; not resuming for %s", ev.session, ev.label)
+                log.info("session %s moved on to another job; not resuming for %s",
+                         ev.session, ", ".join(e.label for e, _ in held))
                 return
+            earlier = [e for e, _ in held[:-1]]
+            ev, w = held[-1]
         if not self.watches:
             if self.cfg.resume.warm_before_resume:
                 await self._warm(ev.session)
             self.suspended_models = []
-        argv = [a.format(session=ev.session, message=self.message(ev), cwd=w.cwd or "") for a in self.cfg.resume.command]
+        argv = [a.format(session=ev.session, message=self.message(ev, earlier), cwd=w.cwd or "")
+                for a in self.cfg.resume.command]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=w.cwd or None, env=outside_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -261,19 +284,22 @@ class Waiter:
             ev.resume_error = str(e)
             log.warning("could not resume session %s: %s", ev.session, e)
 
-    async def _turn_over(self, session: str | None) -> bool:
-        """Wait until the session's client has finished its turn. True if it had not yet.
+    async def _turn_over(self, session: str | None) -> None:
+        """Wait until the session's client has finished its turn.
 
         `opencode run --session` on a session whose turn is still running starts a
         second agent loop next to the first: both edit the same files and start jobs.
         """
         idle = self.cfg.resume.turn_idle_seconds
-        if not self.router.in_turn(session, idle):
-            return False
-        log.info("session %s is still in its turn; resuming once it ends", session)
+        st = self.router.sessions.get(session) if session else None
+        if st:
+            log.info("session %s is still in its turn (%d replies being generated, last reply %s, %.0fs ago); "
+                     "resuming once it ends", session, st.answering,
+                     "called tools" if st.tool_calls else "ended", time.time() - st.updated)
+        start = time.time()
         while self.router.in_turn(session, idle):
             await asyncio.sleep(1.0)
-        return True
+        log.info("session %s finished its turn after %.0fs", session, time.time() - start)
 
     async def _warm(self, session: str | None) -> None:
         st = self.router.sessions.get(session) if session else None

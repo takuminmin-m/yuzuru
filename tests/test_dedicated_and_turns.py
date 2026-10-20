@@ -217,3 +217,27 @@ async def test_stream_records_tool_call_finish(cfg, world, http):
         assert st.router.in_turn("s9", 600)
     finally:
         await st.stop()
+
+
+async def test_outcomes_held_for_one_turn_resume_once(cfg, world, http, tmp_path):
+    out = resume_capture(cfg, tmp_path)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    router.answering("s1")
+    router.answered("s1", "tool_calls")  # one long turn: the agent starts job after job and reads their logs
+    for rc in (1, 1, 0):
+        lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="s1",
+                                          cwd=str(tmp_path), resume=True, note="")
+        waiter.watch_lease(lease)
+        await broker.release_lease(lease.id, rc=rc)
+    await asyncio.sleep(1.5)
+    assert not out.exists()
+    router.answering("s1")
+    router.answered("s1", "stop")
+    await wait_for(out.exists)
+    await asyncio.sleep(1.5)
+    lines = out.read_text().splitlines()
+    assert len(lines) == 1  # one client, not three
+    message = json.loads(lines[0])[1]
+    assert message.startswith("[yuzuru] The process you were waiting for (train) finished")
+    assert message.count("exited with code 1") == 2

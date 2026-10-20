@@ -275,12 +275,13 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                 log.warning("stream failed: %r", e)
                 await queue.put(sse_error(f"yuzuru: {e!r}"))
             finally:
-                if upstream is not None:
-                    await upstream.aclose()
-                if spec is not None:
-                    await st.broker.release(spec)
                 if decision is not None:
                     st.router.answered(decision.session, finish)
+                if upstream is not None:
+                    with contextlib.suppress(Exception):  # a server that was restarted mid-stream
+                        await upstream.aclose()
+                if spec is not None:
+                    await st.broker.release(spec)
                 await queue.put(None)
 
         task = asyncio.create_task(produce())
