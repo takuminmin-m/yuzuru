@@ -241,3 +241,39 @@ async def test_outcomes_held_for_one_turn_resume_once(cfg, world, http, tmp_path
     message = json.loads(lines[0])[1]
     assert message.startswith("[yuzuru] The process you were waiting for (train) finished")
     assert message.count("exited with code 1") == 2
+
+
+async def test_lease_with_an_amount_leaves_the_rest_of_its_gpu(cfg, world, http):
+    _, broker, _ = await make(cfg, world, http)
+    calls = []
+
+    async def restrict(gpus):
+        calls.append(gpus)
+
+    broker.restrict = restrict
+    before = broker.budget().fast
+    res = await broker.create_reservation(gpus=["1"], vram=8 * GB, ttl=None, label="r", hard=False)
+    assert broker.dedicated() == set() and calls == []
+    # Only the 8 GB asked for leave the budget, not all of GPU1.
+    assert 7 * GB < before - broker.budget().fast < 9 * GB
+    await broker.release_lease(res.id)
+    job = await broker.create_lease(pid=os.getpid(), label="train", gpus=["1"], vram=4 * GB)
+    assert broker.dedicated() == set() and calls == []
+    await broker.release_lease(job.id)
+
+
+async def test_whole_gpu_reservation_stays_dedicated_after_handover(cfg, world, http):
+    _, broker, _ = await make(cfg, world, http)
+    hidden: list[set[str]] = []
+
+    async def restrict(gpus):
+        hidden.append(set(gpus))
+
+    broker.restrict = restrict
+    res = await broker.create_reservation(gpus=["1"], vram=None, ttl=None, label="r", hard=False)
+    assert res.vram and hidden == [{"GPU-1"}]  # the amount is filled in, the GPU is still whole
+    job = await broker.handover(res.id, pid=os.getpid())
+    assert broker.dedicated() == {"GPU-1"} and hidden == [{"GPU-1"}]
+    await broker.release_lease(job.id)
+    await wait_for(lambda: len(hidden) == 2)
+    assert hidden[-1] == set()

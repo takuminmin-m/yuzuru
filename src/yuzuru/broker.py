@@ -68,6 +68,7 @@ class Lease:
     resume: bool = False  # resume `session` when the job ends
     note: str = ""  # what the agent meant to do next
     hard: bool = False  # reservation backed by a holder process that occupies the VRAM
+    whole: bool = False  # took its GPUs whole (gpus without an amount): the LLM may not use them
     expires: float | None = None
     created: float = field(default_factory=time.time)
     # job: draining (LLM leaving) -> settling (job allocating) -> active; reservation: reserved
@@ -136,12 +137,15 @@ class Broker:
         return sum(g.used for g in devs)
 
     def dedicated(self) -> set[str]:
-        """GPUs that a lease (job or reservation) took for itself: the LLM may not use them."""
-        return {g for l in self.leases.values() for g in l.gpus}
+        """GPUs that a lease (job or reservation) took whole: the LLM may not use them.
+
+        A lease that names an amount (`--vram`) only takes that much; the rest of
+        its GPUs stays the LLM's, as for a lease on the whole pool."""
+        return {g for l in self.leases.values() if l.whole for g in l.gpus}
 
     def _lease_reserve(self, lease: Lease) -> int:
         snap = self.snapshot
-        if lease.gpus:
+        if lease.whole:
             return 0  # its GPUs are left out of the LLM's pool altogether (budget)
         if lease.kind == "reservation":
             # A hard reservation's holder shows up as growth, so it nets to ~0 here.
@@ -375,7 +379,8 @@ class Broker:
     ) -> Lease:
         await self.refresh()
         resolved = self._resolve_gpus(gpus)
-        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session, **extra)
+        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session,
+                      whole=bool(resolved) and vram is None, **extra)
         self._settled.clear()
         self.leases[lease.id] = lease
         await self._clear_gpus(lease, drain)
@@ -404,6 +409,7 @@ class Broker:
         lease = Lease(
             id=uuid.uuid4().hex[:8], pid=os.getpid(), label=label, gpus=resolved, vram=vram, kind="reservation",
             hard=hard, state="reserved", expires=time.time() + ttl if ttl else None,
+            whole=bool(resolved) and vram is None,
         )
         self.leases[lease.id] = lease
         try:
@@ -503,7 +509,7 @@ class Broker:
         self._restore_task = asyncio.create_task(self._after_lease(lease))
 
     async def _after_lease(self, lease: Lease) -> None:
-        if lease.gpus:
+        if lease.whole:
             await self.apply_dedication()  # give Ollama its GPUs back
         if self.cfg.lease.restore_after and not self.leases and lease.restore:
             await self._restore(lease.restore)

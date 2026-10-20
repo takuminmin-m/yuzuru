@@ -69,7 +69,8 @@ yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
 
-`--gpu`（MCP `yuzuru_train` の `gpus`）で GPU を専有させたジョブの間は、その GPU を LLM に一切使わせない。
+`--gpu`（MCP `yuzuru_train` の `gpus`）で GPU を専有させたジョブ（と `yuzuru reserve --gpu` で量を指定せずに確保した GPU）の
+間は、その GPU を LLM に一切使わせない。`--vram` で量を指定した場合は、その量だけを差し引き、残りは LLM が使える。
 予算はほかの GPU だけで計算し、`ollama.manage: true` なら管理下の Ollama をその GPU を隠して再起動する
 （Ollama は見えている GPU すべてに空き容量に応じて層を置くので、予算だけでは止められない。学習がまだ
 メモリを増やしている最中に LLM の層が隣に載り、学習側が OOM する）。ジョブが終わると全 GPU で再起動する。
