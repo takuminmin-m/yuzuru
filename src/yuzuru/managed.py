@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from .config import Config
+from .ollama import Ollama, OllamaError
 
 log = logging.getLogger("yuzuru.managed")
 
@@ -162,6 +163,7 @@ class ManagedOllama:
         self._scope_ok: bool | None = None
         self._stopping = False
         self._task: asyncio.Task | None = None
+        self.system_url = f"http://127.0.0.1:{SYSTEM_OLLAMA_PORT}"  # owner of the mirrored blobs
 
     @property
     def pid(self) -> int | None:
@@ -333,6 +335,36 @@ class ManagedOllama:
                 await self._launch()
             except OSError as e:
                 log.warning("managed ollama: restart failed: %r", e)
+
+    async def create_variant(self, ollama: Ollama, name: str, base: str, parameters: dict[str, Any]) -> None:
+        """Create a variant on the managed server, or else where its blobs live.
+
+        Ollama touches (chtimes) every layer a create reuses. Mirrored blobs are
+        symlinks to files of the system Ollama's user, so the managed server gets
+        EPERM on any create. The system Ollama owns them: it creates the variant
+        in the source store and the mirror brings it over.
+        """
+        try:
+            await ollama.create_variant(name, base, parameters)
+            return
+        except OllamaError as e:
+            if self.source() is None or ("chtimes" not in str(e) and "not permitted" not in str(e)):
+                raise
+            log.info("managed ollama: cannot touch the shared blobs; creating %s with the system Ollama", name)
+        system = Ollama(self.system_url)
+        try:
+            await system.create_variant(name, base, parameters)
+        except httpx.HTTPError as e:
+            raise OllamaError(f"creating {name}: the managed Ollama cannot write the shared blobs and the "
+                              f"system Ollama (which owns them) is not reachable: {e!r}") from e
+        finally:
+            await system.aclose()
+        await asyncio.to_thread(self.sync)
+        try:
+            await ollama.show(name)
+        except OllamaError as e:  # the system Ollama keeps its models somewhere else than mirror_from
+            raise OllamaError(f"creating {name}: the system Ollama created it, but not in {self.source()} "
+                              "(ollama.mirror_from), so the managed Ollama cannot see it") from e
 
     async def stop(self) -> None:
         self._stopping = True

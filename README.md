@@ -64,7 +64,8 @@ yuzuru run --gpu 1 -- python train.py      # GPU1 を専有（CUDA_VISIBLE_DEVIC
 yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える）
 ```
 
-流れ: lease 作成 → GPU上のモデルをアンロード → ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
+流れ: lease 作成 → 生成中の応答を待つ（`drain_timeout`）→ GPU上のモデルをアンロードし、実際に VRAM から消えるまで待つ（`unload_timeout`、
+消えなければジョブのログに警告）→ ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
 
@@ -124,7 +125,9 @@ ollama:
   - `OLLAMA_MODELS` は `ollama.models`（既定 `~/.local/share/yuzuru-ollama/models`）。システムのモデル置き場
     （`$OLLAMA_MODELS`、`/usr/share/ollama/.ollama/models`、`~/.ollama/models` の順に探す。`ollama.mirror_from` で指定可、
     `none` で無効）の blob をシンボリックリンクで、manifest をコピーで取り込むので、重みは複製しない。
-    システム側で `ollama pull` したモデルは 1 分以内に取り込まれる。yuzuru が作る派生モデルはこちらの置き場に書かれる
+    システム側で `ollama pull` したモデルは 1 分以内に取り込まれる。yuzuru が作る派生モデルはこちらの置き場に書かれる。
+    ただし Ollama 0.40 以降は派生モデルを作るときに元の blob の更新時刻を書き換えるため、blob が別ユーザー（`ollama`）の
+    ものだと作れない。その場合はシステムの Ollama（:11434）で作って取り込む（システム側の `ollama list` にも出る）
   - 可能なら `systemd-run --user --scope` で専用の cgroup に入れて起動するので、ホスト RAM の実測
     （`memory.current`）はシステムの `ollama.service` ではなくこのプロセスが対象になる（`ollama.scope: off` で無効。
     scope が使えない環境ではプロセスツリーの RSS で測る）

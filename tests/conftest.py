@@ -23,6 +23,8 @@ class FakeWorld:
     difficulty: str = "medium"
     chat_requests: list[dict] = field(default_factory=list)
     unloads: list[str] = field(default_factory=list)
+    busy: set[str] = field(default_factory=set)  # generating: Ollama defers their unload
+    pending_unload: set[str] = field(default_factory=set)
     measure_host: bool = True
 
     def add_model(self, name: str, params_b: float, size_gb: float, moe: bool = False) -> None:
@@ -35,6 +37,13 @@ class FakeWorld:
 
     def base_of(self, name: str) -> str:
         return self.variants[name]["from"] if name in self.variants else name
+
+    def finish(self, name: str) -> None:
+        """A generation ends: a deferred unload happens now."""
+        self.busy.discard(name)
+        if name in self.pending_unload:
+            self.pending_unload.discard(name)
+            self.loaded.pop(name, None)
 
     def ollama_vram(self) -> int:
         return sum(m["size_vram"] for m in self.loaded.values())
@@ -90,8 +99,11 @@ class FakeWorld:
             return httpx.Response(200, json={"status": "success"})
         if path == "/api/generate":
             if body.get("keep_alive") == 0:
-                self.loaded.pop(body["model"], None)
                 self.unloads.append(body["model"])
+                if body["model"] in self.busy:
+                    self.pending_unload.add(body["model"])
+                else:
+                    self.loaded.pop(body["model"], None)
             else:
                 self.load(body["model"])
             return httpx.Response(200, json={"done": True})
@@ -130,7 +142,8 @@ def cfg(tmp_path) -> Config:
     return Config(
         state_dir=tmp_path,
         resources=ResourceConfig(vram_margin_mb=256, ram_reserve_mb=4096),
-        lease=LeaseConfig(settle_seconds=0.0, settle_timeout=5, drain_timeout=0.1, restore_after=False),
+        lease=LeaseConfig(settle_seconds=0.0, settle_timeout=5, drain_timeout=0.1, unload_timeout=0.5,
+                          restore_after=False),
     )
 
 

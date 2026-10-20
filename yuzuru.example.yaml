@@ -47,6 +47,8 @@ lease:
   settle_seconds: 15   # job's VRAM use must be stable this long
   settle_timeout: 180
   headroom_mb: 1024    # room for a settled job to grow
+  drain_timeout: 300   # wait for running replies first (CPU-offloaded models answer slowly)
+  unload_timeout: 60   # then for the unloaded models to actually leave the GPU
   restore_after: true  # reload the previous models when the job ends
 
 cloud:                 # paid API for what local models cannot do (off by default)

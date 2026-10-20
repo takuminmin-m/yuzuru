@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -603,3 +604,29 @@ async def test_web_pages_cannot_drive_the_api(cfg, world, http):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:11435") as c:
         r = await c.post("/mcp", json=call, headers={"origin": "http://localhost:3000"})
         assert r.status_code == 200
+
+
+async def test_lease_waits_until_a_busy_model_really_leaves(cfg, world, http):
+    # The drain timed out while the agent's last reply was still generating:
+    # Ollama only unloads once that generation ends.
+    cfg.lease.unload_timeout = 10
+    catalog, broker, _ = await make(cfg, world, http)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    variant = catalog.specs["medium"].variant
+    world.busy.add(variant)
+    asyncio.get_running_loop().call_later(1.5, world.finish, variant)
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None)
+    assert variant not in world.loaded
+    assert lease.resident == []
+    assert lease.baseline == 0  # taken after the model left
+
+
+async def test_lease_reports_a_model_that_never_left(cfg, world, http):
+    catalog, broker, _ = await make(cfg, world, http)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    variant = catalog.specs["medium"].variant
+    world.busy.add(variant)
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None)
+    assert lease.resident == [variant]

@@ -121,7 +121,7 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
             lease = client.call(
                 "POST", "/yuzuru/leases",
                 job | {"label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [], "vram": parse_size(args.vram)},
-                timeout=300,
+                timeout=900,  # the server drains running generations first (lease.drain_timeout)
             )
         lease_id = lease["id"]
         # The lease's GPUs, else every GPU of resources.gpus (older servers send no "visible").
@@ -129,7 +129,11 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
             env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
         env["YUZURU_LEASE"] = lease_id
-        print(f"[yuzuru] lease {lease_id}: LLM moved out of GPU memory", file=sys.stderr)
+        if resident := lease.get("resident"):
+            print(f"[yuzuru] lease {lease_id}: WARNING: {', '.join(resident)} did not leave GPU memory; "
+                  "the job has less VRAM than expected", file=sys.stderr)
+        else:
+            print(f"[yuzuru] lease {lease_id}: LLM moved out of GPU memory", file=sys.stderr)
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         print(f"[yuzuru] server unreachable ({e.__class__.__name__}); running without a lease", file=sys.stderr)
         if allow := allowlist(args.config):

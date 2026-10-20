@@ -162,8 +162,12 @@ class LeaseConfig:
     settle_tolerance_mb: int = 256
     # Extra VRAM kept free for a settled training job to grow into.
     headroom_mb: int = 1024
-    # Wait this long for in-flight generations before unloading for a lease.
-    drain_timeout: float = 30.0
+    # Wait this long for in-flight generations before unloading for a lease. One
+    # reply of a model running partly on CPU can take minutes, and the agent that
+    # started the job is usually still finishing its turn.
+    drain_timeout: float = 300.0
+    # Then wait this long for the unloaded models to actually leave the GPU.
+    unload_timeout: float = 60.0
     # Re-warm the models that were resident before the lease once it ends.
     restore_after: bool = True
 
@@ -205,6 +209,8 @@ class Config:
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    # The file this was loaded from (absolute), handed on to the CLI processes yuzuru starts.
+    source: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.tiers:
@@ -269,6 +275,7 @@ def load_config(path: str | Path | None = None) -> Config:
         else:
             kwargs[key] = value
     cfg = _build(Config, kwargs)
+    cfg.source = Path(path).expanduser().resolve() if path is not None else None
 
     if (env_url := os.environ.get("OLLAMA_HOST_URL")) and not cfg.ollama.manage:
         cfg.ollama_url = env_url

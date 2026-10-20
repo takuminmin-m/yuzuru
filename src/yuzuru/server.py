@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import os
 import logging
@@ -50,6 +51,7 @@ class State:
                 probe.host.pid = lambda: self.managed.pid if self.managed else None
         if cfg.ollama.manage:
             self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus], self._ollama_moved)
+            self.catalog.create_variant = functools.partial(self.managed.create_variant, self.ollama)
         self.broker = Broker(cfg, probe, self.ollama, self.catalog)
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
@@ -337,7 +339,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             raise HTTPException(400, str(e)) from e
         watch = st.waiter.watch_lease(lease)
         return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
-                "watch": watch.id if watch else None}
+                "resident": lease.resident, "watch": watch.id if watch else None}
 
     def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
         return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
