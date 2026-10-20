@@ -76,6 +76,7 @@ class Lease:
     level: int = 0
     last_change: float = field(default_factory=time.time)
     restore: list[str] = field(default_factory=list)
+    resident: list[str] = field(default_factory=list)  # still on a GPU when the job was let go
 
     @property
     def grown(self) -> int:
@@ -339,8 +340,18 @@ class Broker:
             for name in lease.restore:
                 log.info("lease %s: unloading %s", lease.id, name)
                 await self.ollama.unload(name)
-            await asyncio.sleep(1.0)  # let the driver actually free memory
-            await self.refresh()
+            # Ollama only marks a model for unloading; it leaves once its runner is
+            # idle, i.e. after any generation still running (drain timed out) ends.
+            gone = time.time() + self.cfg.lease.unload_timeout
+            while True:
+                await asyncio.sleep(1.0)  # also lets the driver actually free memory
+                await self.refresh()
+                lease.resident = [m.name for m in self.loaded if m.name in lease.restore and m.size_vram > 0]
+                if not lease.resident or time.time() >= gone:
+                    break
+            if lease.resident:
+                log.warning("lease %s: %s still on the GPU after %.0fs; the job starts without that memory",
+                            lease.id, ", ".join(lease.resident), self.cfg.lease.unload_timeout)
             lease.baseline = lease.level = self._device_level(lease.gpus)
             lease.last_change = time.time()
 

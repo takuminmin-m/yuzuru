@@ -162,8 +162,12 @@ class LeaseConfig:
     settle_tolerance_mb: int = 256
     # Extra VRAM kept free for a settled training job to grow into.
     headroom_mb: int = 1024
-    # Wait this long for in-flight generations before unloading for a lease.
-    drain_timeout: float = 30.0
+    # Wait this long for in-flight generations before unloading for a lease. One
+    # reply of a model running partly on CPU can take minutes, and the agent that
+    # started the job is usually still finishing its turn.
+    drain_timeout: float = 300.0
+    # Then wait this long for the unloaded models to actually leave the GPU.
+    unload_timeout: float = 60.0
     # Re-warm the models that were resident before the lease once it ends.
     restore_after: bool = True
 

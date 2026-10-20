@@ -64,7 +64,8 @@ yuzuru run --gpu 1 -- python train.py      # GPU1 を専有（CUDA_VISIBLE_DEVIC
 yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える）
 ```
 
-流れ: lease 作成 → GPU上のモデルをアンロード → ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
+流れ: lease 作成 → 生成中の応答を待つ（`drain_timeout`）→ GPU上のモデルをアンロードし、実際に VRAM から消えるまで待つ（`unload_timeout`、
+消えなければジョブのログに警告）→ ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
 

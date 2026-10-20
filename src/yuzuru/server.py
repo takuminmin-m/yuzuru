@@ -339,7 +339,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             raise HTTPException(400, str(e)) from e
         watch = st.waiter.watch_lease(lease)
         return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
-                "watch": watch.id if watch else None}
+                "resident": lease.resident, "watch": watch.id if watch else None}
 
     def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
         return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
