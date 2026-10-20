@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -68,6 +68,7 @@ class Lease:
     resume: bool = False  # resume `session` when the job ends
     note: str = ""  # what the agent meant to do next
     hard: bool = False  # reservation backed by a holder process that occupies the VRAM
+    whole: bool = False  # took its GPUs whole (gpus without an amount): the LLM may not use them
     expires: float | None = None
     created: float = field(default_factory=time.time)
     # job: draining (LLM leaving) -> settling (job allocating) -> active; reservation: reserved
@@ -102,6 +103,12 @@ class Broker:
         # Called with (lease, exit code or None) whenever a lease ends.
         self.on_lease_end: list[Callable[[Lease, int | None], None]] = []
         self.failed: dict[str, float] = {}  # variant -> time until which it is not offered
+        # Keeps Ollama off the GPUs leases dedicate (given the excluded UUIDs). Set when
+        # yuzuru runs Ollama itself; otherwise Ollama still sees them and only the budget does not.
+        self.restrict: Callable[[set[str]], Awaitable[None]] | None = None
+        self._unenforced_warned = False
+        self._restricting = 0  # Ollama is being restarted: hold requests back
+        self._hidden: set[str] = set()  # GPUs the managed Ollama was last started without
 
     # ------------------------------------------------------------------ state
 
@@ -129,8 +136,17 @@ class Broker:
         devs = [g for g in snap.gpus if not gpus or g.uuid in gpus]
         return sum(g.used for g in devs)
 
+    def dedicated(self) -> set[str]:
+        """GPUs that a lease (job or reservation) took whole: the LLM may not use them.
+
+        A lease that names an amount (`--vram`) only takes that much; the rest of
+        its GPUs stays the LLM's, as for a lease on the whole pool."""
+        return {g for l in self.leases.values() if l.whole for g in l.gpus}
+
     def _lease_reserve(self, lease: Lease) -> int:
         snap = self.snapshot
+        if lease.whole:
+            return 0  # its GPUs are left out of the LLM's pool altogether (budget)
         if lease.kind == "reservation":
             # A hard reservation's holder shows up as growth, so it nets to ~0 here.
             return max(0, (lease.vram or 0) - lease.grown)
@@ -152,9 +168,11 @@ class Broker:
             # Unified memory / CPU-only: one pool.
             fast = snap.ram_available + ollama_vram + ollama_ram - res.ram_reserve_mb * MB - reserved
             return Budget(fast=max(0, fast), slow=0, unified=True)
-        foreign = max(0, snap.gpu_used - ollama_vram)
-        margin = res.vram_margin_mb * MB * len(snap.gpus)
-        fast = snap.gpu_total - foreign - reserved - margin
+        ded = self.dedicated()
+        shared = [g for g in snap.gpus if g.uuid not in ded]
+        foreign = max(0, sum(g.used for g in shared) - ollama_vram)
+        margin = res.vram_margin_mb * MB * len(shared)
+        fast = sum(g.total for g in shared) - foreign - reserved - margin
         return Budget(fast=max(0, fast), slow=max(0, ram_for_llm), unified=False)
 
     def ollama_host(self) -> int:
@@ -361,10 +379,12 @@ class Broker:
     ) -> Lease:
         await self.refresh()
         resolved = self._resolve_gpus(gpus)
-        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session, **extra)
+        lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session,
+                      whole=bool(resolved) and vram is None, **extra)
         self._settled.clear()
         self.leases[lease.id] = lease
         await self._clear_gpus(lease, drain)
+        await self.apply_dedication()
         lease.state = "settling"
         log.info("lease %s (%s, pid %d) created", lease.id, label, pid)
         return lease
@@ -389,10 +409,12 @@ class Broker:
         lease = Lease(
             id=uuid.uuid4().hex[:8], pid=os.getpid(), label=label, gpus=resolved, vram=vram, kind="reservation",
             hard=hard, state="reserved", expires=time.time() + ttl if ttl else None,
+            whole=bool(resolved) and vram is None,
         )
         self.leases[lease.id] = lease
         try:
             await self._clear_gpus(lease, drain=False)
+            await self.apply_dedication()
             devs = [g for g in self.snapshot.gpus if g.uuid in resolved]
             margin = self.cfg.resources.vram_margin_mb * MB
             if vram is None:
@@ -484,8 +506,47 @@ class Broker:
         for cb in self.on_lease_end:
             cb(lease, rc)
         self._update_leases()
+        self._restore_task = asyncio.create_task(self._after_lease(lease))
+
+    async def _after_lease(self, lease: Lease) -> None:
+        if lease.whole:
+            await self.apply_dedication()  # give Ollama its GPUs back
         if self.cfg.lease.restore_after and not self.leases and lease.restore:
-            self._restore_task = asyncio.create_task(self._restore(lease.restore))
+            await self._restore(lease.restore)
+
+    async def apply_dedication(self) -> None:
+        """Make Ollama see exactly the GPUs no lease dedicates.
+
+        Ollama spreads a model over every GPU it sees, by their free memory, so a
+        budget alone cannot keep it off a GPU a job was given: a training job that
+        is still growing gets the LLM's layers next to it and runs out of memory.
+        A managed Ollama is restarted with those GPUs hidden. Requests wait for the
+        restart (routing waits until leases settle), and a generation still running
+        on the old server is given drain_timeout to finish first.
+        """
+        if self.restrict is None:
+            if self.dedicated() and not self._unenforced_warned:
+                self._unenforced_warned = True
+                log.warning("a lease dedicates %s, but Ollama is not managed by yuzuru (ollama.manage) and may "
+                            "still place layers there", ", ".join(sorted(self.dedicated())))
+            return
+        if self.dedicated() == self._hidden:
+            return
+        self._restricting += 1
+        self._settled.clear()
+        try:
+            deadline = time.time() + self.cfg.lease.drain_timeout
+            while time.time() < deadline and any(self.inflight.values()):
+                await asyncio.sleep(0.5)
+            async with self.lock:
+                hide = self.dedicated()
+                log.info("restarting Ollama %s", f"without {', '.join(sorted(hide))}" if hide else "with every GPU")
+                await self.restrict(hide)
+                self._hidden = hide
+                await self.refresh()
+        finally:
+            self._restricting -= 1
+            self._update_leases()
 
     async def _restore(self, variants: list[str]) -> None:
         await asyncio.sleep(2.0)
@@ -513,11 +574,10 @@ class Broker:
                     holder = self._holders.pop(lease.pid, None)
                     if holder and holder.returncode is None:
                         holder.terminate()
-                if self.cfg.lease.restore_after and not self.leases and lease.restore:
-                    try:
-                        self._restore_task = asyncio.get_running_loop().create_task(self._restore(lease.restore))
-                    except RuntimeError:
-                        pass
+                try:
+                    self._restore_task = asyncio.get_running_loop().create_task(self._after_lease(lease))
+                except RuntimeError:
+                    pass
                 continue
             if lease.state == "draining":
                 continue
@@ -531,7 +591,7 @@ class Broker:
                 if (quiet and allocated) or now - lease.created >= self.cfg.lease.settle_timeout:
                     lease.state = "active"
                     log.info("lease %s settled at +%.1f GB", lease.id, lease.grown / 2**30)
-        if all(l.state in ("active", "reserved") for l in self.leases.values()):
+        if all(l.state in ("active", "reserved") for l in self.leases.values()) and not self._restricting:
             self._settled.set()
         else:
             self._settled.clear()

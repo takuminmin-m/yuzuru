@@ -162,6 +162,8 @@ class ManagedOllama:
         self.visible: str | None = None
         self._scope_ok: bool | None = None
         self._stopping = False
+        self.hidden: set[str] = set()  # GPU UUIDs kept from it (dedicated to a job)
+        self._swapping = False  # being restarted on purpose: the supervisor leaves it alone
         self._task: asyncio.Task | None = None
         self.system_url = f"http://127.0.0.1:{SYSTEM_OLLAMA_PORT}"  # owner of the mirrored blobs
 
@@ -209,13 +211,15 @@ class ManagedOllama:
         env = {**os.environ, **self.oc.env, "OLLAMA_HOST": f"{self.oc.host}:{self.port}",
                "OLLAMA_MODELS": str(self.oc.models)}
         allow = self.cfg.resources.gpus
-        if allow:
+        if allow or self.hidden:
             try:
                 uuids = await asyncio.to_thread(self.gpus)
             except Exception as e:  # noqa: BLE001
                 log.warning("managed ollama: cannot resolve GPU UUIDs (%r); using %s as given", e, allow)
                 uuids = []
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(uuids or allow)
+            visible = [g for g in (uuids or allow) if g not in self.hidden]
+            # "-1" hides every GPU (an empty value would be read as "unset" by some runtimes).
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(visible) or "-1"
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # if indices had to be used as given
         self.visible = env.get("CUDA_VISIBLE_DEVICES")
         return env
@@ -310,6 +314,30 @@ class ManagedOllama:
                 break
         self._task = asyncio.create_task(self._supervise())
 
+    async def hide(self, gpus: set[str]) -> None:
+        """Restart with `gpus` hidden (or shown again), on the same port when it is still free."""
+        if gpus == self.hidden and self.pid is not None:
+            return
+        self.hidden = set(gpus)
+        self._swapping = True
+        try:
+            await self._terminate()
+            self.restarts += 1
+            if await self._launch():
+                await self._ready()
+        finally:
+            self._swapping = False
+
+    async def _terminate(self) -> None:
+        proc = self.proc
+        if proc is not None and proc.returncode is None:
+            _kill_group(proc.pid, signal.SIGTERM)  # the group: its runners too
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:
+                _kill_group(proc.pid, signal.SIGKILL)
+                await proc.wait()
+
     async def _supervise(self) -> None:
         backoff = 1.0
         while not self._stopping:
@@ -321,6 +349,11 @@ class ManagedOllama:
                     continue
                 if self._stopping:
                     return
+                if self._swapping or self.proc.returncode is None:
+                    # hide() stopped it and starts the next one itself.
+                    while self._swapping:
+                        await asyncio.sleep(0.2)
+                    continue
                 if time.time() - self.started_at > 60:
                     backoff = 1.0
                 log.warning("managed ollama exited with %s; restarting in %.0fs", rc, backoff)
@@ -371,14 +404,7 @@ class ManagedOllama:
         if self._task:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
-        proc = self.proc
-        if proc is not None and proc.returncode is None:
-            _kill_group(proc.pid, signal.SIGTERM)  # the group: its runners too
-            try:
-                await asyncio.wait_for(proc.wait(), 10)
-            except asyncio.TimeoutError:
-                _kill_group(proc.pid, signal.SIGKILL)
-                await proc.wait()
+        await self._terminate()
         self.pidfile.unlink(missing_ok=True)
 
     def status(self) -> dict[str, Any]:

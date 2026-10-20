@@ -185,6 +185,12 @@ class ResumeConfig:
     # Unload only once the waiting session has been quiet this long: right after
     # starting a job the agent still sends one more request to wrap up its turn.
     suspend_idle_seconds: float = 20.0
+    # A job can end while the agent that started it is still in that turn (it failed at
+    # once, or the agent kept working). Resuming then would run a second client on the
+    # same session, so the resume waits for the turn to end. A turn whose last reply
+    # called tools counts as running for this long without a new request (a tool such
+    # as a test run takes a while; a client killed mid-turn never comes back).
+    turn_idle_seconds: float = 600.0
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40

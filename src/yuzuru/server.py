@@ -13,6 +13,7 @@ import functools
 import json
 import os
 import logging
+import re
 import secrets
 import uuid
 from typing import Any
@@ -35,6 +36,7 @@ log = logging.getLogger("yuzuru.server")
 
 KEEPALIVE_SECONDS = 10.0  # SSE comment interval while waiting for the first token
 
+FINISH_RE = re.compile(rb'"finish_reason"\s*:\s*"([a-z_]+)"')
 HOP_HEADERS = {"content-length", "transfer-encoding", "connection", "content-encoding"}
 
 
@@ -53,6 +55,8 @@ class State:
             self.managed = ManagedOllama(cfg, lambda: [g.uuid for g in probe.snapshot().gpus], self._ollama_moved)
             self.catalog.create_variant = functools.partial(self.managed.create_variant, self.ollama)
         self.broker = Broker(cfg, probe, self.ollama, self.catalog)
+        if self.managed:
+            self.broker.restrict = self.managed.hide
         self.router = Router(cfg, self.catalog, self.broker, self.ollama)
         self.cloud_http = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10))
         self.waiter = Waiter(cfg, self.broker, self.router)
@@ -196,19 +200,32 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                                      headers={"cache-control": "no-cache"})
 
         decision, _ = await pick(body, headers)
-        if decision.cloud:
-            return await forward_cloud(body, decision)
-        spec = decision.spec
+        st.router.answering(decision.session)
+        finish = None
         try:
-            upstream = await st.http.post("/v1/chat/completions", json={**body, "model": spec.variant})
+            if decision.cloud:
+                resp = await forward_cloud(body, decision)
+                finish = finish_reason(resp.body)
+                return resp
+            spec = decision.spec
+            try:
+                upstream = await st.http.post("/v1/chat/completions", json={**body, "model": spec.variant})
+            finally:
+                await st.broker.release(spec)
+            finish = finish_reason(upstream.content)
         finally:
-            await st.broker.release(spec)
+            st.router.answered(decision.session, finish)
         return Response(
             upstream.content,
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type"),
             headers=decision.headers(),
         )
+
+    def finish_reason(data: bytes) -> str | None:
+        """The last finish_reason in a completion (JSON or SSE stream); "tool_calls" means the turn goes on."""
+        found = FINISH_RE.findall(data)
+        return found[-1].decode() if found else None
 
     def sse_error(message: str) -> bytes:
         return b"data: " + json.dumps({"error": {"message": message, "type": "server_error"}}).encode() + b"\n\n"
@@ -226,8 +243,11 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         async def produce() -> None:
             spec = None
             upstream = None
+            decision = None
+            finish, seen = None, b""
             try:
                 decision, _ = await pick(body, headers)
+                st.router.answering(decision.session)
                 await queue.put(f": yuzuru {decision.tier} ({decision.reason})\n\n".encode())
                 if decision.cloud:
                     c = cfg.cloud
@@ -246,6 +266,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                     await queue.put(sse_error(f"upstream returned {upstream.status_code}: {text[:500]}"))
                     return
                 async for chunk in upstream.aiter_bytes():
+                    seen = seen[-64:] + chunk  # a finish_reason may straddle two chunks
+                    finish = finish_reason(seen) or finish
                     await queue.put(chunk)
             except HTTPException as e:
                 await queue.put(sse_error(str(e.detail)))
@@ -253,8 +275,11 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                 log.warning("stream failed: %r", e)
                 await queue.put(sse_error(f"yuzuru: {e!r}"))
             finally:
+                if decision is not None:
+                    st.router.answered(decision.session, finish)
                 if upstream is not None:
-                    await upstream.aclose()
+                    with contextlib.suppress(Exception):  # a server that was restarted mid-stream
+                        await upstream.aclose()
                 if spec is not None:
                     await st.broker.release(spec)
                 await queue.put(None)
