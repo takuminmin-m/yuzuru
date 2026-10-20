@@ -67,6 +67,8 @@ class SessionState:
     pinned: str | None = None
     escalated: bool = False
     updated: float = field(default_factory=time.time)
+    answering: int = 0  # replies of this session being generated now
+    tool_calls: bool = False  # the last reply asked for tools: the client will call again in this turn
 
 
 @dataclass
@@ -193,6 +195,24 @@ class Router:
                 raise ValueError(f"{target!r} is neither a tier nor an installed model")
             target = name
         self.sessions.setdefault(session, SessionState()).pinned = target
+
+    def answering(self, session: str) -> None:
+        self.sessions.setdefault(session, SessionState()).answering += 1
+
+    def answered(self, session: str, finish_reason: str | None) -> None:
+        sess = self.sessions.setdefault(session, SessionState())
+        sess.answering = max(0, sess.answering - 1)
+        sess.tool_calls = finish_reason == "tool_calls"
+        sess.updated = time.time()
+
+    def in_turn(self, session: str | None, idle: float) -> bool:
+        """The session's client is still working on a turn: a reply is being generated,
+        or the last one called tools and the next request is due (within `idle` seconds:
+        a client killed mid-turn never sends it)."""
+        sess = self.sessions.get(session) if session else None
+        if sess is None:
+            return False
+        return sess.answering > 0 or (sess.tool_calls and time.time() - sess.updated < idle)
 
     def _gc(self) -> None:
         cutoff = time.time() - 6 * 3600

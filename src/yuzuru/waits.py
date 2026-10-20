@@ -174,7 +174,7 @@ class Waiter:
         cutoff = time.time() - self.cfg.resume.suspend_idle_seconds
         for w in self.watches.values():
             st = self.router.sessions.get(w.session) if w.session else None
-            if st and st.updated > cutoff:
+            if st and st.updated > cutoff or self.router.in_turn(w.session, self.cfg.resume.turn_idle_seconds):
                 return False
         return True
 
@@ -237,6 +237,12 @@ class Waiter:
         return "\n\n".join(parts)
 
     async def resume(self, ev: Event, w: Watch) -> None:
+        if await self._turn_over(ev.session):
+            # The agent kept working after the job ended and started another one: it has
+            # seen this outcome, and the new job's own resume will continue the session.
+            if any(x.session == ev.session for x in self.watches.values()):
+                log.info("session %s moved on to another job; not resuming for %s", ev.session, ev.label)
+                return
         if not self.watches:
             if self.cfg.resume.warm_before_resume:
                 await self._warm(ev.session)
@@ -254,6 +260,20 @@ class Waiter:
         except OSError as e:
             ev.resume_error = str(e)
             log.warning("could not resume session %s: %s", ev.session, e)
+
+    async def _turn_over(self, session: str | None) -> bool:
+        """Wait until the session's client has finished its turn. True if it had not yet.
+
+        `opencode run --session` on a session whose turn is still running starts a
+        second agent loop next to the first: both edit the same files and start jobs.
+        """
+        idle = self.cfg.resume.turn_idle_seconds
+        if not self.router.in_turn(session, idle):
+            return False
+        log.info("session %s is still in its turn; resuming once it ends", session)
+        while self.router.in_turn(session, idle):
+            await asyncio.sleep(1.0)
+        return True
 
     async def _warm(self, session: str | None) -> None:
         st = self.router.sessions.get(session) if session else None

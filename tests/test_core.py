@@ -108,8 +108,8 @@ async def test_lease_unloads_settles_and_shrinks_budget(cfg, world, http):
     await broker.refresh()
     assert lease.state == "active"
     b = broker.budget()
-    # 20 GB total - 10 GB training - 1 GB headroom - margins
-    assert 8 * GB < b.fast < 9 * GB
+    # GPU1 is the job's: its 2 GB left are not the LLM's, only GPU0 (8 GB - margin) is
+    assert 7 * GB < b.fast < 8 * GB
     assert broker.plan(catalog.specs["medium"], True)[0] is not Placement.GPU
     assert broker.plan(catalog.specs["small"], True)[0] is Placement.GPU
     await broker.release_lease(lease.id)
