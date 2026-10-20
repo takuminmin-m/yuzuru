@@ -29,6 +29,12 @@ OpenCode から `yuzuru/auto` を選ぶだけで、タスクの難易度と空�
 
 ## セットアップ
 
+> [!WARNING]
+> **Linux 6.11 のカーネルでは使わないこと（6.12 以降に更新する）。** 6.11 には、大きなモデルの一部を CPU に逃がして
+> 読み込むたびに、数 GB〜十数 GB の RAM が再起動するまで失われるバグがある（詳細は「トラブルシューティング」）。
+> `uname -r` で確認できる。6.11 で起動すると yuzuru はログと `yuzuru status` で警告する。カーネルを更新するときは、
+> NVIDIA ドライバも新しいカーネルに対応するものにする（古いドライバはモジュールをビルドできないことがある）
+
 ```bash
 uv tool install -e /home/takumi/Documents/yuzuru   # `yuzuru` コマンドを PATH に
 yuzuru serve                                       # 常駐（systemd 化は下記）
@@ -133,6 +139,9 @@ ollama:
     scope が使えない環境ではプロセスツリーの RSS で測る）
   - 落ちたら自動で再起動し、yuzuru の終了時に止める。yuzuru が強制終了されて残ったものは、次の起動時に止めてから
     起動し直す。ログは `~/.local/state/yuzuru/ollama.log`、状態は `yuzuru status` の `Ollama (managed)` 行
+  - GPU を限定したときは `OLLAMA_VULKAN=0` も付ける。Ollama は CUDA とは別に Vulkan でも GPU を探し、
+    Vulkan は `CUDA_VISIBLE_DEVICES` を見ないので、除外した GPU が Vulkan のデバイスとして現れて使われてしまうため
+    （`ollama.env` に `OLLAMA_VULKAN` を書けばそちらが優先）
   - システムの `ollama.service` は 11434 で動いたままでよい（止めるなら `sudo systemctl disable --now ollama`）。
     OpenCode などは yuzuru 経由で使う（11434 を直接使うと、その分は yuzuru から見て他プロセスの使用量になる）
 
@@ -252,7 +261,17 @@ Bearer トークン必須になる（OpenCode 側は `{env:YUZURU_TOKEN}` を ap
 - `yuzuru status` の先頭に `!` 付きの警告が出る:
   - **GPU が応答しない**（カーネルログに `Xid 79, GPU has fallen off the bus`）: yuzuru は残りの GPU だけで動き続ける。
     再起動か `sudo nvidia-smi -r` で戻ることが多い。繰り返す場合は電源容量・PCIe の挿さり・ライザーを疑う
+  - **RAM がどのプロセスにも属さないまま保持されている**（どのプロセスも持っていないのに RAM が戻らない）: 下記
   - **Ollama がモデルに対応しない RAM を抱えている**: 強制終了されたランナーの分が残ることがある。`sudo systemctl restart ollama`
+- **RAM が再起動するまで解放されない（Linux 6.11）**: CPU に一部を逃がしたモデル（例: 8 GB GPU 上の qwen3.6）を
+  読み込むと、llama.cpp は CPU 側の重みを pinned メモリに置こうとする。6.11 のカーネルは数 GB を超える固定（pin）に
+  失敗すると、固定済みのページを解放しないバグがある（[kernel bug 219427](https://bugzilla.kernel.org/show_bug.cgi?id=219427)、
+  修正は 6.12）。llama.cpp は通常のメモリで動き続けるが、固定されたページは誰のものでもないまま残り、
+  Ollama を止めても戻らない。qwen3.6 では 1 回の読み込みで約 16 GB 失われた
+  - 対策はカーネルの更新（6.12 以降。NVIDIA ドライバも新しいカーネルに対応するものへ）。失われた分は再起動でしか戻らない
+  - 6.11 のまま使っていて読み込みで RAM が失われたら、yuzuru はそのモデルをすぐアンロードし、このカーネルでは
+    CPU に逃がす配置をしない（`~/.local/state/yuzuru/pinned_leaks.json`、カーネルを更新すると無効）。
+    これで 2 回目以降は防げるが、最初の 1 回分は失われる
 - OpenCode から送られている実際のリクエストを見たいとき: `YUZURU_DUMP=1 yuzuru serve` で、要求モデルごとの最新リクエストを
   `~/.local/state/yuzuru/last_request_<model>.json` に保存する
 

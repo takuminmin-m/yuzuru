@@ -217,6 +217,10 @@ class ManagedOllama:
                 uuids = []
             env["CUDA_VISIBLE_DEVICES"] = ",".join(uuids or allow)
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # if indices had to be used as given
+            # Ollama also runs models through Vulkan, which ignores CUDA_VISIBLE_DEVICES:
+            # a GPU hidden from CUDA shows up there as a separate device and gets used.
+            if "OLLAMA_VULKAN" not in self.oc.env:
+                env["OLLAMA_VULKAN"] = "0"
         self.visible = env.get("CUDA_VISIBLE_DEVICES")
         return env
 

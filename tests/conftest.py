@@ -26,6 +26,8 @@ class FakeWorld:
     busy: set[str] = field(default_factory=set)  # generating: Ollama defers their unload
     pending_unload: set[str] = field(default_factory=set)
     measure_host: bool = True
+    unowned: int = 0  # leaked pinned RAM no process owns
+    leak_on_load: dict[str, int] = field(default_factory=dict)  # variant -> bytes its load leaks
 
     def add_model(self, name: str, params_b: float, size_gb: float, moe: bool = False) -> None:
         self.installed[name] = {
@@ -59,6 +61,7 @@ class FakeWorld:
             free = sum(self.gpu_sizes) - sum(self.foreign) - self.ollama_vram()
             vram = max(0, min(size, free))
         self.loaded[name] = {"size": size, "size_vram": vram}
+        self.unowned += self.leak_on_load.get(name, 0)
 
     def snapshot(self) -> Snapshot:
         # Spread Ollama's VRAM over GPUs in order, after foreign usage.
@@ -69,8 +72,9 @@ class FakeWorld:
             rest -= take
             gpus.append(GPU(i, f"GPU-{i}", f"Fake {i}", total, foreign + take))
         host = self.ollama_host()
-        return Snapshot(gpus=gpus, ram_total=self.ram_total, ram_available=self.ram_total - 4 * GB - host,
-                        ollama_host=host if self.measure_host else None)
+        return Snapshot(gpus=gpus, ram_total=self.ram_total,
+                        ram_available=self.ram_total - 4 * GB - host - self.unowned,
+                        ollama_host=host if self.measure_host else None, ram_unowned=self.unowned)
 
     def ollama_host(self) -> int:
         # Like llama.cpp on CUDA: partial offload keeps the whole model in host RAM.
@@ -128,6 +132,14 @@ class FakeProbe(Probe):
         return self.world.snapshot()
 
 
+@pytest.fixture(autouse=True)
+def fixed_kernel(monkeypatch):
+    """Tests must not depend on the kernel they run on (6.11 adds a warning)."""
+    from yuzuru import pinleak
+
+    monkeypatch.setattr(pinleak, "kernel_release", lambda: "7.0.0-test")
+
+
 @pytest.fixture
 def world() -> FakeWorld:
     w = FakeWorld()
@@ -182,7 +194,8 @@ FAKE_OLLAMA = """#!{python}
 import http.server, json, os, sys
 assert sys.argv[1:] == ["serve"], sys.argv
 host, port = os.environ["OLLAMA_HOST"].rsplit(":", 1)
-keys = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OLLAMA_MODELS", "OLLAMA_HOST", "OLLAMA_FLASH_ATTENTION")
+keys = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OLLAMA_MODELS", "OLLAMA_HOST", "OLLAMA_FLASH_ATTENTION",
+        "OLLAMA_VULKAN", "GGML_CUDA_NO_PINNED")
 with open({record!r}, "a") as f:
     f.write(json.dumps({{"pid": os.getpid(), **{{k: os.environ.get(k) for k in keys}}}}) + "\\n")
 
