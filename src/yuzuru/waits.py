@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 import time
 import uuid
 from collections import deque
@@ -58,6 +59,24 @@ class Event:
     resume_error: str | None = None
 
 
+def outside_env() -> dict[str, str]:
+    """The environment for processes started for an agent (jobs, resumed sessions).
+
+    A server started with `uv run yuzuru serve` has its own venv in VIRTUAL_ENV and
+    first on PATH; a job inheriting them runs `python` / `uv run` in yuzuru's venv
+    instead of the project's (ModuleNotFoundError for everything the project installed).
+    """
+    env = os.environ.copy()
+    if sys.prefix == sys.base_prefix:
+        return env
+    if env.get("VIRTUAL_ENV") and Path(env["VIRTUAL_ENV"]).resolve() == Path(sys.prefix).resolve():
+        del env["VIRTUAL_ENV"]
+        env.pop("VIRTUAL_ENV_PROMPT", None)
+    own_bin = (Path(sys.prefix) / "bin").resolve()
+    env["PATH"] = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p).resolve() != own_bin)
+    return env
+
+
 def tail(path: str | None, cwd: str | None, lines: int) -> str:
     if not path:
         return ""
@@ -96,6 +115,14 @@ class Waiter:
             raise KeyError(w.lease)
         if w.pid is not None and not _pid_alive(w.pid):
             raise ValueError(f"pid {w.pid} is not running")
+        if same := self._watching(w):
+            # e.g. `wait` on a job `train` already resumes for: one exit, one resume.
+            log.info("watch %s already covers %s for session %s", same.id, w.label, w.session)
+            same.note, same.log = same.note or w.note, same.log or w.log
+            same.suspend, same.resume = same.suspend or w.suspend, same.resume or w.resume
+            if w.suspend and self.cfg.resume.suspend_all:
+                self.suspend_pending = True
+            return same
         self.watches[w.id] = w
         log.info("watch %s: %s (session %s, suspend=%s, resume=%s)", w.id, w.label, w.session, w.suspend, w.resume)
         if w.suspend and self.cfg.resume.suspend_all:
@@ -106,12 +133,26 @@ class Waiter:
         """Jobs started for a session with resume=True get a watch automatically."""
         if not (lease.resume and lease.session):
             return None
+        for w in self.watches.values():
+            if w.session == lease.session and w.pid == lease.pid and not w.lease:
+                # The agent called `wait` on the job before its lease existed: take that watch over.
+                w.lease, w.label = lease.id, lease.label
+                w.note, w.log, w.cwd = w.note or lease.note, w.log or lease.log, w.cwd or lease.cwd
+                w.resume = True
+                return w
         w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
                   note=lease.note, cwd=lease.cwd, log=lease.log)
         self.watches[w.id] = w
         if self.cfg.resume.suspend_all:
             self.suspend_pending = True
         return w
+
+    def _watching(self, w: Watch) -> Watch | None:
+        """An existing watch of the same session on the same process or lease."""
+        def target(x: Watch) -> tuple[str, Any]:
+            lease = self.broker.leases.get(x.lease) if x.lease else None
+            return ("pid", lease.pid) if lease else (("lease", x.lease) if x.lease else ("pid", x.pid))
+        return next((x for x in self.watches.values() if x.session == w.session and target(x) == target(w)), None)
 
     def _lease_ended(self, lease: Lease, rc: int | None) -> None:
         for w in [w for w in self.watches.values() if w.lease == lease.id]:
@@ -203,7 +244,7 @@ class Waiter:
         argv = [a.format(session=ev.session, message=self.message(ev), cwd=w.cwd or "") for a in self.cfg.resume.command]
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=w.cwd or None, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                *argv, cwd=w.cwd or None, env=outside_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )
             ev.resumed = True

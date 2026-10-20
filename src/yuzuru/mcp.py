@@ -22,6 +22,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .waits import outside_env
 
 log = logging.getLogger("yuzuru.mcp")
 
@@ -152,7 +153,7 @@ class MCPServer:
             if resume:
                 argv += ["--resume", "--note", args.get("note") or ""]
             argv += ["--", "bash", "-c", args["command"]]
-            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=outside_env(), capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
