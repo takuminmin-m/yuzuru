@@ -497,10 +497,10 @@ async def test_waiting_on_a_resuming_job_resumes_once(cfg, world, http, tmp_path
     catalog, broker, router = await make(cfg, world, http)
     waiter = Waiter(cfg, broker, router)
     # The agent calls `wait` on the job `train` just started, before its lease exists...
-    w = await waiter.add(session="ses_9", pid=os.getpid(), label="pid", note="次は評価", log="train.log")
+    w = await waiter.add(session="ses_9", pid=os.getpid(), label="pid", note="次は評価", log="train.log", resume=False)
     lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="ses_9",
                                       cwd=str(tmp_path), log=None, resume=True, note="")
-    assert waiter.watch_lease(lease) is w and w.lease == lease.id
+    assert waiter.watch_lease(lease) is w and w.lease == lease.id and w.resume  # the job asked to resume
     # ...or after it.
     assert await waiter.add(session="ses_9", pid=os.getpid()) is w
     assert len(waiter.watches) == 1

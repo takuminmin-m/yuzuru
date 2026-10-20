@@ -118,8 +118,10 @@ class Waiter:
         if same := self._watching(w):
             # e.g. `wait` on a job `train` already resumes for: one exit, one resume.
             log.info("watch %s already covers %s for session %s", same.id, w.label, w.session)
-            same.note = same.note or w.note
-            same.log = same.log or w.log
+            same.note, same.log = same.note or w.note, same.log or w.log
+            same.suspend, same.resume = same.suspend or w.suspend, same.resume or w.resume
+            if w.suspend and self.cfg.resume.suspend_all:
+                self.suspend_pending = True
             return same
         self.watches[w.id] = w
         log.info("watch %s: %s (session %s, suspend=%s, resume=%s)", w.id, w.label, w.session, w.suspend, w.resume)
@@ -136,6 +138,7 @@ class Waiter:
                 # The agent called `wait` on the job before its lease existed: take that watch over.
                 w.lease, w.label = lease.id, lease.label
                 w.note, w.log, w.cwd = w.note or lease.note, w.log or lease.log, w.cwd or lease.cwd
+                w.resume = True
                 return w
         w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
                   note=lease.note, cwd=lease.cwd, log=lease.log)
