@@ -274,6 +274,8 @@ class Waiter:
                 for a in self.cfg.resume.command]
         rc = self.cfg.resume
         if await asyncio.to_thread(scope.use, rc.scope):
+            if outside := await asyncio.to_thread(scope.opencode_service_outside):
+                log.warning("resuming session %s: %s", ev.session, scope.service_warning(outside))
             argv = scope.wrap(argv, f"yuzuru-agent-{os.getpid()}-{uuid.uuid4().hex[:8]}", rc.memory_max, oom_continue=True)
         try:
             proc = await asyncio.create_subprocess_exec(

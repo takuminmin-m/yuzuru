@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import shutil
 import subprocess
+from pathlib import Path
 
 
 @functools.cache
@@ -39,3 +40,34 @@ def wrap(argv: list[str], unit: str, memory_max: str | None = None, oom_continue
     if oom_continue:
         props += ["-p", "OOMPolicy=continue"]
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", *props, "--", *argv]
+
+
+def opencode_service_outside(proc: Path = Path("/proc")) -> list[tuple[int, str]]:
+    """OpenCode 2.x background services not running in an agent scope, as (pid, cgroup).
+
+    `opencode run` hands the turn to that service, so the agent's tools run in the
+    service's cgroup, not in the scope `opencode run` itself was started in. The
+    service lands wherever the first command that needed it ran (a Claude Code shell, a
+    terminal), unless it was started with `yuzuru agent -- opencode service start`.
+    """
+    found = []
+    for d in proc.iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+            if not (argv[0].endswith(b"opencode") and b"serve" in argv and b"--service" in argv):
+                continue
+            cgroup = (d / "cgroup").read_text().strip().split(":", 2)[-1]
+        except (OSError, IndexError):
+            continue
+        if "/yuzuru-agent-" not in cgroup:
+            found.append((int(d.name), cgroup))
+    return found
+
+
+def service_warning(outside: list[tuple[int, str]]) -> str:
+    pid, cgroup = outside[0]
+    return (f"the OpenCode service (pid {pid}) runs in {cgroup.rsplit('/', 1)[-1]}, not in an agent scope: "
+            "the agent's tools run there, without the memory cap. Restart it in one: "
+            "opencode service stop && yuzuru agent -- opencode service start")

@@ -111,3 +111,22 @@ def test_agent_command_execs_into_a_scope(tmp_path, monkeypatch):
     argv = calls[0]
     assert argv[0] == "systemd-run" and "MemoryMax=80%" in argv and "OOMPolicy=continue" in argv
     assert argv[argv.index("--") + 1:] == ["opencode", "run", "go"]
+
+
+def test_opencode_service_outside_an_agent_scope_is_found(tmp_path):
+    from yuzuru import scope
+
+    def proc(pid, argv, cgroup):
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "cmdline").write_bytes(b"\0".join(argv) + b"\0")
+        (d / "cgroup").write_text(f"0::{cgroup}\n")
+
+    app = "/user.slice/user-1000.slice/user@1000.service/app.slice"
+    proc(10, [b"/usr/bin/opencode", b"serve", b"--service"], f"{app}/app-com.anthropic.Claude-1.scope")
+    proc(11, [b"/usr/bin/opencode", b"serve", b"--service"], f"{app}/yuzuru-agent-5.scope")
+    proc(12, [b"/usr/bin/opencode", b"run", b"--session", b"ses"], f"{app}/app-com.anthropic.Claude-1.scope")
+    (tmp_path / "self").mkdir()
+    outside = scope.opencode_service_outside(tmp_path)
+    assert outside == [(10, f"{app}/app-com.anthropic.Claude-1.scope")]
+    assert "app-com.anthropic.Claude-1.scope" in scope.service_warning(outside)

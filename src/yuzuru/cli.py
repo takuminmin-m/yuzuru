@@ -97,6 +97,8 @@ def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
     if not cmd:
         raise SystemExit("usage: yuzuru agent -- opencode run ...")
     if scope.use(cfg.resume.scope):
+        if outside := scope.opencode_service_outside():
+            print(f"[yuzuru] WARNING: {scope.service_warning(outside)}", file=sys.stderr)
         cmd = scope.wrap(cmd, f"yuzuru-agent-{os.getpid()}", cfg.resume.memory_max, oom_continue=True)
     else:
         print("[yuzuru] no systemd user scope; the agent runs in this process's cgroup", file=sys.stderr)
