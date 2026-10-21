@@ -103,14 +103,19 @@ def test_agent_command_execs_into_a_scope(tmp_path, monkeypatch):
     from yuzuru import cli, scope
 
     calls = []
-    monkeypatch.setattr(cli.os, "execvp", lambda f, argv: calls.append(argv))
+    monkeypatch.setattr(cli.os, "execvpe", lambda f, argv, env: calls.append((argv, env)))
     monkeypatch.setattr(scope, "available", lambda: True)
+    monkeypatch.setattr(scope, "opencode_service_outside", lambda: [])
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))  # no user config: the defaults
+    monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)  # as under `uv run yuzuru agent`
     cli.main(["agent", "--", "opencode", "run", "go"])
-    argv = calls[0]
+    argv, env = calls[0]
     assert argv[0] == "systemd-run" and "MemoryMax=80%" in argv and "OOMPolicy=continue" in argv
     assert argv[argv.index("--") + 1:] == ["opencode", "run", "go"]
+    # The agent (and the OpenCode service it may start) must not run in yuzuru's venv.
+    if sys.prefix != sys.base_prefix:
+        assert "VIRTUAL_ENV" not in env
 
 
 def test_opencode_service_outside_an_agent_scope_is_found(tmp_path):

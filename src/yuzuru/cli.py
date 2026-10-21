@@ -102,7 +102,10 @@ def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
         cmd = scope.wrap(cmd, f"yuzuru-agent-{os.getpid()}", cfg.resume.memory_max, oom_continue=True)
     else:
         print("[yuzuru] no systemd user scope; the agent runs in this process's cgroup", file=sys.stderr)
-    os.execvp(cmd[0], cmd)
+    from .waits import outside_env
+
+    # Not yuzuru's own venv: the agent's `uv run python` must use the project's.
+    os.execvpe(cmd[0], cmd, outside_env())
 
 
 def cmd_run(args: argparse.Namespace, client: Client) -> None:
