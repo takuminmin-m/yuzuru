@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +100,9 @@ def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
     if scope.use(cfg.resume.scope):
         if outside := scope.opencode_service_outside():
             print(f"[yuzuru] WARNING: {scope.service_warning(outside)}", file=sys.stderr)
-        cmd = scope.wrap(cmd, f"yuzuru-agent-{os.getpid()}", cfg.resume.memory_max, oom_continue=True)
+        # The scope outlives this pid when it holds the OpenCode service, so the pid alone may be reused.
+        unit = f"yuzuru-agent-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        cmd = scope.wrap(cmd, unit, cfg.resume.memory_max, oom_continue=True)
     else:
         print("[yuzuru] no systemd user scope; the agent runs in this process's cgroup", file=sys.stderr)
     from .waits import outside_env
