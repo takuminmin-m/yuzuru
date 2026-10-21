@@ -272,11 +272,10 @@ class Waiter:
             self.suspended_models = []
         argv = [a.format(session=ev.session, message=self.message(ev, earlier), cwd=w.cwd or "")
                 for a in self.cfg.resume.command]
-        if await asyncio.to_thread(scope.use, self.cfg.resume.scope):
+        if await asyncio.to_thread(scope.use, self.cfg.isolation.scope):
             if outside := await asyncio.to_thread(scope.opencode_service_outside):
                 log.warning("resuming session %s: %s", ev.session, scope.service_warning(outside))
-            argv = scope.wrap(argv, f"yuzuru-agent-{os.getpid()}-{uuid.uuid4().hex[:8]}",
-                              self.cfg.resume.memory_max, oom_continue=True)
+            argv = scope.wrap(argv, scope.unit_name("agent"), self.cfg.isolation.memory_max, oom_continue=True)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=w.cwd or None, env=outside_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

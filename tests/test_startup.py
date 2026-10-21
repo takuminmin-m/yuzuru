@@ -81,7 +81,7 @@ async def test_resumed_agent_runs_in_its_own_capped_scope(cfg, world, http, tmp_
     argv_file = fake_systemd_run(tmp_path, monkeypatch)
     out = tmp_path / "resumed"
     cfg.resume.warm_before_resume = False
-    cfg.resume.scope, cfg.resume.memory_max = "on", "24G"
+    cfg.isolation.scope, cfg.isolation.memory_max = "on", "24G"
     cfg.resume.command = [sys.executable, "-c", f"open({str(out)!r}, 'w').write('ok')", "{session}"]
     ollama = Ollama("http://ollama", http)
     catalog = Catalog(cfg, ollama)

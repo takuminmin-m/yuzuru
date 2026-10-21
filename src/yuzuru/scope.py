@@ -10,8 +10,10 @@ script is killed there alone and the agent sees it exit with 137.
 from __future__ import annotations
 
 import functools
+import os
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 
@@ -30,6 +32,12 @@ def available() -> bool:
 def use(mode: str) -> bool:
     """auto | on | off -> whether to wrap commands in a scope."""
     return mode == "on" or (mode == "auto" and available())
+
+
+def unit_name(kind: str) -> str:
+    """yuzuru-<kind>-<pid>-<random>: a scope can outlive the pid that made it (one holding
+    the OpenCode service, a detached job), so the pid alone may be reused."""
+    return f"yuzuru-{kind}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 def wrap(argv: list[str], unit: str, memory_max: str | None = None, oom_continue: bool = False) -> list[str]:

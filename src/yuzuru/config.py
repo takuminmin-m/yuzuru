@@ -194,16 +194,26 @@ class ResumeConfig:
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40
-    # Run each resumed agent in its own systemd user scope: auto | on | off. The scripts
-    # it runs itself land there too, so one that runs out of memory is killed there alone
-    # instead of systemd stopping yuzuru's unit (and every agent in it) with it.
+
+
+@dataclass
+class IsolationConfig:
+    """Own systemd user scopes for what runs for an agent: the agent itself (resumed turns,
+    `yuzuru agent`) and its training jobs (MCP `yuzuru_train`).
+
+    A process's memory counts against the unit it was started from, and when the kernel
+    OOM-kills one, systemd stops that whole unit (yuzuru's service, a terminal, an IDE).
+    In a scope of its own with a memory cap, a runaway script or job is killed alone.
+    """
+
+    # auto (when `systemd-run --user --scope` works) | on | off
     scope: str = "auto"
-    # That scope's memory cap (systemd MemoryMax: "80%", "24G"; null: none).
+    # Each scope's memory cap (systemd MemoryMax: "80%", "24G"; null: none).
     memory_max: str | None = "80%"
 
     def __post_init__(self) -> None:
         if self.scope not in ("auto", "on", "off"):
-            raise ValueError(f"resume.scope must be auto, on or off, not {self.scope!r}")
+            raise ValueError(f"isolation.scope must be auto, on or off, not {self.scope!r}")
 
 
 @dataclass
@@ -222,6 +232,7 @@ class Config:
     router: RouterConfig = field(default_factory=RouterConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
     resume: ResumeConfig = field(default_factory=ResumeConfig)
+    isolation: IsolationConfig = field(default_factory=IsolationConfig)
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
@@ -284,6 +295,8 @@ def load_config(path: str | Path | None = None) -> Config:
             kwargs["cloud"] = _build(CloudConfig, value)
         elif key == "resume":
             kwargs["resume"] = _build(ResumeConfig, value)
+        elif key == "isolation":
+            kwargs["isolation"] = _build(IsolationConfig, value)
         elif key == "ollama":
             kwargs["ollama"] = _build(OllamaConfig, value)
         elif key == "state_dir":

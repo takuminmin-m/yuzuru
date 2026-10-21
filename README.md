@@ -164,12 +164,12 @@ ollama:
 そのターンの中でエージェントが次のジョブを起動していれば、前のジョブの結果では再開せず、次のジョブの終了を待つ。
 OpenCode のバックグラウンドサービスにつながっている TUI なら、再開したターンがそのまま表示される。
 
-再開したエージェントは、それぞれ専用の systemd user scope（`yuzuru-agent-*.scope`）で動く。エージェントが
+再開したエージェントは、それぞれ専用の systemd user scope（`yuzuru-agent-*.scope`）で動く。MCP `yuzuru_train` の学習ジョブも同じく `yuzuru-job-*.scope` で動く。エージェントが
 `uv run python debug.py` のように直接実行したスクリプトもその scope に入るので、メモリを食い尽くしても
-`resume.memory_max`（既定 `80%`、systemd の `MemoryMax`）で止まり、OOM で殺されるのはそのスクリプトだけになる。
+`isolation.memory_max`（既定 `80%`、systemd の `MemoryMax`）で止まり、OOM で殺されるのはそのスクリプトだけになる（ジョブなら終了コード 137 で lease が終わり、それを添えて再開する）。
 scope がないと、スクリプトのメモリは起動元（yuzuru のサービスや端末、IDE、Claude Code など）の unit に数えられ、
 カーネルの OOM killer がスクリプトを殺したあとに systemd がその unit ごと止めてしまう（`OOMPolicy=stop` が既定）。
-最初のターンも同じように隔離するには `yuzuru agent` から起動する（systemd がなければそのまま実行する。`resume.scope: off` で無効）:
+最初のターンも同じように隔離するには `yuzuru agent` から起動する（systemd がなければそのまま実行する。`isolation.scope: off` で無効）:
 
 ```bash
 yuzuru agent -- opencode run "README.md を読んで課題に取り組んで"
