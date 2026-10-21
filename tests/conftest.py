@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import httpx
 import pytest
 
-from yuzuru.config import GB, Config, LeaseConfig, ResourceConfig
+from yuzuru.config import GB, Config, IsolationConfig, LeaseConfig, ResourceConfig
 from yuzuru.resources import GPU, Probe, Snapshot
 
 
@@ -144,6 +144,7 @@ def cfg(tmp_path) -> Config:
         resources=ResourceConfig(vram_margin_mb=256, ram_reserve_mb=4096),
         lease=LeaseConfig(settle_seconds=0.0, settle_timeout=5, drain_timeout=0.1, unload_timeout=0.5,
                           restore_after=False),
+        isolation=IsolationConfig(scope="off"),  # tests that want a scope fake systemd-run
     )
 
 

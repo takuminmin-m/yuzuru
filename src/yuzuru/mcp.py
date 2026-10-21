@@ -21,7 +21,7 @@ from typing import Any
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from . import __version__
+from . import __version__, scope
 from .waits import outside_env
 
 log = logging.getLogger("yuzuru.mcp")
@@ -153,6 +153,10 @@ class MCPServer:
             if resume:
                 argv += ["--resume", "--note", args.get("note") or ""]
             argv += ["--", "bash", "-c", args["command"]]
+            if await asyncio.to_thread(scope.use, st.cfg.isolation.scope):
+                # Not in yuzuru's own unit: a job that runs out of memory is killed alone (its lease
+                # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
+                argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True)
             r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=outside_env(), capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)

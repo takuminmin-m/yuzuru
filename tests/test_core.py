@@ -649,3 +649,34 @@ async def test_lease_reports_a_model_that_never_left(cfg, world, http):
     world.busy.add(variant)
     lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None)
     assert lease.resident == [variant]
+
+
+async def test_mcp_train_runs_the_job_in_its_own_capped_scope(cfg, world, http, tmp_path, monkeypatch):
+    import subprocess
+
+    import yuzuru.mcp as mcp_mod
+
+    cfg.router = RouterConfig(classifier="heuristic")
+    cfg.isolation.scope, cfg.isolation.memory_max = "on", "20G"
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"pid": 1, "log": "x.log"}), stderr="")
+
+    monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+    st = State(cfg, probe=FakeProbe(world), http=http)
+    app = create_app(cfg, st)
+    await st.start()
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
+            r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "train", "arguments": {"command": "python train.py", "cwd": str(tmp_path)}}})
+            assert not r.json()["result"]["isError"]
+    finally:
+        await st.stop()
+    argv = calls[0]
+    # Not in yuzuru's own unit: a job that runs out of memory must not stop the server.
+    assert argv[:3] == ["systemd-run", "--user", "--scope"] and any(a.startswith("--unit=yuzuru-job-") for a in argv)
+    assert "MemoryMax=20G" in argv and "OOMPolicy=continue" in argv
+    assert argv[argv.index("--") + 1:][-3:] == ["bash", "-c", "python train.py"]

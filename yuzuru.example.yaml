@@ -68,3 +68,7 @@ resume:                # free the LLM while waiting on a process, resume the ses
   suspend_all: true    # unload every model while waiting (CPU classifier too)
   warm_before_resume: true
   log_tail_lines: 40
+
+isolation:             # own systemd scope for each agent (resumed / `yuzuru agent`) and yuzuru_train job
+  scope: auto          # auto | on | off
+  memory_max: 80%      # each scope's MemoryMax: a runaway script or job is killed there, not yuzuru or the terminal
