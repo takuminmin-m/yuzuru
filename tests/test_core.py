@@ -537,6 +537,29 @@ async def test_pid_watch_and_long_poll(cfg, world, http, tmp_path):
         await waiter.add(session="s", pid=proc.pid)  # already gone
 
 
+
+async def test_relative_log_of_a_pid_watch_is_the_processs(cfg, world, http, tmp_path):
+    """`wait` with log="train.log" and no cwd: the log is in the process's directory, not the server's."""
+    import subprocess
+    import sys
+
+    from yuzuru.waits import Waiter
+
+    cfg.resume.enabled = False
+    _, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "train_run.log").write_text("epoch 199 val=47.5%\nDone!\n")
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"], cwd=job)
+    w = await waiter.add(session="s", pid=proc.pid, label="train", log="train_run.log")
+    assert w.cwd == str(job)
+    proc.wait()
+    await waiter.poll()
+    ev = list(waiter.events)[-1]
+    assert ev.log_tail.endswith("Done!")
+
+
 def test_default_tiers_fit_an_agent_prompt():
     from yuzuru.config import default_tiers
 

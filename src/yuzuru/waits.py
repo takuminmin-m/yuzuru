@@ -78,6 +78,15 @@ def outside_env() -> dict[str, str]:
     return env
 
 
+def _proc_cwd(pid: int | None) -> str | None:
+    if pid is None:
+        return None
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
 def tail(path: str | None, cwd: str | None, lines: int) -> str:
     if not path:
         return ""
@@ -118,10 +127,15 @@ class Waiter:
             raise KeyError(w.lease)
         if w.pid is not None and not _pid_alive(w.pid):
             raise ValueError(f"pid {w.pid} is not running")
+        if not w.cwd:
+            # A relative log ("train.log") is the process's, not the server's: resolve it where
+            # the job runs, read now while the process is still there.
+            lease = self.broker.leases.get(w.lease) if w.lease else None
+            w.cwd = lease.cwd if lease and lease.cwd else _proc_cwd(lease.pid if lease else w.pid)
         if same := self._watching(w):
             # e.g. `wait` on a job `train` already resumes for: one exit, one resume.
             log.info("watch %s already covers %s for session %s", same.id, w.label, w.session)
-            same.note, same.log = same.note or w.note, same.log or w.log
+            same.note, same.log, same.cwd = same.note or w.note, same.log or w.log, same.cwd or w.cwd
             same.suspend, same.resume = same.suspend or w.suspend, same.resume or w.resume
             if w.suspend and self.cfg.resume.suspend_all:
                 self.suspend_pending = True
