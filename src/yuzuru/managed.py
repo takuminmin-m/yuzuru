@@ -17,7 +17,6 @@ import os
 import shutil
 import signal
 import socket
-import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -25,6 +24,7 @@ from typing import Any
 
 import httpx
 
+from . import scope
 from .config import Config
 from .ollama import Ollama, OllamaError
 
@@ -119,14 +119,6 @@ def running_url(cfg: Config) -> str | None:
     except (OSError, ValueError):
         return None
     return info.get("url") if _is_ollama_serve(int(info.get("pid", 0))) else None
-
-
-def _scope_works() -> bool:
-    try:
-        return subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"],
-                              capture_output=True, timeout=10).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
 
 
 def _gone(pid: int) -> bool:
@@ -229,7 +221,7 @@ class ManagedOllama:
             return self.oc.scope == "on"
         if self._scope_ok is None:
             # No user systemd instance (a container, a bare ssh session): run it without a scope.
-            self._scope_ok = shutil.which("systemd-run") is not None and await asyncio.to_thread(_scope_works)
+            self._scope_ok = await asyncio.to_thread(scope.available)
             if not self._scope_ok:
                 log.info("managed ollama: systemd-run --user --scope unavailable; measuring its RAM by process")
         return self._scope_ok
@@ -253,7 +245,7 @@ class ManagedOllama:
         if self.scoped:
             # Runs the command in place (same pid) inside a transient scope = its own cgroup.
             unit = f"yuzuru-ollama-{os.getpid()}-{self.restarts}"
-            argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "--", *argv]
+            argv = scope.wrap(argv, unit)
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         with (self.cfg.state_dir / "ollama.log").open("ab") as out:
             # Own session: Ctrl-C on yuzuru's terminal must not kill it before yuzuru stops it.

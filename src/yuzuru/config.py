@@ -194,6 +194,16 @@ class ResumeConfig:
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40
+    # Run each resumed agent in its own systemd user scope: auto | on | off. The scripts
+    # it runs itself land there too, so one that runs out of memory is killed there alone
+    # instead of systemd stopping yuzuru's unit (and every agent in it) with it.
+    scope: str = "auto"
+    # That scope's memory cap (systemd MemoryMax: "80%", "24G"; null: none).
+    memory_max: str | None = "80%"
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("auto", "on", "off"):
+            raise ValueError(f"resume.scope must be auto, on or off, not {self.scope!r}")
 
 
 @dataclass

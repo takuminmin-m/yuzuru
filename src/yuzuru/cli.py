@@ -16,7 +16,8 @@ from typing import Any
 
 import httpx
 
-from .config import GB, MB, load_config
+from . import scope
+from .config import GB, MB, Config, load_config
 
 UNITS = {"": GB, "b": 1, "k": 1024, "m": MB, "g": GB, "t": 1024 * GB}
 
@@ -86,6 +87,20 @@ def allowlist(config: str | None) -> list[str]:
     except Exception as e:  # noqa: BLE001 - a broken config must not stop the job
         print(f"[yuzuru] cannot read config ({e}); not restricting GPUs", file=sys.stderr)
         return []
+
+
+def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
+    """Replace this process with the agent, in a scope of its own like resumed turns get:
+    a script the agent runs that eats all memory is killed alone, not the terminal, IDE
+    or service the agent was started from."""
+    cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+    if not cmd:
+        raise SystemExit("usage: yuzuru agent -- opencode run ...")
+    if scope.use(cfg.resume.scope):
+        cmd = scope.wrap(cmd, f"yuzuru-agent-{os.getpid()}", cfg.resume.memory_max, oom_continue=True)
+    else:
+        print("[yuzuru] no systemd user scope; the agent runs in this process's cgroup", file=sys.stderr)
+    os.execvp(cmd[0], cmd)
 
 
 def cmd_run(args: argparse.Namespace, client: Client) -> None:
@@ -252,6 +267,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--note", default="", help="what to do next, passed back when resuming")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
+    p = sub.add_parser("agent", help="start an agent (e.g. opencode run) in its own memory-capped scope")
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+
     p = sub.add_parser("reserve", help="force-reserve VRAM / GPUs now (LLM is moved out, memory is held)")
     p.add_argument("--gpu", action="append", help="GPU index or UUID (repeatable); default: the only GPU")
     p.add_argument("--vram", help="amount, e.g. 10G (default: everything free on the chosen GPUs)")
@@ -318,6 +336,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "run":
         return cmd_run(args, client)
+    if args.command == "agent":
+        return cmd_agent(args, cfg)
     if args.command == "opencode":
         from .opencode import cmd_opencode
 

@@ -137,10 +137,10 @@ async def test_state_follows_the_picked_port(cfg, world, http, fake_ollama, free
 
 
 async def test_scope_detected_up_front(cfg, monkeypatch, tmp_path):
-    import yuzuru.managed as managed_mod
+    import yuzuru.scope as scope_mod
 
     m, _ = managed(cfg, "ollama", tmp_path)
     m.oc.scope = "auto"
-    monkeypatch.setattr(managed_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(scope_mod, "available", lambda: False)
     assert await m._use_scope() is False  # decided before launching, not from an early exit
     assert port_free("127.0.0.1", 0)
