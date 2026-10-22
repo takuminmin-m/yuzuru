@@ -177,7 +177,7 @@ class MCPServer:
                 "lease": {"type": "string", "description": "or a yuzuru lease id (from the `status` tool)"},
                 "note": {"type": "string", "description": "what you will do when it ends (handed back to you)"},
                 "log": {"type": "string", "description": "log file whose last lines to hand back (optional)"},
-                "cwd": {"type": "string", "description": "working directory for resolving the log path (optional)"},
+                "cwd": {"type": "string", "description": "working directory for resolving the log path (optional; default the process's own)"},
             },
         )
         async def wait(args: dict[str, Any], headers: dict[str, str]) -> str:
