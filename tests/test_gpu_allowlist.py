@@ -15,7 +15,7 @@ from yuzuru import cli
 from yuzuru.broker import Broker
 from yuzuru.catalog import Catalog
 from yuzuru.config import GB, Config, OllamaConfig, ResourceConfig, load_config
-from yuzuru.managed import ManagedOllama, mirror_models
+from yuzuru.managed import ManagedOllama, _gone, mirror_models
 from yuzuru.ollama import Ollama
 from yuzuru.resources import NvidiaSmiProbe, OllamaHostMemory
 from yuzuru.server import State, create_app
@@ -208,7 +208,7 @@ async def test_managed_ollama_sees_only_allowed_gpus_and_is_restarted(cfg, fake_
 
 
 async def test_managed_ollama_replaces_stale_instance(cfg, fake_ollama, free_port, tmp_path):
-    binary, record = fake_ollama
+    binary, _ = fake_ollama
     managed_cfg(cfg, binary, free_port, tmp_path / "models")
     old = ManagedOllama(cfg, lambda: ["GPU-x"])
     await old.start()
@@ -221,6 +221,49 @@ async def test_managed_ollama_replaces_stale_instance(cfg, fake_ollama, free_por
         await old.proc.wait()  # the stale one was stopped (it held the port)
     finally:
         await m.stop()
+
+
+def other_free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+async def test_two_yuzurus_sharing_state_dir_keep_their_own_servers(cfg, fake_ollama, free_port, tmp_path):
+    binary, _ = fake_ollama
+    a = ManagedOllama(managed_cfg(cfg, binary, free_port, tmp_path / "models"), lambda: ["GPU-x"])
+    cfg_b = managed_cfg(dataclasses.replace(cfg, port=cfg.port + 10), binary, other_free_port(), tmp_path / "models")
+    b = ManagedOllama(cfg_b, lambda: ["GPU-y"])
+    await a.start()
+    try:
+        await b.start()
+        try:
+            assert a.pidfile != b.pidfile and a.pidfile.parent == b.pidfile.parent
+            assert a.pid is not None and b.pid is not None and a.restarts == 0
+        finally:
+            await b.stop()
+        assert a.pid is not None and a.pidfile.exists()  # b's stop left a's server and pidfile alone
+    finally:
+        await a.stop()
+
+
+async def test_managed_ollama_of_a_running_yuzuru_is_not_stale(cfg, fake_ollama, free_port, tmp_path):
+    binary, record = fake_ollama
+    managed_cfg(cfg, binary, free_port, tmp_path / "models")
+    old = ManagedOllama(cfg, lambda: ["GPU-x"])
+    await old.start()
+    owner = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)", "yuzuru")
+    try:
+        info = json.loads(old.pidfile.read_text())
+        old.pidfile.write_text(json.dumps({**info, "owner": owner.pid}))  # as if another yuzuru started it
+        ManagedOllama(cfg, lambda: ["GPU-x"])._kill_stale()
+        assert not _gone(info["pid"])
+    finally:
+        owner.kill()
+        await owner.wait()
+        await old.stop()
 
 
 async def test_state_runs_managed_ollama_on_allowed_gpus(cfg, world, http, fake_ollama, free_port, tmp_path):
