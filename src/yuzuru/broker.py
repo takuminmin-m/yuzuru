@@ -69,6 +69,7 @@ class Lease:
     note: str = ""  # what the agent meant to do next
     hard: bool = False  # reservation backed by a holder process that occupies the VRAM
     whole: bool = False  # took its GPUs whole (gpus without an amount): the LLM may not use them
+    cpu: bool = False  # CPU-only job: sees no GPU, the LLM stays where it is
     expires: float | None = None
     created: float = field(default_factory=time.time)
     # job: draining (LLM leaving) -> settling (job allocating) -> active; reservation: reserved
@@ -145,8 +146,8 @@ class Broker:
 
     def _lease_reserve(self, lease: Lease) -> int:
         snap = self.snapshot
-        if lease.whole:
-            return 0  # its GPUs are left out of the LLM's pool altogether (budget)
+        if lease.whole or lease.cpu:
+            return 0  # its GPUs are left out of the LLM's pool altogether (budget); a CPU job takes none
         if lease.kind == "reservation":
             # A hard reservation's holder shows up as growth, so it nets to ~0 here.
             return max(0, (lease.vram or 0) - lease.grown)
@@ -342,7 +343,9 @@ class Broker:
     def visible_gpus(self, lease: Lease) -> list[str]:
         """CUDA_VISIBLE_DEVICES for a lease's job: its GPUs, else every allowed one.
 
-        Empty means "do not restrict" (no allowlist configured)."""
+        Empty means "do not restrict" (no allowlist configured); "-1" hides every GPU (a CPU-only job)."""
+        if lease.cpu:
+            return ["-1"]
         if lease.gpus or not self.cfg.resources.gpus:
             return lease.gpus
         return [g.uuid for g in self.snapshot.gpus] or list(self.cfg.resources.gpus)
@@ -377,6 +380,15 @@ class Broker:
         self, pid: int, label: str, gpus: list[str], vram: int | None, session: str | None = None,
         drain: bool = True, **extra: Any,
     ) -> Lease:
+        if extra.get("cpu"):
+            if gpus or vram:
+                raise ValueError("a CPU-only job takes no --gpu or --vram")
+            # Nothing to make room for: no drain, no unload, no settling.
+            lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=[], vram=None, session=session,
+                          state="active", **extra)
+            self.leases[lease.id] = lease
+            log.info("lease %s (%s, pid %d, CPU only) created", lease.id, label, pid)
+            return lease
         await self.refresh()
         resolved = self._resolve_gpus(gpus)
         lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session,

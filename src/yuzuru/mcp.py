@@ -32,10 +32,18 @@ INSTRUCTIONS = (
     "yuzuru serves this assistant from local models sized to the free GPU memory. "
     "Call this server's `model` tool with 'large' when a task needs deeper reasoning than the current model gives. "
     "Start GPU training / fine-tuning with its `train` tool rather than bash: it moves the LLM out of VRAM first "
-    "and runs the job in the background with a log file."
+    "and runs the job in the background with a log file. For a job that uses no GPU (LightGBM, XGBoost on CPU, "
+    "scikit-learn, data preparation) pass device 'cpu': the LLM then stays loaded."
 )
 
 Handler = Callable[[dict[str, Any], dict[str, str]], Awaitable[str]]
+
+
+def _device(args: dict[str, Any]) -> str:
+    device = (args.get("device") or "gpu").lower()
+    if device not in ("gpu", "cpu"):
+        raise ValueError(f"device must be 'gpu' or 'cpu', not {device!r}")
+    return device
 
 
 def gb(n: float) -> str:
@@ -55,7 +63,8 @@ def format_status(s: dict[str, Any]) -> str:
     if s["loaded"]:
         lines.append("Loaded: " + ", ".join(f"{m['name']} ({gb(m['size_vram'])} GPU)" for m in s["loaded"]))
     for l in s["leases"]:
-        lines.append(f"Lease {l['id']}: {l['label']} pid {l['pid']} {l['state']}, using +{gb(l['grown'])}")
+        use = "CPU only" if l.get("cpu") else f"using +{gb(l['grown'])}"
+        lines.append(f"Lease {l['id']}: {l['label']} pid {l['pid']} {l['state']}, {use}")
     return "\n".join(lines)
 
 
@@ -118,12 +127,15 @@ class MCPServer:
 
         @self.tool(
             "train",
-            "Start a GPU training / fine-tuning job in the background. yuzuru first moves the local LLM out of GPU "
-            "memory, waits for the job's memory use to settle, then lets the LLM use what remains. Returns the PID "
-            "and log file; read the log to follow progress.",
+            "Start a training / fine-tuning job in the background. For a GPU job (the default) yuzuru first moves "
+            "the local LLM out of GPU memory, waits for the job's memory use to settle, then lets the LLM use what "
+            "remains. With device 'cpu' the job sees no GPU, the LLM is left alone and the job yields CPU to it. "
+            "Returns the PID and log file; read the log to follow progress.",
             {
                 "command": {"type": "string", "description": "shell command, e.g. 'python train.py --epochs 10'"},
                 "cwd": {"type": "string", "description": "absolute working directory (the project root)"},
+                "device": {"type": "string", "enum": ["gpu", "cpu"],
+                           "description": "'cpu' for a job that uses no GPU (default 'gpu')"},
                 "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional)"},
                 "vram": {"type": "string", "description": "VRAM to reserve, e.g. '10G' (optional; default measured)"},
                 "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
@@ -137,11 +149,16 @@ class MCPServer:
             cwd = Path(args["cwd"]).expanduser()
             if not cwd.is_dir():
                 raise ValueError(f"cwd does not exist: {cwd}")
+            cpu = _device(args) == "cpu"
+            if cpu and (args.get("gpus") or args.get("vram")):
+                raise ValueError("device 'cpu' takes no gpus or vram")
             # The job runs in `cwd`: a relative config path (YUZURU_CONFIG, ./yuzuru.yaml) would not resolve there.
             argv = [sys.executable, "-m", "yuzuru.cli", *(["--config", str(st.cfg.source)] if st.cfg.source else []),
                     "--url", st.cfg.url, "run", "--detach", "--label", "train"]
             if args.get("log"):
                 argv += ["--log", args["log"]]
+            if cpu:
+                argv.append("--cpu")
             for g in filter(None, (x.strip() for x in (args.get("gpus") or "").split(","))):
                 argv += ["--gpu", g]
             if args.get("vram"):
@@ -156,15 +173,18 @@ class MCPServer:
             if await asyncio.to_thread(scope.use, st.cfg.isolation.scope):
                 # Not in yuzuru's own unit: a job that runs out of memory is killed alone (its lease
                 # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
-                argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True)
+                argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True,
+                                  cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
             r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=outside_env(), capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if resume:
-                text += ("\nThe local LLM is released while the job runs. End your turn now: this session is "
-                         "resumed automatically with the exit status and the log tail when the job ends.")
+                text += ("\n" + ("The local LLM stays loaded (CPU-only job)." if cpu else
+                                 "The local LLM is released while the job runs.") +
+                         " End your turn now: this session is resumed automatically with the exit status and "
+                         "the log tail when the job ends.")
             return text
 
         @self.tool(
@@ -178,6 +198,8 @@ class MCPServer:
                 "note": {"type": "string", "description": "what you will do when it ends (handed back to you)"},
                 "log": {"type": "string", "description": "log file whose last lines to hand back (optional)"},
                 "cwd": {"type": "string", "description": "working directory for resolving the log path (optional; default the process's own)"},
+                "device": {"type": "string", "enum": ["gpu", "cpu"],
+                           "description": "'cpu' if the process uses no GPU: the LLM is not unloaded (default 'gpu')"},
             },
         )
         async def wait(args: dict[str, Any], headers: dict[str, str]) -> str:
@@ -188,9 +210,10 @@ class MCPServer:
                 session=session, pid=int(args["pid"]) if args.get("pid") else None, lease=args.get("lease"),
                 label=f"pid {args['pid']}" if args.get("pid") else f"lease {args['lease']}",
                 note=args.get("note") or "", log=args.get("log"), cwd=args.get("cwd"),
+                suspend=_device(args) != "cpu",
             )
-            return (f"waiting ({w.id}); the local LLM is unloaded. End your turn now: session {session} is "
-                    "resumed automatically when the process exits.")
+            return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
+                    f"turn now: session {session} is resumed automatically when the process exits.")
 
     async def handle(self, request: Request) -> Response:
         try:

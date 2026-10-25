@@ -93,11 +93,11 @@ async def test_lease_endpoint_tells_job_which_gpus_to_see(cfg, world, http):
 # ------------------------------------------------------------------ yuzuru run
 
 
-def run_args(tmp_path, out, config=None):
+def run_args(tmp_path, out, config=None, cpu=False):
     code = f"import os; open({str(out)!r}, 'w').write(os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>'))"
     return argparse.Namespace(
         cmd=["--", sys.executable, "-c", code], detach=False, log=None, session=None, resume=False, note="",
-        use=None, label=None, gpu=None, vram=None, config=config,
+        use=None, label=None, gpu=None, vram=None, config=config, cpu=cpu,
     )
 
 
@@ -129,6 +129,30 @@ def test_run_limits_job_to_allowed_gpus_without_gpu_flag(tmp_path, monkeypatch):
     out = tmp_path / "seen"
     call_run(run_args(tmp_path, out), FakeClient({"id": "abc", "gpus": [], "visible": ["GPU-0"]}))
     assert out.read_text() == "GPU-0"
+
+
+async def test_cpu_lease_endpoint_hides_every_gpu(cfg, world, http):
+    cfg.resources.gpus = ["GPU-1"]
+    st = State(cfg, probe=AllowlistProbe(world, ["GPU-1"]), http=http)
+    app = create_app(cfg, st)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
+        r = await c.post("/yuzuru/leases", json={"pid": os.getpid(), "label": "lgbm", "cpu": True})
+        assert r.status_code == 200 and r.json()["visible"] == ["-1"] and r.json()["state"] == "active"
+        assert (await c.get("/yuzuru/status")).json()["leases"][0]["cpu"]
+        r = await c.post("/yuzuru/leases", json={"pid": os.getpid(), "cpu": True, "gpus": ["GPU-1"]})
+        assert r.status_code == 400
+
+
+def test_run_cpu_hides_gpus_with_or_without_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    out = tmp_path / "seen"
+    client = FakeClient({"id": "abc", "gpus": [], "visible": ["-1"]})
+    call_run(run_args(tmp_path, out, cpu=True), client)
+    assert out.read_text() == "-1"
+    conf = tmp_path / "y.yaml"
+    conf.write_text("resources:\n  gpus: [0]\n")
+    call_run(run_args(tmp_path, out, str(conf), cpu=True), FakeClient(None))
+    assert out.read_text() == "-1"  # not the allowlist: the job is CPU only
 
 
 def test_run_without_server_still_applies_allowlist(tmp_path, monkeypatch):

@@ -132,6 +132,8 @@ class Waiter:
             # the job runs, read now while the process is still there.
             lease = self.broker.leases.get(w.lease) if w.lease else None
             w.cwd = lease.cwd if lease and lease.cwd else _proc_cwd(lease.pid if lease else w.pid)
+        if self._cpu_job(w):
+            w.suspend = False  # e.g. `wait` on a job started with device "cpu"
         if same := self._watching(w):
             # e.g. `wait` on a job `train` already resumes for: one exit, one resume.
             log.info("watch %s already covers %s for session %s", same.id, w.label, w.session)
@@ -157,12 +159,18 @@ class Waiter:
                 w.note, w.log, w.cwd = w.note or lease.note, w.log or lease.log, w.cwd or lease.cwd
                 w.resume = True
                 return w
+        # A CPU-only job needs none of the LLM's memory: keep it loaded for the resumed turn.
         w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
-                  note=lease.note, cwd=lease.cwd, log=lease.log)
+                  note=lease.note, cwd=lease.cwd, log=lease.log, suspend=not lease.cpu)
         self.watches[w.id] = w
-        if self.cfg.resume.suspend_all:
+        if w.suspend and self.cfg.resume.suspend_all:
             self.suspend_pending = True
         return w
+
+    def _cpu_job(self, w: Watch) -> bool:
+        """Whether `w` watches a CPU-only job's lease (by id, or by the job's pid)."""
+        return any(l.cpu and (l.id == w.lease or w.pid is not None and l.pid == w.pid)
+                   for l in self.broker.leases.values())
 
     def _watching(self, w: Watch) -> Watch | None:
         """An existing watch of the same session on the same process or lease."""

@@ -368,7 +368,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
 
     def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
         return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
-                "note": str(payload.get("note") or "")}
+                "note": str(payload.get("note") or ""), "cpu": bool(payload.get("cpu"))}
 
     @app.post("/yuzuru/reservations", dependencies=guarded)
     async def reserve(payload: dict[str, Any]) -> dict[str, Any]:
