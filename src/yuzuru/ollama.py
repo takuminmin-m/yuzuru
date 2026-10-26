@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
+
+T = TypeVar("T")
+_running: set[asyncio.Task] = set()
+
+
+async def shielded(aw: Awaitable[T]) -> T:
+    """Await `aw` in a task of its own, which cancelling the caller does not cancel.
+
+    httpx's cleanup is not safe against asyncio's Task.cancel(): a cancellation that lands while
+    a response is being finished or closed can leave its pool connection marked busy for good.
+    Once all of the pool's connections (100) are, every request to Ollama waits forever. Shielded,
+    the request runs to its end and hands its connection back; only the caller stops waiting.
+    """
+    task = asyncio.ensure_future(aw)
+    _running.add(task)
+    task.add_done_callback(_running.discard)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())  # nobody else will look
+        raise
 
 
 @dataclass
@@ -33,18 +56,18 @@ class Ollama:
         await self.http.aclose()
 
     async def _post(self, path: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        r = await self.http.post(path, json=payload, timeout=timeout or httpx.USE_CLIENT_DEFAULT)
+        r = await shielded(self.http.post(path, json=payload, timeout=timeout or httpx.USE_CLIENT_DEFAULT))
         if r.status_code >= 400:
             raise OllamaError(f"{path}: {r.status_code} {r.text[:300]}")
         return r.json() if r.content else {}
 
     async def tags(self) -> list[dict[str, Any]]:
-        r = await self.http.get("/api/tags")
+        r = await shielded(self.http.get("/api/tags"))
         r.raise_for_status()
         return r.json().get("models", [])
 
     async def ps(self) -> list[LoadedModel]:
-        r = await self.http.get("/api/ps")
+        r = await shielded(self.http.get("/api/ps"))
         r.raise_for_status()
         return [
             LoadedModel(m["name"], m.get("size", 0), m.get("size_vram", 0), m.get("context_length"))
