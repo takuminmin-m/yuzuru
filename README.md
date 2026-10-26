@@ -136,7 +136,8 @@ ollama:
     ポートを使う。手で立てた Ollama や別の yuzuru の管理 Ollama がいても衝突せず、複数同時に動かせる。
     yuzuru 自身のポート（`port`）と 11434 は選ばない。再起動時は前回のポートが空いていればそのまま使い、
     埋まっていれば別のポートに移る（yuzuru 内部の接続先も追従する）。実際のポートは `yuzuru status` と
-    `~/.local/state/yuzuru/ollama.json` に出る
+    `~/.local/state/yuzuru/ollama-<yuzuru の port>.json` に出る（yuzuru ごとに別ファイルなので、同じ `state_dir` の
+    yuzuru を複数動かしても互いの管理 Ollama を止めない）
   - `port: 11437` のように固定すると、そのポートが埋まっている間は起動せずに警告を出して待ち、空いたら起動する
   - `OLLAMA_MODELS` は `ollama.models`（既定 `~/.local/share/yuzuru-ollama/models`）。システムのモデル置き場
     （`$OLLAMA_MODELS`、`/usr/share/ollama/.ollama/models`、`~/.ollama/models` の順に探す。`ollama.mirror_from` で指定可、
@@ -148,7 +149,7 @@ ollama:
     （`memory.current`）はシステムの `ollama.service` ではなくこのプロセスが対象になる（`ollama.scope: off` で無効。
     scope が使えない環境ではプロセスツリーの RSS で測る）
   - 落ちたら自動で再起動し、yuzuru の終了時に止める。yuzuru が強制終了されて残ったものは、次の起動時に止めてから
-    起動し直す。ログは `~/.local/state/yuzuru/ollama.log`、状態は `yuzuru status` の `Ollama (managed)` 行
+    起動し直す。ログは `~/.local/state/yuzuru/ollama-<yuzuru の port>.log`、状態は `yuzuru status` の `Ollama (managed)` 行
   - システムの `ollama.service` は 11434 で動いたままでよい（止めるなら `sudo systemctl disable --now ollama`）。
     OpenCode などは yuzuru 経由で使う（11434 を直接使うと、その分は yuzuru から見て他プロセスの使用量になる）
 
