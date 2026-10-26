@@ -97,6 +97,16 @@ def _is_ollama_serve(pid: int) -> bool:
     return any(a.endswith(b"ollama") for a in argv) and b"serve" in argv
 
 
+def _is_live_yuzuru(pid: int) -> bool:
+    """A running yuzuru other than this one (the owner of a managed server)."""
+    if pid == os.getpid() or _gone(pid):
+        return False
+    try:
+        return b"yuzuru" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
 def port_free(host: str, port: int) -> bool:
     """Whether `ollama serve` could listen on host:port right now."""
     with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET) as s:
@@ -109,16 +119,29 @@ def port_free(host: str, port: int) -> bool:
 
 
 def state_file(cfg: Config) -> Path:
-    return cfg.state_dir / "ollama.json"
+    # Keyed by yuzuru's own port: several yuzurus may share a state_dir, and one
+    # must neither read nor stop the server another started.
+    return cfg.state_dir / f"ollama-{cfg.port}.json"
+
+
+def log_file(cfg: Config) -> Path:
+    return cfg.state_dir / f"ollama-{cfg.port}.log"
 
 
 def running_url(cfg: Config) -> str | None:
-    """URL of the managed server a running yuzuru started (its port may be auto-picked)."""
-    try:
-        info = json.loads(state_file(cfg).read_text())
-    except (OSError, ValueError):
-        return None
-    return info.get("url") if _is_ollama_serve(int(info.get("pid", 0))) else None
+    """URL of the managed server a running yuzuru started (its port may be auto-picked).
+
+    That yuzuru's own first; else any other's in the state_dir (one started with
+    `serve --port` is not keyed by the config's port)."""
+    others = sorted(set(cfg.state_dir.glob("ollama-*.json")) - {state_file(cfg)})
+    for f in [state_file(cfg), *others]:
+        try:
+            info = json.loads(f.read_text())
+            if _is_ollama_serve(int(info.get("pid", 0))):
+                return info.get("url")
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
 
 
 def _gone(pid: int) -> bool:
@@ -247,14 +270,14 @@ class ManagedOllama:
             unit = f"yuzuru-ollama-{os.getpid()}-{self.restarts}"
             argv = scope.wrap(argv, unit)
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
-        with (self.cfg.state_dir / "ollama.log").open("ab") as out:
+        with log_file(self.cfg).open("ab") as out:
             # Own session: Ctrl-C on yuzuru's terminal must not kill it before yuzuru stops it.
             self.proc = await asyncio.create_subprocess_exec(
                 *argv, env=await self.env(), stdin=asyncio.subprocess.DEVNULL, stdout=out, stderr=out,
                 start_new_session=True,
             )
         self.started_at = time.time()
-        self.pidfile.write_text(json.dumps({"pid": self.proc.pid, "url": self.url}))
+        self.pidfile.write_text(json.dumps({"pid": self.proc.pid, "url": self.url, "owner": os.getpid()}))
         log.info("managed ollama: pid %d on %s, CUDA_VISIBLE_DEVICES=%s%s", self.proc.pid, self.url,
                  self.visible or "(all)", " (own scope)" if self.scoped else "")
         return True
@@ -276,10 +299,14 @@ class ManagedOllama:
     def _kill_stale(self) -> None:
         """An instance left behind by a yuzuru that was killed would hold the port."""
         try:
-            pid = int(json.loads(self.pidfile.read_text())["pid"])
-        except (OSError, ValueError, KeyError, TypeError):
+            info = json.loads(self.pidfile.read_text())
+            pid, owner = int(info["pid"]), int(info.get("owner", 0))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return
         if not _is_ollama_serve(pid):
+            return
+        if _is_live_yuzuru(owner):
+            log.warning("managed ollama: pid %d belongs to the running yuzuru %d; leaving it alone", pid, owner)
             return
         log.warning("managed ollama: stopping stale pid %d", pid)
         _kill_group(pid, signal.SIGTERM)
@@ -301,7 +328,7 @@ class ManagedOllama:
             # Most likely another server took the port between the check and the bind
             # (two yuzurus starting at once); `auto` then moves on to the next one.
             log.warning("managed ollama exited with %s at startup on port %s; see %s", self.proc.returncode,
-                        self.port, self.cfg.state_dir / "ollama.log")
+                        self.port, log_file(self.cfg))
             if isinstance(self.oc.port, int):
                 break
         self._task = asyncio.create_task(self._supervise())
