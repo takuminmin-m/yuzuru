@@ -158,6 +158,7 @@ class Waiter:
                 w.lease, w.label = lease.id, lease.label
                 w.note, w.log, w.cwd = w.note or lease.note, w.log or lease.log, w.cwd or lease.cwd
                 w.resume = True
+                w.suspend = w.suspend and not lease.cpu
                 return w
         # A CPU-only job needs none of the LLM's memory: keep it loaded for the resumed turn.
         w = Watch(id=uuid.uuid4().hex[:8], session=lease.session, lease=lease.id, label=lease.label,
@@ -188,7 +189,8 @@ class Waiter:
         for w in [w for w in self.watches.values() if w.pid is not None and not w.lease]:
             if not _pid_alive(w.pid):
                 self._finish(w, None)
-        if self.suspend_pending and self.watches and self._quiet():
+        # Only a watch that asked for it suspends (a CPU-only job's does not).
+        if self.suspend_pending and any(w.suspend for w in self.watches.values()) and self._quiet():
             self.suspend_pending = False
             await self.suspend()
 

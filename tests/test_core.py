@@ -519,6 +519,26 @@ async def test_cpu_job_lease_leaves_the_llm_loaded(cfg, world, http, tmp_path):
         await broker.create_lease(pid=os.getpid(), label="x", gpus=["1"], vram=None, cpu=True)
 
 
+async def test_wait_before_a_cpu_jobs_lease_does_not_suspend(cfg, world, http, tmp_path):
+    from yuzuru.waits import Waiter
+
+    cfg.resume.enabled = False
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    # `wait` on the job `train` just started, before its (CPU-only) lease exists...
+    w = await waiter.add(session="ses_9", pid=os.getpid(), label="pid")
+    assert w.suspend and waiter.suspend_pending
+    lease = await broker.create_lease(pid=os.getpid(), label="lgbm", gpus=[], vram=None, session="ses_9",
+                                      cwd=str(tmp_path), log=None, resume=True, note="", cpu=True)
+    assert waiter.watch_lease(lease) is w and not w.suspend
+    cfg.resume.suspend_idle_seconds = 0
+    await waiter.poll()
+    assert world.loaded  # ...the LLM stays
+    await broker.release_lease(lease.id, rc=0)
+
+
 async def test_waiting_on_a_resuming_job_resumes_once(cfg, world, http, tmp_path):
     from yuzuru.waits import Waiter
 
