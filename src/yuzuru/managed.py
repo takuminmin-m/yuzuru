@@ -129,12 +129,19 @@ def log_file(cfg: Config) -> Path:
 
 
 def running_url(cfg: Config) -> str | None:
-    """URL of the managed server a running yuzuru started (its port may be auto-picked)."""
-    try:
-        info = json.loads(state_file(cfg).read_text())
-    except (OSError, ValueError):
-        return None
-    return info.get("url") if _is_ollama_serve(int(info.get("pid", 0))) else None
+    """URL of the managed server a running yuzuru started (its port may be auto-picked).
+
+    That yuzuru's own first; else any other's in the state_dir (one started with
+    `serve --port` is not keyed by the config's port)."""
+    others = sorted(set(cfg.state_dir.glob("ollama-*.json")) - {state_file(cfg)})
+    for f in [state_file(cfg), *others]:
+        try:
+            info = json.loads(f.read_text())
+            if _is_ollama_serve(int(info.get("pid", 0))):
+                return info.get("url")
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
 
 
 def _gone(pid: int) -> bool:

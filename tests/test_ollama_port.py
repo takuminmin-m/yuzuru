@@ -74,6 +74,8 @@ async def test_auto_skips_busy_port_and_reports_url(cfg, fake_ollama, free_port,
             assert urls == [url] and m.cfg.ollama_url == url and m.status()["url"] == url
             assert json.loads(record.read_text().splitlines()[-1])["OLLAMA_HOST"] == f"127.0.0.1:{m.port}"
             assert running_url(m.cfg) == url  # what `yuzuru opencode` reads
+            other = dataclasses.replace(m.cfg, port=m.cfg.port + 1)  # e.g. served with `--port`
+            assert running_url(other) == url
         finally:
             await m.stop()
     assert running_url(m.cfg) is None
