@@ -210,8 +210,13 @@ class IsolationConfig:
     scope: str = "auto"
     # Each scope's memory cap (systemd MemoryMax: "80%", "24G"; null: none).
     memory_max: str | None = "80%"
+    # CPU share of a CPU-only job's scope (systemd CPUWeight, 1-10000; the LLM's Ollama has the
+    # default 100). It still gets every idle core, but yields while the LLM generates. null: 100.
+    cpu_job_weight: int | None = 20
 
     def __post_init__(self) -> None:
+        if self.cpu_job_weight is not None and not 1 <= self.cpu_job_weight <= 10000:
+            raise ValueError(f"isolation.cpu_job_weight must be 1-10000, not {self.cpu_job_weight}")
         if self.scope not in ("auto", "on", "off"):
             raise ValueError(f"isolation.scope must be auto, on or off, not {self.scope!r}")
 

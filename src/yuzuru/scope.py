@@ -40,11 +40,14 @@ def unit_name(kind: str) -> str:
     return f"yuzuru-{kind}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-def wrap(argv: list[str], unit: str, memory_max: str | None = None, oom_continue: bool = False) -> list[str]:
+def wrap(argv: list[str], unit: str, memory_max: str | None = None, oom_continue: bool = False,
+         cpu_weight: int | None = None) -> list[str]:
     """`argv` run in place (same pid) inside a transient scope named `unit`."""
     props = []
     if memory_max:
         props += ["-p", f"MemoryMax={memory_max}"]
+    if cpu_weight:
+        props += ["-p", f"CPUWeight={cpu_weight}"]
     if oom_continue:
         props += ["-p", "OOMPolicy=continue"]
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", *props, "--", *argv]

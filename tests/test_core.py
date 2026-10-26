@@ -490,6 +490,55 @@ async def test_job_lease_suspends_llm_and_resumes_session(cfg, world, http, tmp_
     assert ev.rc == 0 and ev.resumed and not waiter.watches
 
 
+async def test_cpu_job_lease_leaves_the_llm_loaded(cfg, world, http, tmp_path):
+    from yuzuru.waits import Waiter
+
+    out = resume_capture(cfg, tmp_path)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    before = broker.budget().fast
+    lease = await broker.create_lease(pid=os.getpid(), label="lgbm", gpus=[], vram=None, session="ses_9",
+                                      cwd=str(tmp_path), log=None, resume=True, note="", cpu=True)
+    assert lease.state == "active" and not world.unloads  # no drain, no settling
+    assert broker.visible_gpus(lease) == ["-1"]
+    world.foreign = [0, 3 * GB]  # the LLM (or anything else) growing is not the job's
+    await broker.refresh()
+    assert broker.budget().fast == before - 3 * GB
+    w = waiter.watch_lease(lease)
+    assert w is not None and not w.suspend
+    assert (await waiter.add(session="ses_9", pid=os.getpid())) is w and not w.suspend  # a later `wait` too
+    cfg.resume.suspend_idle_seconds = 0
+    await waiter.poll()
+    assert world.loaded and not waiter.suspend_pending
+    await broker.release_lease(lease.id, rc=0)
+    await wait_for(out.exists)
+    assert world.loaded
+    with pytest.raises(ValueError):
+        await broker.create_lease(pid=os.getpid(), label="x", gpus=["1"], vram=None, cpu=True)
+
+
+async def test_wait_before_a_cpu_jobs_lease_does_not_suspend(cfg, world, http, tmp_path):
+    from yuzuru.waits import Waiter
+
+    cfg.resume.enabled = False
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await broker.acquire(catalog.specs["medium"])
+    await broker.release(catalog.specs["medium"], touch=False)
+    # `wait` on the job `train` just started, before its (CPU-only) lease exists...
+    w = await waiter.add(session="ses_9", pid=os.getpid(), label="pid")
+    assert w.suspend and waiter.suspend_pending
+    lease = await broker.create_lease(pid=os.getpid(), label="lgbm", gpus=[], vram=None, session="ses_9",
+                                      cwd=str(tmp_path), log=None, resume=True, note="", cpu=True)
+    assert waiter.watch_lease(lease) is w and not w.suspend
+    cfg.resume.suspend_idle_seconds = 0
+    await waiter.poll()
+    assert world.loaded  # ...the LLM stays
+    await broker.release_lease(lease.id, rc=0)
+
+
 async def test_waiting_on_a_resuming_job_resumes_once(cfg, world, http, tmp_path):
     from yuzuru.waits import Waiter
 
@@ -703,3 +752,43 @@ async def test_mcp_train_runs_the_job_in_its_own_capped_scope(cfg, world, http, 
     assert argv[:3] == ["systemd-run", "--user", "--scope"] and any(a.startswith("--unit=yuzuru-job-") for a in argv)
     assert "MemoryMax=20G" in argv and "OOMPolicy=continue" in argv
     assert argv[argv.index("--") + 1:][-3:] == ["bash", "-c", "python train.py"]
+    assert "--cpu" not in argv and not any(a.startswith("CPUWeight=") for a in argv)
+
+
+async def test_mcp_train_and_wait_on_cpu(cfg, world, http, tmp_path, monkeypatch):
+    import subprocess
+
+    import yuzuru.mcp as mcp_mod
+
+    cfg.router = RouterConfig(classifier="heuristic")
+    cfg.isolation.scope = "on"
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"pid": 1, "log": "x.log"}), stderr="")
+
+    monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+    st = State(cfg, probe=FakeProbe(world), http=http)
+    app = create_app(cfg, st)
+    await st.start()
+
+    async def call(c, name, **arguments):
+        r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": {"name": name, "arguments": arguments}})
+        return r.json()["result"]
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
+            r = await call(c, "train", command="python lgbm.py", cwd=str(tmp_path), device="cpu")
+            assert not r["isError"]
+            r = await call(c, "train", command="python lgbm.py", cwd=str(tmp_path), device="cpu", vram="4G")
+            assert r["isError"] and len(calls) == 1
+            r = await call(c, "wait", pid=os.getpid(), device="cpu")
+            assert not r["isError"] and "left loaded" in r["content"][0]["text"]
+            assert not st.waiter.watches[next(iter(st.waiter.watches))].suspend
+    finally:
+        await st.stop()
+    argv = calls[0]
+    assert "CPUWeight=20" in argv
+    assert argv[argv.index("run"):].count("--cpu") == 1

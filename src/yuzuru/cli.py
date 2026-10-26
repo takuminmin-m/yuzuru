@@ -133,7 +133,9 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
     session = args.session or os.environ.get("YUZURU_SESSION")
     job = {"pid": os.getpid(), "session": session, "cwd": os.getcwd(),
            "log": str(Path(args.log).resolve()) if args.log else None,
-           "resume": args.resume, "note": args.note}
+           "resume": args.resume, "note": args.note, "cpu": args.cpu}
+    if args.cpu and (args.gpu or args.vram or args.use):
+        sys.exit("yuzuru run: --cpu takes no --gpu, --vram or --use")
     try:
         if args.use:
             lease = client.call("POST", f"/yuzuru/leases/{args.use}/handover", job, timeout=60)
@@ -149,14 +151,18 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
             env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
         env["YUZURU_LEASE"] = lease_id
-        if resident := lease.get("resident"):
+        if args.cpu:
+            print(f"[yuzuru] lease {lease_id}: CPU only (no GPU visible)", file=sys.stderr)
+        elif resident := lease.get("resident"):
             print(f"[yuzuru] lease {lease_id}: WARNING: {', '.join(resident)} did not leave GPU memory; "
                   "the job has less VRAM than expected", file=sys.stderr)
         else:
             print(f"[yuzuru] lease {lease_id}: LLM moved out of GPU memory", file=sys.stderr)
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         print(f"[yuzuru] server unreachable ({e.__class__.__name__}); running without a lease", file=sys.stderr)
-        if allow := allowlist(args.config):
+        if args.cpu:
+            env["CUDA_VISIBLE_DEVICES"] = "-1"
+        elif allow := allowlist(args.config):
             # Still keep the job off the GPUs yuzuru was told not to use (indices in nvidia-smi order).
             env["CUDA_VISIBLE_DEVICES"] = ",".join(allow)
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -226,7 +232,7 @@ def print_status(s: dict[str, Any]) -> None:
     if s["leases"]:
         print("\nLeases:")
         for l in s["leases"]:
-            where = ",".join(g[:12] for g in l["gpus"]) or "any GPU"
+            where = "CPU only" if l.get("cpu") else ",".join(g[:12] for g in l["gpus"]) or "any GPU"
             if l["kind"] == "reservation":
                 left = f", {int((l['expires'] - time.time()) / 60)} min left" if l["expires"] else ""
                 print(f"  {l['id']} {l['label']:<20} {'held' if l['hard'] else 'soft':<13} {gb(l['vram'] or 0)} on {where}{left}")
@@ -263,6 +269,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("run", help="run a training job under a GPU lease")
     p.add_argument("--gpu", action="append", help="GPU index or UUID to dedicate (repeatable)")
     p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measure)")
+    p.add_argument("--cpu", action="store_true",
+                   help="CPU-only job: it sees no GPU and the LLM is not moved out for it")
     p.add_argument("--label")
     p.add_argument("--log", help="write the job's output to this file")
     p.add_argument("--detach", action="store_true", help="run in the background; print pid and log path")

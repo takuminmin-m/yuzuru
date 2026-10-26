@@ -62,6 +62,7 @@ ollama pull qwen3:14b     # 例: medium（学習中でも 8GB 級GPUに載る）
 yuzuru run -- python train.py              # LLMをVRAMから退かして実行、終わったら戻す
 yuzuru run --gpu 1 -- python train.py      # GPU1 を専有（CUDA_VISIBLE_DEVICES を UUID で設定）
 yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える）
+yuzuru run --cpu -- python lgbm.py         # GPU を使わないジョブ（LLM はそのまま、GPU は見せない）
 ```
 
 流れ: lease 作成 → 生成中の応答を待つ（`drain_timeout`）→ GPU上のモデルをアンロードし、実際に VRAM から消えるまで待つ（`unload_timeout`、
@@ -76,6 +77,13 @@ yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習
 メモリを増やしている最中に LLM の層が隣に載り、学習側が OOM する）。ジョブが終わると全 GPU で再起動する。
 再起動の間はリクエストを待たせ、生成中のものは `drain_timeout` まで終わるのを待つ。`manage` なしでは
 予算から外すだけで、Ollama がその GPU を使う可能性は残る（警告を出す）。
+
+`--cpu`（MCP `yuzuru_train` / `yuzuru_wait` の `device: "cpu"`）は GPU を使わないジョブ（LightGBM、CPU の XGBoost、
+scikit-learn、前処理など）用。LLM のアンロードも VRAM の安定待ちもせず、待っている間も LLM を降ろさない
+（lease は作るので、終了後の再開や `status` の表示はそのまま）。ジョブには `CUDA_VISIBLE_DEVICES=-1` を渡すので、
+うっかり GPU を使うコードは GPU を取らずに失敗するか CPU で動く。MCP から起動した場合は scope に
+`CPUWeight=isolation.cpu_job_weight`（既定 20、Ollama は既定の 100）を付ける。空いているコアはすべて使えるが、
+LLM が CPU 側の層を計算している間は LLM に譲る（GPU に載りきらないモデルでは、生成速度が CPU に左右される）。
 
 ### VRAM / GPU を強制的に確保する
 
@@ -153,7 +161,8 @@ ollama:
 添えてセッションを再開する。OpenCode は再開のターンで会話の履歴をすべて送り直すので、文脈はそのまま戻る。
 
 - MCP `yuzuru_train`: 既定で `resume_when_done: true`。ジョブを起動したらモデルはターンを終える
-- MCP `yuzuru_wait`: 自分で起動したわけではないプロセス（PID または lease）を待つ
+- MCP `yuzuru_wait`: 自分で起動したわけではないプロセス（PID または lease）を待つ。`device: "cpu"`（または
+  CPU ジョブの lease / PID）なら LLM は降ろさない
 - CLI: `yuzuru run --resume --session <id> --note "..." --log train.log -- python train.py`、
   `yuzuru wait --pid 1234 --session <id>`、`yuzuru events -f`
 
