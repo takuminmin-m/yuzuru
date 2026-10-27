@@ -133,8 +133,8 @@ ollama:
     設定すると `RuntimeError` にする。lease の GPU の一部に絞る、`-1` で全部隠すのは可。削除は無視する
     （HF Trainer の中で `accelerate` が環境変数を一時的に全部消して戻すため）。Python の起動前に別の値が
     入っていたら、置き換えて警告を出す。ジョブの venv などにある `sitecustomize` はその後に通常どおり動く
-  - Python の中での制限なので、`python -S` や Python 以外のプログラム、`subprocess` に `env=` で直接渡した
-    値には効かない
+  - Python の中での制限なので、`python -S` / `-E` / `-I` や Python 以外のプログラム、`subprocess` に `env=` で
+    直接渡した値には効かない
 - **`ollama.manage: true`**: `resources.gpus` だけでは、システムの Ollama（`ollama.service`）は全 GPU を見たまま。
   除外した GPU を hard reserve で埋めても、Ollama はそこに計算バッファを置こうとして OOM する。`manage` を
   有効にすると、yuzuru が自前の `ollama serve` を `CUDA_VISIBLE_DEVICES=<許可した GPU の UUID>` 付きで起動し、
