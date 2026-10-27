@@ -26,7 +26,7 @@ from .broker import Broker, LoadFailed, Placement
 from .catalog import Catalog
 from .mcp import MCPServer
 from .config import Config
-from .ollama import Ollama
+from .ollama import Ollama, shielded
 from .managed import ManagedOllama
 from .resources import Probe, make_probe
 from .router import Router
@@ -44,7 +44,10 @@ class State:
     def __init__(self, cfg: Config, probe: Probe | None = None, http: httpx.AsyncClient | None = None) -> None:
         self.cfg = cfg
         self.http = http or httpx.AsyncClient(base_url=cfg.ollama_url, timeout=httpx.Timeout(None, connect=5))
-        self.ollama = Ollama(cfg.ollama_url, self.http)
+        # Model management gets a connection pool of its own: whatever happens to the proxied
+        # completions, yuzuru can still see, load and unload models.
+        self.ollama = Ollama(cfg.ollama_url, http or httpx.AsyncClient(base_url=cfg.ollama_url,
+                                                                      timeout=httpx.Timeout(None, connect=5)))
         self.catalog = Catalog(cfg, self.ollama)
         self.managed: ManagedOllama | None = None
         if probe is None:
@@ -65,6 +68,7 @@ class State:
     def _ollama_moved(self, url: str) -> None:
         """The managed server picked its port (`ollama.port: auto`) only now."""
         self.http.base_url = url
+        self.ollama.http.base_url = url
         self.ollama.base_url = url
 
     async def start(self) -> None:
@@ -91,6 +95,7 @@ class State:
         if self.managed:
             await self.managed.stop()
         await self.http.aclose()
+        await self.ollama.aclose()
         await self.cloud_http.aclose()
 
     async def _poll_watches(self) -> None:
@@ -277,12 +282,21 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             finally:
                 if decision is not None:
                     st.router.answered(decision.session, finish)
-                if upstream is not None:
-                    with contextlib.suppress(Exception):  # a server that was restarted mid-stream
-                        await upstream.aclose()
-                if spec is not None:
-                    await st.broker.release(spec)
-                await queue.put(None)
+
+                async def clean_up() -> None:
+                    if upstream is not None:
+                        with contextlib.suppress(Exception):  # a server that was restarted mid-stream
+                            await upstream.aclose()
+                    if spec is not None:
+                        await st.broker.release(spec)
+
+                try:
+                    # The client usually leaves right after the last chunk, which cancels this task
+                    # while it is still here: closing the upstream or refreshing keep_alive.
+                    # Interrupted, httpx leaks the connection and release() is skipped.
+                    await shielded(clean_up())
+                finally:
+                    queue.put_nowait(None)
 
         task = asyncio.create_task(produce())
         try:
@@ -298,8 +312,10 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         finally:
             if not task.done():  # client went away: stop generating and free the model
                 task.cancel()
+                # Let it clean up, but only once: while this generator is being cancelled itself,
+                # awaiting the task directly would cancel it again, inside its clean-up.
                 with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                    await asyncio.shield(task)
 
     async def forward_cloud(body: dict[str, Any], decision: Any) -> Response:
         """Non-streaming cloud call (streaming ones go through stream_chat)."""
