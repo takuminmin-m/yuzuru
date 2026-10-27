@@ -108,6 +108,15 @@ def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
     os.execvpe(cmd[0], cmd, outside_env())
 
 
+def pin_gpus(env: dict[str, str], visible: str) -> None:
+    """Show the job only `visible`, and keep its Python from switching to other GPUs
+    (gpu_pin/sitecustomize.py, first on its PYTHONPATH)."""
+    env["CUDA_VISIBLE_DEVICES"] = env["YUZURU_CUDA_VISIBLE_DEVICES"] = visible
+    pin = str(Path(__file__).with_name("gpu_pin"))
+    rest = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != pin]
+    env["PYTHONPATH"] = os.pathsep.join([pin, *rest])
+
+
 def cmd_run(args: argparse.Namespace, client: Client) -> None:
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
@@ -149,7 +158,7 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
         # The lease's GPUs, else every GPU of resources.gpus (older servers send no "visible").
         if visible := lease.get("visible") or lease["gpus"]:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(visible)
+            pin_gpus(env, ",".join(visible))
         env["YUZURU_LEASE"] = lease_id
         if args.cpu:
             print(f"[yuzuru] lease {lease_id}: CPU only (no GPU visible)", file=sys.stderr)
@@ -161,10 +170,10 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
     except (httpx.ConnectError, httpx.TimeoutException) as e:
         print(f"[yuzuru] server unreachable ({e.__class__.__name__}); running without a lease", file=sys.stderr)
         if args.cpu:
-            env["CUDA_VISIBLE_DEVICES"] = "-1"
+            pin_gpus(env, "-1")
         elif allow := allowlist(args.config):
             # Still keep the job off the GPUs yuzuru was told not to use (indices in nvidia-smi order).
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(allow)
+            pin_gpus(env, ",".join(allow))
             env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     out = None
