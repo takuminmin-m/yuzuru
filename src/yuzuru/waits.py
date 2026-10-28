@@ -78,6 +78,32 @@ def outside_env() -> dict[str, str]:
     return env
 
 
+def pin_gpus(env: dict[str, str], visible: str) -> None:
+    """Show the process only `visible`, and keep its Python from switching to other GPUs
+    (gpu_pin/sitecustomize.py, first on its PYTHONPATH)."""
+    env["CUDA_VISIBLE_DEVICES"] = env["YUZURU_CUDA_VISIBLE_DEVICES"] = visible
+    pin = str(Path(__file__).with_name("gpu_pin"))
+    rest = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != pin]
+    env["PYTHONPATH"] = os.pathsep.join([pin, *rest])
+
+
+def agent_env(cfg: Config) -> dict[str, str]:
+    """The environment for an agent (`yuzuru agent`, resumed turns): what it runs itself sees no GPU.
+
+    An agent that runs `python train.py` from its shell instead of through the train tool trains
+    without a lease, next to the LLM, until the shell tool's timeout kills it (in LoRA run 3 after
+    it had overwritten the best weights). With no GPU visible such a script fails at once and
+    points the agent at the train tool; jobs the train tool starts get their GPUs from yuzuru.
+    OpenCode 2.x runs the agent's tools in its background service, so this has to reach
+    `yuzuru agent -- opencode service start`.
+    """
+    env = outside_env()
+    if cfg.isolation.hide_gpus_from_agent:
+        pin_gpus(env, "")
+        env["YUZURU_AGENT"] = "1"
+    return env
+
+
 def _proc_cwd(pid: int | None) -> str | None:
     if pid is None:
         return None
@@ -302,7 +328,7 @@ class Waiter:
             argv = scope.wrap(argv, scope.unit_name("agent"), self.cfg.isolation.memory_max, oom_continue=True)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=w.cwd or None, env=outside_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                *argv, cwd=w.cwd or None, env=agent_env(self.cfg), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )
             ev.resumed = True

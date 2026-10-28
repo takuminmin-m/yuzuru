@@ -34,7 +34,8 @@ INSTRUCTIONS = (
     "Start GPU training / fine-tuning with its `train` tool rather than bash: it moves the LLM out of VRAM first "
     "and runs the job in the background with a log file. Give a GPU job the VRAM it will need at its peak ('vram'). "
     "For a job that uses no GPU (LightGBM, XGBoost on CPU, scikit-learn, data preparation) pass device 'cpu': "
-    "the LLM then stays loaded."
+    "the LLM then stays loaded. Commands you run in the shell yourself see no GPU (when the agent was started "
+    "through yuzuru)."
 )
 
 Handler = Callable[[dict[str, Any], dict[str, str]], Awaitable[str]]

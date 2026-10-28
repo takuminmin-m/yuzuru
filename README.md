@@ -206,6 +206,18 @@ OpenCode 2.x の `opencode run` はターンをバックグラウンドサービ
 opencode service stop && yuzuru agent -- opencode service start
 ```
 
+`yuzuru agent` と再開したターンでは、エージェントが自分で実行するコマンドには GPU を見せない
+（`CUDA_VISIBLE_DEVICES=""`。ジョブと同じ `gpu_pin` で、Python からほかの値に変えようとすると `RuntimeError`）。
+GPU を使う処理は MCP `yuzuru_train` で起動させるためで、そのジョブには yuzuru が lease の GPU を渡す。
+シェルから直接 `python train.py` を動かすと、lease なしで LLM の隣に載り、シェルツールのタイムアウトで途中で
+殺される（そのあいだに出力を上書きすることもある）。GPU が見えなければ CUDA のエラーですぐ落ち、トレースバックの
+後に `yuzuru_train` を使うよう案内を出す。OpenCode 2.x ではツールがバックグラウンドサービスで動くので、
+サービスを `yuzuru agent -- opencode service start` で起動しておくこと。`isolation.hide_gpus_from_agent: false` で無効。
+
+- うっかり直接実行するのを防ぐためのもので、サンドボックスではない。`env -u PYTHONPATH`、`python -E` / `-I`、
+  Python 以外のプログラムでは外せる
+- GPU が無ければ CPU で動くように書かれたスクリプトは、落ちずに CPU で（遅く）動く
+
 ### ルーティング
 
 | 何で決まるか | 例 |

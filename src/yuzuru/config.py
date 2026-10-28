@@ -213,6 +213,9 @@ class IsolationConfig:
     # CPU share of a CPU-only job's scope (systemd CPUWeight, 1-10000; the LLM's Ollama has the
     # default 100). It still gets every idle core, but yields while the LLM generates. null: 100.
     cpu_job_weight: int | None = 20
+    # What the agent runs itself (its shell, scripts) sees no GPU: GPU work has to go through the
+    # train tool, which gives the job a lease. Applies to `yuzuru agent` and resumed turns.
+    hide_gpus_from_agent: bool = True
 
     def __post_init__(self) -> None:
         if self.cpu_job_weight is not None and not 1 <= self.cpu_job_weight <= 10000:

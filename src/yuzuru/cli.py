@@ -102,22 +102,16 @@ def cmd_agent(args: argparse.Namespace, cfg: Config) -> None:
         cmd = scope.wrap(cmd, scope.unit_name("agent"), cfg.isolation.memory_max, oom_continue=True)
     else:
         print("[yuzuru] no systemd user scope; the agent runs in this process's cgroup", file=sys.stderr)
-    from .waits import outside_env
+    from .waits import agent_env
 
-    # Not yuzuru's own venv: the agent's `uv run python` must use the project's.
-    os.execvpe(cmd[0], cmd, outside_env())
-
-
-def pin_gpus(env: dict[str, str], visible: str) -> None:
-    """Show the job only `visible`, and keep its Python from switching to other GPUs
-    (gpu_pin/sitecustomize.py, first on its PYTHONPATH)."""
-    env["CUDA_VISIBLE_DEVICES"] = env["YUZURU_CUDA_VISIBLE_DEVICES"] = visible
-    pin = str(Path(__file__).with_name("gpu_pin"))
-    rest = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != pin]
-    env["PYTHONPATH"] = os.pathsep.join([pin, *rest])
+    # Not yuzuru's own venv: the agent's `uv run python` must use the project's. No GPU either:
+    # GPU work goes through the train tool, which gives the job its GPUs.
+    os.execvpe(cmd[0], cmd, agent_env(cfg))
 
 
 def cmd_run(args: argparse.Namespace, client: Client) -> None:
+    from .waits import pin_gpus
+
     cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not cmd:
         raise SystemExit("usage: yuzuru run [options] -- command ...")
@@ -138,6 +132,7 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
         return
 
     env = os.environ.copy()
+    env.pop("YUZURU_AGENT", None)  # started from an agent's shell: the job gets the lease's GPUs
     lease_id = None
     session = args.session or os.environ.get("YUZURU_SESSION")
     job = {"pid": os.getpid(), "session": session, "cwd": os.getcwd(),
