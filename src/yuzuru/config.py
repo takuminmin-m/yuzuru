@@ -194,6 +194,10 @@ class ResumeConfig:
     # Reload the session's model before resuming so the prompt does not wait on a load.
     warm_before_resume: bool = True
     log_tail_lines: int = 40
+    # A resumed turn that ends after one reply without a tool call, with no job of the session
+    # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
+    # such a session this many times in a row, telling it so; 0 turns this off.
+    stall_nudges: int = 1
 
 
 @dataclass

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import httpx
 import pytest
 
-from yuzuru.config import GB, Config, IsolationConfig, LeaseConfig, ResourceConfig
+from yuzuru.config import GB, Config, IsolationConfig, LeaseConfig, ResourceConfig, ResumeConfig
 from yuzuru.resources import GPU, Probe, Snapshot
 
 
@@ -145,6 +145,9 @@ def cfg(tmp_path) -> Config:
         lease=LeaseConfig(settle_seconds=0.0, settle_timeout=5, drain_timeout=0.1, unload_timeout=0.5,
                           restore_after=False),
         isolation=IsolationConfig(scope="off"),  # tests that want a scope fake systemd-run
+        # A fake resume command answers nothing, which looks like a stalled turn; tests that want
+        # the nudge turn it on.
+        resume=ResumeConfig(stall_nudges=0),
     )
 
 

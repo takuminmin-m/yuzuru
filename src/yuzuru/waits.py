@@ -28,6 +28,10 @@ from .config import Config
 
 log = logging.getLogger("yuzuru.waits")
 
+STALLED = ("[yuzuru] Your last turn ended after a single reply with no tool call, and no job of yours is running: "
+           "nothing continues this session unless you do. Continue the task from where you left off. If the task "
+           "is finished, say so and summarize the result.")
+
 
 @dataclass
 class Watch:
@@ -143,6 +147,7 @@ class Waiter:
         self._tasks: set[asyncio.Task] = set()
         # Outcomes held back until their session's turn ends: one resume reports them all.
         self._held: dict[str, list[tuple[Event, Watch]]] = {}
+        self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
         broker.on_lease_end.append(self._lease_ended)
 
     # ---------------------------------------------------------------- watches
@@ -160,6 +165,8 @@ class Waiter:
             w.cwd = lease.cwd if lease and lease.cwd else _proc_cwd(lease.pid if lease else w.pid)
         if self._cpu_job(w):
             w.suspend = False  # e.g. `wait` on a job started with device "cpu"
+        if w.session:
+            self.nudges.pop(w.session, None)  # it is waiting for something: not stalled
         if same := self._watching(w):
             # e.g. `wait` on a job `train` already resumes for: one exit, one resume.
             log.info("watch %s already covers %s for session %s", same.id, w.label, w.session)
@@ -178,6 +185,7 @@ class Waiter:
         """Jobs started for a session with resume=True get a watch automatically."""
         if not (lease.resume and lease.session):
             return None
+        self.nudges.pop(lease.session, None)  # it started a job: not stalled
         for w in self.watches.values():
             if w.session == lease.session and w.pid == lease.pid and not w.lease:
                 # The agent called `wait` on the job before its lease existed: take that watch over.
@@ -320,24 +328,61 @@ class Waiter:
             if self.cfg.resume.warm_before_resume:
                 await self._warm(ev.session)
             self.suspended_models = []
-        argv = [a.format(session=ev.session, message=self.message(ev, earlier), cwd=w.cwd or "")
-                for a in self.cfg.resume.command]
+        ev.resume_error = await self._continue(ev.session, self.message(ev, earlier), w.cwd)
+        ev.resumed = ev.resume_error is None
+
+    async def _continue(self, session: str, message: str, cwd: str | None) -> str | None:
+        """Run the resume command for `session` with `message`; the error if it could not start."""
+        argv = [a.format(session=session, message=message, cwd=cwd or "") for a in self.cfg.resume.command]
         if await asyncio.to_thread(scope.use, self.cfg.isolation.scope):
             if outside := await asyncio.to_thread(scope.opencode_service_outside):
-                log.warning("resuming session %s: %s", ev.session, scope.service_warning(outside))
+                log.warning("resuming session %s: %s", session, scope.service_warning(outside))
             argv = scope.wrap(argv, scope.unit_name("agent"), self.cfg.isolation.memory_max, oom_continue=True)
+        st = self.router.sessions.get(session)
+        before = st.replies if st else 0
         try:
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=w.cwd or None, env=agent_env(self.cfg), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                *argv, cwd=cwd or None, env=agent_env(self.cfg), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True,
             )
-            ev.resumed = True
-            log.info("resumed session %s (pid %d)", ev.session, proc.pid)
-            # Reap it when the resumed turn ends, so long-running servers collect no zombies.
-            self._spawn(proc.wait())
         except OSError as e:
-            ev.resume_error = str(e)
-            log.warning("could not resume session %s: %s", ev.session, e)
+            log.warning("could not resume session %s: %s", session, e)
+            return str(e)
+        log.info("resumed session %s (pid %d)", session, proc.pid)
+        # Reaped when the resumed turn ends (no zombies in a long-running server), then checked.
+        self._spawn(self._after_turn(session, before, cwd, proc))
+        return None
+
+    async def _after_turn(self, session: str, before: int, cwd: str | None, proc: asyncio.subprocess.Process) -> None:
+        """Continue a resumed turn that stalled: one reply and no tool call, and no job left running.
+
+        Nothing else would wake such a session: yuzuru resumes an agent only when a job of its ends.
+        Only turns yuzuru resumed itself are checked, not a person's turns in their own client.
+        """
+        await proc.wait()
+        # `opencode run` can exit while the turn goes on in the OpenCode service.
+        while self.router.in_turn(session, self.cfg.resume.turn_idle_seconds):
+            await asyncio.sleep(1.0)
+        if session in self._held or any(w.session == session for w in self.watches.values()) \
+                or any(l.session == session for l in self.broker.leases.values()):
+            return
+        st = self.router.sessions.get(session)
+        replies = (st.replies if st else 0) - before
+        if replies > 1:
+            self.nudges.pop(session, None)
+            log.info("session %s ended its turn with no job running", session)
+            return
+        done, limit = self.nudges.get(session, 0), self.cfg.resume.stall_nudges
+        if done >= limit:
+            log.warning("session %s: resumed turn ended after %d replies with no job running; %s", session, replies,
+                        f"not continuing it again ({done} in a row)" if limit > 0 else "resume.stall_nudges is 0")
+            return
+        self.nudges[session] = done + 1
+        log.warning("session %s: resumed turn ended after %d replies with no job running; continuing it (%d/%d)",
+                    session, replies, done + 1, limit)
+        if not self.watches and self.cfg.resume.warm_before_resume:
+            await self._warm(session)
+        await self._continue(session, STALLED, cwd)
 
     async def _turn_over(self, session: str | None) -> None:
         """Wait until the session's client has finished its turn.
