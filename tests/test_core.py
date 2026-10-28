@@ -116,6 +116,21 @@ async def test_lease_unloads_settles_and_shrinks_budget(cfg, world, http):
     assert not broker.leases
 
 
+async def test_measured_lease_keeps_its_peak(cfg, world, http):
+    catalog, broker, _ = await make(cfg, world, http)
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None)
+    world.foreign = [0, 6 * GB]
+    await broker.refresh()
+    await broker.refresh()
+    assert lease.state == "active" and lease.peak == 6 * GB
+    before = broker.budget().fast
+    world.foreign = [0, 2 * GB]  # freed between training and evaluation; it comes back
+    await broker.refresh()
+    assert lease.peak == 6 * GB and lease.grown == 2 * GB
+    assert broker.budget().fast == before  # the 4 GB it let go stay the job's
+    await broker.release_lease(lease.id)
+
+
 async def test_dead_pid_lease_is_reaped(cfg, world, http):
     _, broker, _ = await make(cfg, world, http)
     lease = await broker.create_lease(pid=2**22 + 12345, label="x", gpus=[], vram=None)
@@ -743,7 +758,7 @@ async def test_mcp_train_runs_the_job_in_its_own_capped_scope(cfg, world, http, 
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:11435") as c:
             r = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-                "name": "train", "arguments": {"command": "python train.py", "cwd": str(tmp_path)}}})
+                "name": "train", "arguments": {"command": "python train.py", "cwd": str(tmp_path), "vram": "6G"}}})
             assert not r.json()["result"]["isError"]
     finally:
         await st.stop()
@@ -753,6 +768,36 @@ async def test_mcp_train_runs_the_job_in_its_own_capped_scope(cfg, world, http, 
     assert "MemoryMax=20G" in argv and "OOMPolicy=continue" in argv
     assert argv[argv.index("--") + 1:][-3:] == ["bash", "-c", "python train.py"]
     assert "--cpu" not in argv and not any(a.startswith("CPUWeight=") for a in argv)
+
+
+async def test_mcp_gpu_job_needs_vram_or_gpus(cfg, world, http, tmp_path, monkeypatch):
+    # Measured from its first seconds, a job's lease is too small: the LLM moves back into what the
+    # job grows into later, and the job runs out of memory.
+    import subprocess
+
+    import yuzuru.mcp as mcp_mod
+
+    cfg.router = RouterConfig(classifier="heuristic")
+    cfg.isolation.scope = "off"
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"pid": 1, "log": "x.log"}), stderr="")
+
+    monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+    st = State(cfg, probe=FakeProbe(world), http=http)
+    train = mcp_mod.MCPServer(st).tools["train"][1]
+    base = {"command": "python train.py", "cwd": str(tmp_path), "resume_when_done": False}
+    with pytest.raises(ValueError, match="vram"):
+        await train(base, {})
+    assert not calls
+    await train(base | {"vram": "6G"}, {})
+    assert calls[-1][calls[-1].index("--vram") + 1] == "6G"
+    await train(base | {"gpus": "1"}, {})  # whole GPUs: the LLM keeps off them
+    assert "--gpu" in calls[-1] and "--vram" not in calls[-1]
+    await train(base | {"device": "cpu"}, {})
+    assert "--cpu" in calls[-1]
 
 
 async def test_mcp_train_and_wait_on_cpu(cfg, world, http, tmp_path, monkeypatch):

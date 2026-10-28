@@ -61,7 +61,7 @@ ollama pull qwen3:14b     # 例: medium（学習中でも 8GB 級GPUに載る）
 ```bash
 yuzuru run -- python train.py              # LLMをVRAMから退かして実行、終わったら戻す
 yuzuru run --gpu 1 -- python train.py      # GPU1 を専有（CUDA_VISIBLE_DEVICES を UUID で設定）
-yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える）
+yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える。推奨）
 yuzuru run --cpu -- python lgbm.py         # GPU を使わないジョブ（LLM はそのまま、GPU は見せない）
 ```
 
@@ -69,6 +69,11 @@ yuzuru run --cpu -- python lgbm.py         # GPU を使わないジョブ（LLM 
 消えなければジョブのログに警告）→ ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
+
+`--vram` を省略すると、確定した時点の使用量で予約する。その後に増えた分も含め、ジョブが一度使った量（ピーク）は
+一時的に解放されても予約したままにする。ただし確定の時点ではモデルを読み込んだだけ、ということがあり、そのあと
+最初のステップや評価で伸びる分は、すでに LLM が載っていると確保できずに OOM になる。量が分かっているなら `--vram` を付ける。
+MCP の `yuzuru_train` では、GPU ジョブに `vram`（または GPU を丸ごと取る `gpus`）が必須で、無いとエラーを返す。
 
 `--gpu`（MCP `yuzuru_train` の `gpus`）で GPU を専有させたジョブ（と `yuzuru reserve --gpu` で量を指定せずに確保した GPU）の
 間は、その GPU を LLM に一切使わせない。`--vram` で量を指定した場合は、その量だけを差し引き、残りは LLM が使える。
@@ -181,6 +186,12 @@ ollama:
 そのターンの中でエージェントが次のジョブを起動していれば、前のジョブの結果では再開せず、次のジョブの終了を待つ。
 OpenCode のバックグラウンドサービスにつながっている TUI なら、再開したターンがそのまま表示される。
 
+再開したターンが、応答 1 回だけ・ツール呼び出しなしで終わり、そのセッションのジョブも動いていなければ、
+エージェントを起こすものが何も残らない（応答が空のまま止まることがある）。yuzuru は、自分で再開したターンについて
+これを検知し、「何もせずにターンが終わった。続きから進め、終わっているなら結果をまとめよ」というメッセージで
+もう一度再開する。連続 `resume.stall_nudges` 回（既定 1、0 で無効）まで。ジョブを起動すると回数は戻る。
+人が自分のクライアントで進めているターンは対象にしない。
+
 再開したエージェントは、それぞれ専用の systemd user scope（`yuzuru-agent-*.scope`）で動く。MCP `yuzuru_train` の学習ジョブも同じく `yuzuru-job-*.scope` で動く。エージェントが
 `uv run python debug.py` のように直接実行したスクリプトもその scope に入るので、メモリを食い尽くしても
 `isolation.memory_max`（既定 `80%`、systemd の `MemoryMax`）で止まり、OOM で殺されるのはそのスクリプトだけになる（ジョブなら終了コード 137 で lease が終わり、それを添えて再開する）。
@@ -200,6 +211,18 @@ OpenCode 2.x の `opencode run` はターンをバックグラウンドサービ
 ```bash
 opencode service stop && yuzuru agent -- opencode service start
 ```
+
+`yuzuru agent` と再開したターンでは、エージェントが自分で実行するコマンドには GPU を見せない
+（`CUDA_VISIBLE_DEVICES=""`。ジョブと同じ `gpu_pin` で、Python からほかの値に変えようとすると `RuntimeError`）。
+GPU を使う処理は MCP `yuzuru_train` で起動させるためで、そのジョブには yuzuru が lease の GPU を渡す。
+シェルから直接 `python train.py` を動かすと、lease なしで LLM の隣に載り、シェルツールのタイムアウトで途中で
+殺される（そのあいだに出力を上書きすることもある）。GPU が見えなければ CUDA のエラーですぐ落ち、トレースバックの
+後に `yuzuru_train` を使うよう案内を出す。OpenCode 2.x ではツールがバックグラウンドサービスで動くので、
+サービスを `yuzuru agent -- opencode service start` で起動しておくこと。`isolation.hide_gpus_from_agent: false` で無効。
+
+- うっかり直接実行するのを防ぐためのもので、サンドボックスではない。`env -u PYTHONPATH`、`python -E` / `-I`、
+  Python 以外のプログラムでは外せる
+- GPU が無ければ CPU で動くように書かれたスクリプトは、落ちずに CPU で（遅く）動く
 
 ### ルーティング
 

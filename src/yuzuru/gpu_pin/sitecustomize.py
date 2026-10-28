@@ -9,6 +9,9 @@ excludes. Here that raises instead. Narrowing to some of the job's GPUs, or hidi
 accelerate's clear_environment() (used by the HF Trainer) clears and restores the whole
 environment and must keep working.
 
+`yuzuru agent` uses the same pin with no GPUs (YUZURU_AGENT=1): what the agent runs itself, such
+as `python train.py` from its shell, sees no GPU and is told to use yuzuru's train tool instead.
+
 Then the sitecustomize this one shadows, if any (a venv's or the distribution's), runs as usual.
 """
 
@@ -17,6 +20,9 @@ import sys
 
 _KEY = "CUDA_VISIBLE_DEVICES"
 _PINNED = os.environ.get("YUZURU_CUDA_VISIBLE_DEVICES")
+_AGENT = os.environ.get("YUZURU_AGENT") == "1"
+_ADVICE = ("GPUs are hidden from commands the agent runs itself: start GPU work with yuzuru's train "
+           "tool (MCP yuzuru_train) and give it the VRAM the job needs")
 
 
 def _str(s):
@@ -32,6 +38,8 @@ def _allowed(value):
 
 
 def _check(value):
+    if not _allowed(value) and _AGENT:
+        raise RuntimeError(f"{_KEY} cannot be set to {_str(value)!r} here. {_ADVICE}")
     if not _allowed(value):
         raise RuntimeError(
             f"{_KEY} is limited to this yuzuru job's GPUs ({_PINNED}); setting it to {_str(value)!r} "
@@ -40,7 +48,9 @@ def _check(value):
 
 def _pin():
     if _KEY not in os.environ or not _allowed(os.environ[_KEY]):
-        if _KEY in os.environ:  # e.g. `CUDA_VISIBLE_DEVICES=1 python train.py` inside the job
+        if _KEY in os.environ and _AGENT:  # e.g. `CUDA_VISIBLE_DEVICES=0 python train.py` from the agent's shell
+            print(f"[yuzuru] {_KEY}={os.environ[_KEY]} ignored. {_ADVICE}", file=sys.stderr)
+        elif _KEY in os.environ:  # e.g. `CUDA_VISIBLE_DEVICES=1 python train.py` inside the job
             print(f"[yuzuru] {_KEY}={os.environ[_KEY]} is outside this job's GPUs; using {_PINNED}",
                   file=sys.stderr)
         os.environ[_KEY] = _PINNED
@@ -80,6 +90,18 @@ def _pin():
     os.putenv, os.unsetenv = checked_putenv, checked_unsetenv
 
 
+def _hint_on_cuda_errors():
+    """A script that wants CUDA fails without saying why there is none; say it after the traceback."""
+    previous = sys.excepthook
+
+    def hook(kind, value, tb):
+        previous(kind, value, tb)
+        if any(w in f"{kind.__name__}: {value}" for w in ("CUDA", "cuda", "NVIDIA", "GPU")):
+            print(f"[yuzuru] {_ADVICE}", file=sys.stderr)
+
+    sys.excepthook = hook
+
+
 def _chain():
     import importlib.machinery
     import importlib.util
@@ -94,4 +116,6 @@ def _chain():
 
 if _PINNED is not None:
     _pin()
+    if _AGENT:
+        _hint_on_cuda_errors()
 _chain()

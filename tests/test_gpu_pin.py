@@ -97,3 +97,72 @@ def test_unrestricted_job_is_left_alone(tmp_path, monkeypatch):
     call_run(args, FakeClient({"id": "abc", "gpus": [], "visible": []}))  # no resources.gpus
     seen = json.loads(out.read_text())
     assert seen["start"] is None and seen["other"] == "GPU-9"
+
+
+# What an agent started through yuzuru runs itself (`python train.py` from its shell) sees no GPU:
+# in LoRA run 3 such a run trained without a lease and overwrote the best weights.
+
+def agent_python(tmp_path, cfg, *code_args, extra_env=None):
+    import subprocess
+
+    from yuzuru.waits import agent_env
+
+    env = agent_env(cfg) | (extra_env or {})
+    return subprocess.run([sys.executable, *code_args], env=env, capture_output=True, text=True, timeout=60)
+
+
+def test_agent_commands_see_no_gpu(tmp_path, cfg, monkeypatch):
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    out = tmp_path / "seen.json"
+    r = agent_python(tmp_path, cfg, "-c", PROBE, str(out))
+    assert r.returncode == 0, r.stderr
+    seen = json.loads(out.read_text())
+    assert seen["start"] == "" and seen["hide"] == "-1"
+    assert seen["other"] == seen["index"] == seen["putenv"] == seen["narrow"] == "refused"
+    r = agent_python(tmp_path, cfg, "-c", "import os; os.environ['CUDA_VISIBLE_DEVICES'] = '0'")
+    assert "cannot be set to '0' here" in r.stderr and "yuzuru_train" in r.stderr
+
+
+def test_agent_value_set_before_python_starts_is_ignored(tmp_path, cfg):
+    r = agent_python(tmp_path, cfg, "-c", "import os; print(repr(os.environ['CUDA_VISIBLE_DEVICES']))",
+                     extra_env={"CUDA_VISIBLE_DEVICES": "0"})
+    assert r.stdout.strip() == "''"
+    assert "CUDA_VISIBLE_DEVICES=0 ignored" in r.stderr
+
+
+def test_agent_cuda_error_points_at_the_train_tool(tmp_path, cfg):
+    r = agent_python(tmp_path, cfg, "-c", "raise RuntimeError('No CUDA GPUs are available')")
+    assert r.returncode == 1
+    assert r.stderr.index("No CUDA GPUs are available") < r.stderr.index("yuzuru_train")
+    r = agent_python(tmp_path, cfg, "-c", "raise ValueError('bad shape')")
+    assert "yuzuru_train" not in r.stderr
+
+
+def test_agent_gpus_can_stay_visible(tmp_path, cfg, monkeypatch):
+    from yuzuru.waits import agent_env
+
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-0")
+    cfg.isolation.hide_gpus_from_agent = False
+    env = agent_env(cfg)
+    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-0" and "YUZURU_AGENT" not in env and "PYTHONPATH" not in env
+
+
+def test_yuzuru_agent_starts_without_gpus(cfg, monkeypatch):
+    from yuzuru import cli
+
+    started = {}
+    monkeypatch.setattr(cli.os, "execvpe", lambda f, argv, env: started.update(argv=argv, env=env))
+    cli.cmd_agent(argparse.Namespace(cmd=["--", "opencode", "service", "start"]), cfg)
+    assert started["argv"] == ["opencode", "service", "start"]
+    assert started["env"]["CUDA_VISIBLE_DEVICES"] == "" and started["env"]["YUZURU_AGENT"] == "1"
+
+
+def test_job_started_from_the_agents_shell_gets_its_gpus(tmp_path, monkeypatch):
+    # `yuzuru run` from inside the agent: the lease's GPUs, not the agent's hiding.
+    monkeypatch.setenv("YUZURU_AGENT", "1")
+    monkeypatch.setenv("YUZURU_CUDA_VISIBLE_DEVICES", "")
+    args, out = job(tmp_path)
+    call_run(args, FakeClient({"id": "abc", "gpus": ["GPU-0"]}))
+    seen = json.loads(out.read_text())
+    assert seen["start"] == "GPU-0" and seen["other"] == "refused"

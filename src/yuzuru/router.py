@@ -69,6 +69,7 @@ class SessionState:
     updated: float = field(default_factory=time.time)
     answering: int = 0  # replies of this session being generated now
     tool_calls: bool = False  # the last reply asked for tools: the client will call again in this turn
+    replies: int = 0  # replies finished so far (a turn's count is the difference)
 
 
 @dataclass
@@ -203,6 +204,7 @@ class Router:
         sess = self.sessions.setdefault(session, SessionState())
         sess.answering = max(0, sess.answering - 1)
         sess.tool_calls = finish_reason == "tool_calls"
+        sess.replies += 1
         sess.updated = time.time()
 
     def in_turn(self, session: str | None, idle: float) -> bool:
