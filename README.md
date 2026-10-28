@@ -61,7 +61,7 @@ ollama pull qwen3:14b     # 例: medium（学習中でも 8GB 級GPUに載る）
 ```bash
 yuzuru run -- python train.py              # LLMをVRAMから退かして実行、終わったら戻す
 yuzuru run --gpu 1 -- python train.py      # GPU1 を専有（CUDA_VISIBLE_DEVICES を UUID で設定）
-yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える）
+yuzuru run --vram 10G -- python train.py   # 10GB を予約し続ける（学習途中の増加に備える。推奨）
 yuzuru run --cpu -- python lgbm.py         # GPU を使わないジョブ（LLM はそのまま、GPU は見せない）
 ```
 
@@ -69,6 +69,11 @@ yuzuru run --cpu -- python lgbm.py         # GPU を使わないジョブ（LLM 
 消えなければジョブのログに警告）→ ジョブ起動 → VRAM使用量が `settle_seconds` 安定したら
 「確定」→ 残り（− headroom）を LLM が使える → 終了すると lease を解放し、元のモデルを再ロード。
 ラッパーが kill されても、サーバーがPIDの消滅を検知して lease を回収する。
+
+`--vram` を省略すると、確定した時点の使用量で予約する。その後に増えた分も含め、ジョブが一度使った量（ピーク）は
+一時的に解放されても予約したままにする。ただし確定の時点ではモデルを読み込んだだけ、ということがあり、そのあと
+最初のステップや評価で伸びる分は、すでに LLM が載っていると確保できずに OOM になる。量が分かっているなら `--vram` を付ける。
+MCP の `yuzuru_train` では、GPU ジョブに `vram`（または GPU を丸ごと取る `gpus`）が必須で、無いとエラーを返す。
 
 `--gpu`（MCP `yuzuru_train` の `gpus`）で GPU を専有させたジョブ（と `yuzuru reserve --gpu` で量を指定せずに確保した GPU）の
 間は、その GPU を LLM に一切使わせない。`--vram` で量を指定した場合は、その量だけを差し引き、残りは LLM が使える。

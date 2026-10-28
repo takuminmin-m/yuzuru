@@ -277,7 +277,8 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("run", help="run a training job under a GPU lease")
     p.add_argument("--gpu", action="append", help="GPU index or UUID to dedicate (repeatable)")
-    p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measure)")
+    p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measured once the job's use settles; "
+                   "a job that grows later, e.g. at its first evaluation, should give it)")
     p.add_argument("--cpu", action="store_true",
                    help="CPU-only job: it sees no GPU and the LLM is not moved out for it")
     p.add_argument("--label")

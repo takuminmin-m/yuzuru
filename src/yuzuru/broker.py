@@ -76,6 +76,7 @@ class Lease:
     state: str = "draining"
     baseline: int = 0  # memory in use on the leased devices once the LLM left
     level: int = 0
+    peak: int = 0  # most the job has grown by: what a measured lease keeps reserved
     last_change: float = field(default_factory=time.time)
     restore: list[str] = field(default_factory=list)
     resident: list[str] = field(default_factory=list)  # still on a GPU when the job was let go
@@ -156,7 +157,9 @@ class Broker:
             devs = [g for g in snap.gpus if not lease.gpus or g.uuid in lease.gpus]
             free = sum(g.free for g in devs) if snap.gpus else snap.ram_available
             return max(free, (lease.vram or 0) - lease.grown)
-        return max(0, (lease.vram or 0) - lease.grown) + self.cfg.lease.headroom_mb * MB
+        # A measured job keeps what it once used: memory it freed for a moment (between training and
+        # evaluation) comes back, and the LLM must not be loaded into it meanwhile.
+        return max(0, max(lease.vram or 0, lease.peak) - lease.grown) + self.cfg.lease.headroom_mb * MB
 
     def budget(self) -> Budget:
         snap, res = self.snapshot, self.cfg.resources
@@ -597,6 +600,7 @@ class Broker:
             if abs(level - lease.level) > self.cfg.lease.settle_tolerance_mb * MB:
                 lease.last_change = now
             lease.level = level
+            lease.peak = max(lease.peak, lease.grown)
             if lease.state == "settling":
                 quiet = now - lease.last_change >= self.cfg.lease.settle_seconds
                 allocated = lease.grown > self.cfg.lease.settle_tolerance_mb * MB

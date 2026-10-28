@@ -24,7 +24,7 @@ async def test_train_jobs_get_the_servers_config_wherever_they_run(cfg, tmp_path
 
     monkeypatch.setattr(subprocess, "run", run)
     await MCPServer(st).tools["train"][1](
-        {"command": "python train.py", "cwd": str(tmp_path / "project"), "resume_when_done": False}, {})
+        {"command": "python train.py", "cwd": str(tmp_path / "project"), "vram": "4G", "resume_when_done": False}, {})
     argv, cwd = ran[0]
     assert cwd == tmp_path / "project"
     assert argv[argv.index("--config") + 1] == str(tmp_path / "srv" / "y.yaml")
@@ -64,5 +64,5 @@ async def test_jobs_do_not_inherit_the_servers_venv(cfg, monkeypatch, tmp_path):
     monkeypatch.setenv("VIRTUAL_ENV", sys.prefix)
     monkeypatch.setattr(subprocess, "run", run)
     await MCPServer(st).tools["train"][1]({"command": "uv run python train.py", "cwd": str(tmp_path),
-                                           "resume_when_done": False}, {})
+                                           "vram": "4G", "resume_when_done": False}, {})
     assert "VIRTUAL_ENV" not in seen[0] and own not in seen[0]["PATH"].split(os.pathsep)

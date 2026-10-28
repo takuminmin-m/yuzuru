@@ -32,8 +32,9 @@ INSTRUCTIONS = (
     "yuzuru serves this assistant from local models sized to the free GPU memory. "
     "Call this server's `model` tool with 'large' when a task needs deeper reasoning than the current model gives. "
     "Start GPU training / fine-tuning with its `train` tool rather than bash: it moves the LLM out of VRAM first "
-    "and runs the job in the background with a log file. For a job that uses no GPU (LightGBM, XGBoost on CPU, "
-    "scikit-learn, data preparation) pass device 'cpu': the LLM then stays loaded."
+    "and runs the job in the background with a log file. Give a GPU job the VRAM it will need at its peak ('vram'). "
+    "For a job that uses no GPU (LightGBM, XGBoost on CPU, scikit-learn, data preparation) pass device 'cpu': "
+    "the LLM then stays loaded."
 )
 
 Handler = Callable[[dict[str, Any], dict[str, str]], Awaitable[str]]
@@ -128,8 +129,8 @@ class MCPServer:
         @self.tool(
             "train",
             "Start a training / fine-tuning job in the background. For a GPU job (the default) yuzuru first moves "
-            "the local LLM out of GPU memory, waits for the job's memory use to settle, then lets the LLM use what "
-            "remains. With device 'cpu' the job sees no GPU, the LLM is left alone and the job yields CPU to it. "
+            "the local LLM out of GPU memory and keeps `vram` free for the job; the LLM may use the rest. "
+            "With device 'cpu' the job sees no GPU, the LLM is left alone and the job yields CPU to it. "
             "Returns the PID and log file; read the log to follow progress.",
             {
                 "command": {"type": "string", "description": "shell command, e.g. 'python train.py --epochs 10'"},
@@ -137,7 +138,8 @@ class MCPServer:
                 "device": {"type": "string", "enum": ["gpu", "cpu"],
                            "description": "'cpu' for a job that uses no GPU (default 'gpu')"},
                 "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional)"},
-                "vram": {"type": "string", "description": "VRAM to reserve, e.g. '10G' (optional; default measured)"},
+                "vram": {"type": "string", "description": "VRAM the job needs at its peak, e.g. '6G' (required for "
+                         "a GPU job unless `gpus` dedicates whole GPUs to it)"},
                 "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
                 "resume_when_done": {"type": "boolean", "description": "free the LLM while the job runs and "
                                      "resume this session when it ends (default true); end your turn after starting"},
@@ -152,6 +154,14 @@ class MCPServer:
             cpu = _device(args) == "cpu"
             if cpu and (args.get("gpus") or args.get("vram")):
                 raise ValueError("device 'cpu' takes no gpus or vram")
+            if not cpu and not (args.get("gpus") or args.get("vram")):
+                # Measured from the job's first seconds (model loaded, no step taken yet), the lease is too
+                # small: the LLM moves back into the rest and the job runs out of memory when it grows.
+                raise ValueError(
+                    "give vram for a GPU job, e.g. '6G': what the job uses at its peak (weights, optimizer state, "
+                    "activations of the largest batch, evaluation) plus a margin. Without it the LLM takes back the "
+                    "memory the job would grow into, and the job runs out of memory. Use device 'cpu' for a job that "
+                    "needs no GPU")
             # The job runs in `cwd`: a relative config path (YUZURU_CONFIG, ./yuzuru.yaml) would not resolve there.
             argv = [sys.executable, "-m", "yuzuru.cli", *(["--config", str(st.cfg.source)] if st.cfg.source else []),
                     "--url", st.cfg.url, "run", "--detach", "--label", "train"]
