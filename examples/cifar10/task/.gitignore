@@ -1,0 +1,7 @@
+__pycache__/
+*.pt
+.venv/
+data/
+opencode.json.bak
+.opencode/
+.yuzuru/

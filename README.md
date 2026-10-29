@@ -29,6 +29,8 @@ OpenCode から `yuzuru/auto` を選ぶだけで、タスクの難易度と空�
 
 ## セットアップ
 
+通しの使い方は [チュートリアル: ローカル LLM エージェントに CIFAR-10 を解かせる](docs/tutorial.md) を参照。
+
 ```bash
 uv tool install -e /home/takumi/Documents/yuzuru   # `yuzuru` コマンドを PATH に
 yuzuru serve                                       # 常駐（systemd 化は下記）
