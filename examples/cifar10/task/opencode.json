@@ -1,0 +1,85 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "yuzuru": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "yuzuru (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:11435/v1"
+      },
+      "models": {
+        "large": {
+          "name": "Large (yuzuru)",
+          "tool_call": true,
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "yuzuru": {
+        "type": "remote",
+        "url": "http://127.0.0.1:11435/mcp",
+        "codemode": false
+      }
+    }
+  },
+  "model": "yuzuru/large",
+  "small_model": "yuzuru/large",
+  "disabled_providers": [
+    "opencode"
+  ],
+  "permission": {
+    "*": "allow",
+    "question": "deny",
+    "doom_loop": "deny",
+    "execute": "deny",
+    "external_directory": {
+      "*": "deny",
+      "~/.local/share/opencode/shell/*": "allow"
+    },
+    "bash": {
+      "*": "deny",
+      "uv run *": "allow",
+      "uv pip install *": "allow",
+      "uv pip list*": "allow",
+      "uv pip show *": "allow",
+      "cd *": "allow",
+      "pwd": "allow",
+      "ls": "allow",
+      "ls *": "allow",
+      "cat *": "allow",
+      "head *": "allow",
+      "tail *": "allow",
+      "grep *": "allow",
+      "wc *": "allow",
+      "find *": "allow",
+      "diff *": "allow",
+      "sed -n *": "allow",
+      "echo *": "allow",
+      "mkdir *": "allow",
+      "cp *": "allow",
+      "mv *": "allow",
+      "rm *": "allow",
+      "touch *": "allow",
+      "nvidia-smi*": "allow",
+      "free*": "allow",
+      "df *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git add *": "allow",
+      "git commit *": "allow",
+      "rm -r*": "deny",
+      "rm -f*": "deny",
+      "rm -rf*": "deny",
+      "*--break-system-packages*": "deny",
+      "sudo *": "deny"
+    }
+  }
+}
