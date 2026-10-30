@@ -1,0 +1,32 @@
+# yuzuru の設定（`yuzuru init` が生成）。このディレクトリで実行した yuzuru コマンド
+# （serve / agent / status ...）は ~/.config/yuzuru/config.yaml よりこちらを使う。
+
+port: {port}             # 課題を並行して動かすなら課題ごとに変える（`yuzuru init --port`）
+
+resources:
+  # 学習にも LLM にも使ってよい GPU。index ではなく UUID で書く（`nvidia-smi -L`）
+  gpus: {gpus}
+
+ollama:
+  manage: true           # 上の GPU だけが見える専用の ollama serve を yuzuru が起動する
+  env:
+    OLLAMA_VULKAN: "0"   # Vulkan バックエンドは CUDA_VISIBLE_DEVICES を無視して他の GPU を見つけてしまう
+
+router:
+  classifier: heuristic  # モデルが 1 つなので難易度判定は不要
+
+tiers:
+  - name: large
+    models: [{model}]    # `ollama list` の名前。ツール呼び出しができるモデルにする
+    num_ctx: {num_ctx}   # エージェントは 1 ターンで 2〜3 万トークン使う。32k 以上を推奨
+    max_cpu_fraction: 0.7  # VRAM に入りきらない分はこの割合まで RAM に逃がしてよい
+
+lease:
+  settle_seconds: 6
+
+isolation:
+  memory_max: {memory_max}  # エージェントと学習ジョブ 1 つあたりの RAM 上限。超えたプロセスだけが殺される
+
+resume:
+  # 自動で再開したターンの出力を残す
+  command: {resume}

@@ -4,7 +4,11 @@ GPU 1 枚のマシンで、ローカルの LLM エージェント（OpenCode）�
 結果を見て改善 → 提出」を自律的に回させる。LLM と学習ジョブは同じ GPU を使うので、その取り合いを yuzuru が仲裁する。
 
 - 前半（手順 1〜6、30 分ほど）: yuzuru を入れ、手で学習ジョブを流して「学習中は LLM が GPU から退き、終わると戻る」のを見る
-- 後半（手順 7〜10、エージェント次第で 1〜2 時間）: エージェントに課題を渡して放っておき、終わったら採点・検証する
+- 後半（手順 7〜10、エージェント次第で 1〜2 時間）: エージェントに課題を渡して放っておき、終わったら結果を確かめる
+
+この例はコンペ形式で、隠したテストラベルでの採点まで行う。**採点は必須ではない**。ハイパーパラメータやモデル構造の
+チューニングを任せるなら、検証データの指標と終わる条件を `README.md` に書くだけでよい
+（[採点なしで使う](#採点なしで使うハイパーパラメータモデル構造のチューニング)）。採点に関わる手順には（任意）と付けている。
 
 参考: 作者の環境（RTX 3060 12 GB + Qwen3.6-35B-A3B の 3 ビット量子化）では、エージェントがベースライン（val 66%）を
 ResNet-18 + CutMix/Mixup に書き換え、約 90 分の学習でテスト正解率 95.5% に達した。人が打ったのは最初の 1 行だけ。
@@ -13,10 +17,9 @@ ResNet-18 + CutMix/Mixup に書き換え、約 90 分の学習でテスト正解
 
 | ファイル | 中身 |
 |---|---|
-| `config.yaml` | yuzuru の設定のひな形（GPU 1 枚、モデル 1 つ、専用 Ollama） |
 | `prepare.py` | CIFAR-10 を取得し、ラベルなしのテストセットと隠し正解ラベルに分ける |
-| `score.py` | `submission.csv` を隠しラベルで採点する |
-| `task/` | エージェントに渡す課題ディレクトリのひな形（`README.md`、`AGENTS.md`、ベースライン、`opencode.json`） |
+| `score.py` | `submission.csv` を隠しラベルで採点する（任意） |
+| `task/` | エージェントに渡す課題ディレクトリのひな形（`README.md`、`AGENTS.md`、ベースライン）。設定は `yuzuru init` が足す |
 
 ## 全体像
 
@@ -44,7 +47,7 @@ ResNet-18 + CutMix/Mixup に書き換え、約 90 分の学習でテスト正解
 - systemd のユーザーセッション（普通のデスクトップ Linux ならある）。エージェントと学習ジョブをメモリ上限付きの
   scope に入れるのに使う。無くても動くが、暴走したスクリプトが端末ごと落とすことがある
 - [Ollama](https://ollama.com)（0.40 で確認）
-- [OpenCode](https://opencode.ai) 2.x（2.0.32 で確認。この手順の `opencode.json` は 2.x の書式）
+- [OpenCode](https://opencode.ai) 2.x（2.0.32 で確認。`yuzuru init` は入っている OpenCode の版に合わせた `opencode.json` を作る）
 - [uv](https://docs.astral.sh/uv/)
 
 ## 1. yuzuru を入れる
@@ -71,12 +74,25 @@ ollama list          # 名前を確認（例: qwen3.6-iq3:latest）
 > （作者の Qwen3.6 では `<think>` が停止語になっていて、考え始めた瞬間に応答が切れた）。その場合は
 > `Modelfile` で `RENDERER` / `PARSER` を指定して作り直す（`FROM <blob>` + `RENDERER qwen3.5` + `PARSER qwen3.5`）。
 
-## 3. yuzuru を設定する
+## 3. 課題ディレクトリを作る
 
-まず GPU の UUID を調べる。
+課題ディレクトリ（エージェントが作業する場所）を作る。採点する場合は、正解ラベルを置く採点用ディレクトリを
+エージェントから見えない場所に分けておく（この例の `prepare.py` は両方を作る）。
 
 ```bash
-nvidia-smi -L
+YUZURU=/path/to/yuzuru
+TASK=~/work/cifar10-task
+GRADER=~/work/.cifar10-grader
+
+cp -r "$YUZURU/examples/cifar10/task" "$TASK"
+```
+
+## 4. `yuzuru init` で設定する
+
+yuzuru・OpenCode・エージェント・uv の設定は `yuzuru init` がまとめて作る。
+
+```bash
+nvidia-smi -L        # GPU の番号を確認
 ```
 
 ```
@@ -84,36 +100,67 @@ GPU 0: NVIDIA GeForce RTX 3050 (UUID: GPU-6a1e...)
 GPU 1: NVIDIA GeForce RTX 3060 (UUID: GPU-403d...)
 ```
 
-**GPU は番号ではなく UUID で指定する**。`nvidia-smi` の番号（PCI バス順）と CUDA / PyTorch の番号（速い順）は
-一致しないことがある（上の例では CUDA の 0 番は 3060）。
-
-設定のひな形をコピーし、`resources.gpus` を使う GPU の UUID に、`tiers[0].models` を手順 2 のモデル名に書き換える。
-
 ```bash
-mkdir -p ~/.config/yuzuru
-cp /path/to/yuzuru/examples/cifar10/config.yaml ~/.config/yuzuru/config.yaml
-$EDITOR ~/.config/yuzuru/config.yaml
+yuzuru init "$TASK" --gpu 1 --packages torch torchvision numpy pillow
 ```
 
-ひな形で効いている設定:
-
-| 設定 | 意味 |
+| 作るもの | 中身 |
 |---|---|
-| `resources.gpus` | ここに書いた GPU だけを LLM にも学習にも使う。学習ジョブには `CUDA_VISIBLE_DEVICES` が自動で設定される |
-| `ollama.manage: true` | yuzuru が、上の GPU だけが見える専用の `ollama serve` を起動する。システムの `ollama.service`（:11434）は動いたままでよい。重みはシンボリックリンクで共有するのでディスクは増えない |
-| `tiers` | LLM の大きさの区分。ここではモデル 1 つだけの `large`。`num_ctx` は 32k 以上（OpenCode はシステムプロンプトとツール定義だけで 2 万トークン近く送る） |
-| `isolation.memory_max` | エージェントと学習ジョブ 1 つあたりの RAM 上限。超えたプロセスだけが殺され、yuzuru や端末は無事 |
-| `resume.command` | 学習後に会話を再開するコマンド。ひな形は出力を `~/.local/state/yuzuru/resume.log` に残す形にしてある |
+| `yuzuru.yaml` | yuzuru の設定。この課題ディレクトリで実行した yuzuru コマンドは、`~/.config/yuzuru/config.yaml` よりこれを使う |
+| `opencode.json` | OpenCode の設定（yuzuru への接続 + 権限）。手順 7 |
+| `AGENTS.md` | エージェントへの作業ルール（手順 7）。すでにあれば残す（この例では課題用のものが入っている） |
+| `.gitignore` | `.venv/`、`.yuzuru/`、`data/`、重みファイルなどを足す |
+| `.venv` | `uv venv` + `--packages` を `uv pip install`（`pyproject.toml` があれば `uv sync`、`requirements.txt` があればそれも入れる） |
+| git | リポジトリでなければ `git init` して課題を commit する。エージェントが何を変えたかを後で `git diff` で追える |
 
-## 4. yuzuru を起動して状態を見る
+既にあるファイルは書き換えない（`--force` で `.bak` を残して作り直す）。
 
-端末を 1 つ yuzuru 用にして起動する（ログがここに流れる）。
+`yuzuru.yaml` で効いている設定と、`init` の引数:
+
+| 設定 | `init` の引数 | 意味 |
+|---|---|---|
+| `resources.gpus` | `--gpu`（番号か UUID、複数可。既定: 全部） | ここに書いた GPU だけを LLM にも学習にも使う。学習ジョブには `CUDA_VISIBLE_DEVICES` が自動で設定される |
+| `tiers` | `--model`、`--ctx`（既定 65536） | LLM の大きさの区分。ここではモデル 1 つだけの `large`。モデルの既定は、yuzuru が前回 `large` に使ったもの（初めてなら `ollama list` で一番大きいもの）。`num_ctx` は 32k 以上（OpenCode はシステムプロンプトとツール定義だけで 2 万トークン近く送る） |
+| `ollama.manage: true` | | yuzuru が、上の GPU だけが見える専用の `ollama serve` を起動する。システムの `ollama.service`（:11434）は動いたままでよい。重みはシンボリックリンクで共有するのでディスクは増えない |
+| `isolation.memory_max` | `--memory-max`（既定 80%） | エージェントと学習ジョブ 1 つあたりの RAM 上限。超えたプロセスだけが殺され、yuzuru や端末は無事 |
+| `port` | `--port`（既定 11435） | yuzuru のポート。課題を並行して動かすときは課題ごとに変える |
+| `resume.command` | | 学習後に会話を再開するコマンド。出力を課題ディレクトリの `.yuzuru/resume.log` に残す |
+
+**GPU は yuzuru.yaml に UUID で書かれる**（`--gpu 1` は `nvidia-smi` の番号）。`nvidia-smi` の番号（PCI バス順）と
+CUDA / PyTorch の番号（速い順）は一致しないことがある（上の例では CUDA の 0 番は 3060）。
+
+続けてデータを用意する。
 
 ```bash
+cd "$TASK"
+uv run python -c "import torch; print(torch.cuda.is_available())"   # True になること
+uv run python "$YUZURU/examples/cifar10/prepare.py" "$TASK" "$GRADER"  # 約 170 MB をダウンロード
+```
+
+CIFAR-10 の Python 版（`cifar-10-batches-py/`）が手元にあれば `--root <その親ディレクトリ>` でダウンロードを省ける。
+
+できあがるもの:
+
+```
+cifar10-task/
+├── README.md        課題（目標: テスト正解率 85%、ルール）
+├── AGENTS.md        作業ルール（後述）
+├── model.py / train.py / predict.py   ベースライン（val 約 66%）
+├── yuzuru.yaml      yuzuru の設定
+├── opencode.json    OpenCode の設定（yuzuru への接続 + 権限）
+└── data/            train.npz（ラベル付き 50000 枚）、test.npz（ラベルなし 10000 枚）など
+```
+
+## 5. yuzuru を起動して状態を見る
+
+端末を 1 つ yuzuru 用にして、**課題ディレクトリで**起動する（`yuzuru.yaml` を読む。ログがここに流れる）。
+
+```bash
+cd "$TASK"
 yuzuru serve
 ```
 
-別の端末で状態を見る。
+別の端末で（同じく課題ディレクトリで）状態を見る。
 
 ```bash
 yuzuru status
@@ -150,39 +197,6 @@ yuzuru warm large --force
 10.4 GB になり、GPU に全部載った）。`status` の見込みが最初から `gpu` か `offload` なら `--force` は要らない。
 どちらの場合も、先に読み込んでおくと最初の応答が速い。
 
-## 5. 課題ディレクトリを作る
-
-課題ディレクトリ（エージェントが作業する場所）と、採点用ディレクトリ（エージェントから見えない場所）を分ける。
-
-```bash
-YUZURU=/path/to/yuzuru
-TASK=~/work/cifar10-task
-GRADER=~/work/.cifar10-grader
-
-cp -r "$YUZURU/examples/cifar10/task" "$TASK"
-cd "$TASK"
-uv venv .venv
-uv pip install torch torchvision numpy pillow
-uv run python -c "import torch; print(torch.cuda.is_available())"   # True になること
-uv run python "$YUZURU/examples/cifar10/prepare.py" "$TASK" "$GRADER"  # 約 170 MB をダウンロード
-git init -q && git add -A && git commit -qm "task + baseline"
-```
-
-CIFAR-10 の Python 版（`cifar-10-batches-py/`）が手元にあれば `--root <その親ディレクトリ>` でダウンロードを省ける。
-
-できあがるもの:
-
-```
-cifar10-task/
-├── README.md        課題（目標: テスト正解率 85%、ルール）
-├── AGENTS.md        作業ルール（後述）
-├── model.py / train.py / predict.py   ベースライン（val 約 66%）
-├── opencode.json    OpenCode の設定（yuzuru への接続 + 権限）
-└── data/            train.npz（ラベル付き 50000 枚）、test.npz（ラベルなし 10000 枚）など
-```
-
-`git init` しておくと、エージェントが何を変えたかを後で `git diff` で追える。
-
 ## 6. 手で学習ジョブを流してみる
 
 エージェントに渡す前に、yuzuru 経由の学習を自分で動かして仕組みを見ておく。別の端末で
@@ -215,7 +229,7 @@ loading yuzuru-large:qwen3.6-iq3-64k (gpu, ~10.4 GB)
 `--vram 2G` は「この学習は VRAM を 2 GB まで使う」という申告。学習の間、yuzuru はその分を LLM に使わせない。
 この例では LLM ごと降ろすので差は出ないが、GPU に余裕があるときは残りを LLM が使い続けられる。
 
-採点の流れも確かめておく。
+（任意）採点の流れも確かめておく。
 
 ```bash
 uv run python predict.py
@@ -241,17 +255,17 @@ OpenCode は `AGENTS.md` を毎ターン読み込む。ローカルの LLM は�
 
 ### `opencode.json`（接続と権限）
 
-課題ディレクトリの `opencode.json` が、このディレクトリで動く OpenCode の設定になる。
+課題ディレクトリの `opencode.json`（`yuzuru init` が作る）が、このディレクトリで動く OpenCode の設定になる。
 
 - `provider.yuzuru` と `mcp.servers.yuzuru`: yuzuru（:11435）への接続。`models` のキー（`large`）は yuzuru の
-  tier 名と合わせる。yuzuru のポートや tier を変えたらここも直す
-  （`yuzuru opencode --install --project "$TASK" --local-only` で生成し直してから `permission` を足してもよい）
+  tier 名と合わせる。`yuzuru.yaml` のポートや tier を変えたら `yuzuru init --force` で作り直す
+  （`AGENTS.md` なども作り直されるので、手を入れていたら `.bak` から戻す）
 - `disabled_providers: ["opencode"]`: yuzuru が落ちていると、OpenCode は組み込みの無料クラウドモデルに黙って
   切り替えてコードを外に送る。それを防ぐ
 - `permission`: 人が見ていない間に走らせるので、全部許可ではなく許可リストにしている
   - `bash` は既定で拒否し、`uv run *`、`ls`、`cat`、`tail`、`git diff` など必要なものだけ許可。許可した中でも
     `rm -rf`、`--break-system-packages` は拒否（`sudo` や `kill` は許可リストにないので拒否される）
-  - `external_directory` は拒否（課題ディレクトリの外 = 採点用ディレクトリを読ませない）。例外として
+  - `external_directory` は拒否（課題ディレクトリの外、たとえば採点用ディレクトリを読ませない）。例外として
     `~/.local/share/opencode/shell/*` だけ許可する。OpenCode 2.x は長いコマンド出力をここに保存して
     エージェントに読ませるため、拒否すると自分のコマンドの出力を読めなくなる
   - `execute` は拒否（OpenCode 2.x の `execute` ツールは JavaScript でコードを実行でき、bash の許可リストを素通りする）
@@ -309,7 +323,7 @@ Error: Invalid arguments for tool "yuzuru_train":
 学習ジョブ（pid 84113）を開始しました。このターンは終了し、完了後に自動的に再開します。
 ```
 
-ツールの引数を間違えてもエラーを読んで直すので、1 回の失敗は気にしなくてよい。15 秒後、`resume.log` に
+ツールの引数を間違えてもエラーを読んで直すので、1 回の失敗は気にしなくてよい。15 秒後、`.yuzuru/resume.log` に
 再開したターンが現れる:
 
 ```
@@ -332,7 +346,7 @@ Error: Invalid arguments for tool "yuzuru_train":
 | GPU・LLM の予算・読み込み中のモデル・学習ジョブ（lease） | `yuzuru status` |
 | 学習の終了と再開の履歴 | `yuzuru events`（`-f` で流し続ける） |
 | 学習ログ | `yuzuru_train` の `log` に渡したパス（課題ディレクトリからの相対） |
-| 自動で再開したターンの出力 | `~/.local/state/yuzuru/resume.log` |
+| 自動で再開したターンの出力 | `$TASK/.yuzuru/resume.log` |
 | エージェントが変えたもの | `cd $TASK && git status && git diff` |
 | yuzuru のログ | `yuzuru serve` の端末 |
 | 管理下の Ollama のログ | `~/.local/state/yuzuru/ollama-11435.log`（11435 は yuzuru のポート） |
@@ -348,32 +362,74 @@ Error: Invalid arguments for tool "yuzuru_train":
   yuzuru agent -- opencode run --session ses_xxxx "前回の続きから進めてください"
   ```
 
-## 10. 採点と検証
+## 10. 結果を確かめる
 
-エージェントが終わったら採点する。
+エージェントは `RESULTS.md` に、試した設定と検証データの指標の表、一番良かった設定を残す。まずこれを読む。
+
+自律実行の結果をそのまま信じず、次も確かめる。実際の実行でも、良い重みを後の実験で上書きして `RESULTS.md` の数字と
+重み・提出物が食い違った、提出形式を間違えた（ラベルをクラス名で書いた）、といったことが起きている。
+
+- `RESULTS.md` の指標が学習ログと一致するか、その重みが今のファイルか（ファイルの更新時刻とログの時刻）
+- 検証データが学習データと重なっていないか（分け方のコード）。重なっていると検証の指標が高く出て、
+  チューニングの判断そのものが狂う
+- `git diff` で、指示していない所（データの読み込み、評価のコード）を変えていないか
+
+（任意）採点する場合は、さらに次も確かめる。
 
 ```bash
 cd "$TASK"
 uv run python "$YUZURU/examples/cifar10/score.py" "$GRADER/test_labels.npy" submission.csv
 ```
 
-自律実行の結果をそのまま信じず、次も確かめる。実際の実行でも、良い重みを後の実験で上書きして `RESULTS.md` の数字と
-提出物が食い違った、提出形式を間違えた（ラベルをクラス名で書いた）、といったことが起きている。
-
 - `submission.csv` が本当に提出された重みから出たものか: `predict.py` を走らせ直し、差分がないことを確かめる
   ```bash
   cp submission.csv /tmp/submitted.csv && uv run python predict.py && cmp submission.csv /tmp/submitted.csv
   ```
-- `RESULTS.md` の `val_acc` が学習ログと一致するか、その重みが今のファイルか（ファイルの更新時刻とログの時刻）
 - テストの答えに触っていないか: `git diff` と書かれたコードで、`data/train.npz` 以外を学習に使っていないか、
   配布元からテストセットを取りに行っていないか、`$GRADER` を読もうとしていないか
-- 検証データが学習データと重なっていないか（分け方のコード）
+
+## 採点なしで使う（ハイパーパラメータ・モデル構造のチューニング）
+
+手元の学習コードの学習率やバッチサイズ、層の数や幅などを試させる使い方では、隠しラベルも `score.py` も要らない。
+エージェントは検証データの指標を見て次の設定を決め、結果を `RESULTS.md` に残して終わる。手順は前半と同じで、
+違うのは課題ディレクトリの中身だけ。
+
+```bash
+cd ~/work/my-model                    # 自分の学習コードがあるディレクトリ（git 管理ならそのまま）
+yuzuru init . --gpu 1 --packages torch numpy
+```
+
+`README.md` に次を書く。エージェントが迷うのはだいたいこのどれかが抜けているとき。
+
+- **指標**: 何をどのデータで測り、大きい方と小さい方のどちらが良いか（例: `train.py` が最後に出す `val_loss`、小さいほど良い）
+- **動かしてよい範囲**: 変えてよい設定・ファイルと、変えてはいけないもの（データの分け方、評価のコード、エポック数の上限など）
+- **終わる条件**: 試す回数、かける時間、指標の目標、「3 回続けて改善しなければ終わる」など。
+  無いとエージェントは自分で区切りをつけて早く終わりがち（実際に、目標を確かめずに終えたことがある）
+- **1 回の学習の重さ**: 使う VRAM、かかる時間の目安。`yuzuru_train` の `vram` の手がかりになる
+
+例:
+
+```markdown
+# 画像分類モデルのチューニング
+
+`train.py` のハイパーパラメータとモデル構造（`model.py`）を調整して、`val_acc` を上げてください。
+
+- 指標: `uv run python train.py --out <name>` が最後に出す `val_acc`（大きいほど良い）
+- 変えてよいもの: `train.py` の引数と既定値、`model.py`。データの読み込み（`data.py`）と検証データの分け方は変えない
+- 1 回の学習は VRAM 3 GB、10 分ほど。エポック数は 30 まで
+- 終わる条件: 学習を 15 回回すか、`val_acc` 0.93 を超えたら終わり
+- 結果: `RESULTS.md` に設定と `val_acc` の表、一番良かった設定、その重みのパス
+```
+
+`yuzuru init` の `AGENTS.md` は、この形の課題を前提にしている（学習ごとに `RESULTS.md` に 1 行足す、`README.md` の
+終わる条件を確かめてから終える、重みを上書きしない）。テストデータがある場合も、設定を選ぶのには使わせず、
+終わった後に人が一番良かった重みで測る。
 
 ## うまくいかないとき（実際にあったもの）
 
 | 症状 | 原因と対処 |
 |---|---|
-| `yuzuru warm` が `"placement": "none"` を返す | 初回の最悪見積もりが RAM 予算を超えている（手順 4）。`yuzuru warm large --force` で一度読み込む |
+| `yuzuru warm` が `"placement": "none"` を返す | 初回の最悪見積もりが RAM 予算を超えている（手順 5）。`yuzuru warm large --force` で一度読み込む |
 | 学習が OOM する、LLM の層が学習中の GPU に載っている | `ollama.manage: true` か確認（システムの Ollama を直接使うと GPU を隠せない）。Vulkan バックエンドは `CUDA_VISIBLE_DEVICES` を無視するので `OLLAMA_VULKAN: "0"` |
 | 違う GPU を使っている | GPU を番号で書いている。UUID で書く |
 | エージェントのシェルで `torch.cuda.is_available()` が False、CUDA エラー | 意図どおり（手順 7）。学習は `yuzuru_train` で動かす。エージェントが気づかなければ `AGENTS.md` に書く |
@@ -397,5 +453,5 @@ uv run python "$YUZURU/examples/cifar10/score.py" "$GRADER/test_labels.npy" subm
   小さいモデルに回る。`opencode.json` の `models` にも tier を足す
 - **常駐させる**: README の [systemd user unit](../README.md#常駐させるsystemd-user-unit)。自動再開で `opencode` を
   起動するので、unit の環境から `opencode` が見えることを確かめる
-- **他の課題**: `task/` の `README.md`（課題と評価）、`AGENTS.md`（作法）、`prepare.py`（データと隠しラベルの分離）を
-  差し替えれば同じ流れで使える
+- **他の課題**: `task/` の `README.md`（課題と評価）と `AGENTS.md`（作法）を差し替えれば同じ流れで使える。
+  採点したいときだけ、`prepare.py` のようにテストの正解を課題ディレクトリの外に分ける

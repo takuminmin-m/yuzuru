@@ -37,6 +37,25 @@ yuzuru serve                                       # 常駐（systemd 化は下�
 yuzuru opencode --install                          # ~/.config/opencode にプロバイダとプラグインを追加
 ```
 
+エージェントに課題を解かせるなら、課題ディレクトリごとに `yuzuru init` で一式を用意できる:
+
+```bash
+yuzuru init ~/work/my-task --gpu 1 --packages torch numpy   # --model / --port / --memory-max も指定できる
+cd ~/work/my-task && yuzuru serve                          # このディレクトリでは ./yuzuru.yaml が使われる
+```
+
+- `yuzuru.yaml`: GPU（`--gpu` の番号を UUID にして書く。既定は全部）、モデル（既定は前回 `large` に使ったもの、
+  初めてなら一番大きいもの）、専用 Ollama（`ollama.manage: true`）、RAM 上限、再開ターンの出力先（`.yuzuru/resume.log`）
+- `opencode.json`: yuzuru のプロバイダと MCP、クラウドへのフォールバック無効、無人実行向けの権限の許可リスト
+- `AGENTS.md`: `uv run python`、学習は `yuzuru_train`（`vram` 必須、CPU だけなら `device: "cpu"`）、呼んだらターンを終える、など
+- `.gitignore` に追記、`uv venv`（+ `--packages`、`requirements.txt`、`pyproject.toml` なら `uv sync`）、`git init` + commit
+
+既にあるファイルはそのまま残す（`--force` で `.bak` を残して作り直す）。課題を並行して動かすときは `--port` を変える。
+
+課題は採点つきのコンペ形式でなくてよい。ハイパーパラメータやモデル構造のチューニングなら、`README.md` に検証データの
+指標・変えてよい範囲・終わる条件を書けば、エージェントは試した設定と指標を `RESULTS.md` に残して終わる
+（[チュートリアル](docs/tutorial.md#採点なしで使うハイパーパラメータモデル構造のチューニング)）。
+
 `yuzuru opencode --install` は次を行う:
 - `opencode.json` に `yuzuru` プロバイダ（`auto` と各 tier）と MCP サーバー（`http://127.0.0.1:11435/mcp`）を追加し、
   `model` / `small_model` が未設定なら `yuzuru/auto` / `yuzuru/small` にする（既存ファイルは `.json.bak` に退避。
