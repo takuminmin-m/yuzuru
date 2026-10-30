@@ -250,36 +250,70 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
             upstream = None
             decision = None
             finish, seen = None, b""
+            unstarted = None  # the variant counted in broker.unstarted until the first chunk
+
+            def started() -> None:
+                nonlocal unstarted
+                if unstarted is not None:
+                    st.broker.unstarted[unstarted] -= 1
+                    unstarted = None
+
             try:
-                decision, _ = await pick(body, headers)
-                st.router.answering(decision.session)
-                await queue.put(f": yuzuru {decision.tier} ({decision.reason})\n\n".encode())
-                if decision.cloud:
-                    c = cfg.cloud
-                    log.info("cloud: %s (%s)", c.model, decision.reason)
-                    req = st.cloud_http.build_request(
-                        "POST", c.base_url.rstrip("/") + "/chat/completions", json={**body, "model": c.model},
-                        headers={"authorization": f"Bearer {c.api_key}"},
-                    )
-                    upstream = await st.cloud_http.send(req, stream=True)
-                else:
-                    spec = decision.spec
-                    req = st.http.build_request("POST", "/v1/chat/completions", json={**body, "model": spec.variant})
-                    upstream = await st.http.send(req, stream=True)
-                if upstream.status_code >= 400:
-                    text = (await upstream.aread()).decode(errors="replace")
-                    await queue.put(sse_error(f"upstream returned {upstream.status_code}: {text[:500]}"))
-                    return
-                async for chunk in upstream.aiter_bytes():
-                    seen = seen[-64:] + chunk  # a finish_reason may straddle two chunks
-                    finish = finish_reason(seen) or finish
-                    await queue.put(chunk)
+                while True:
+                    fresh = decision is None
+                    decision, _ = await pick(body, headers)
+                    if fresh:
+                        st.router.answering(decision.session)
+                    await queue.put(f": yuzuru {decision.tier} ({decision.reason})\n\n".encode())
+                    restarts = st.broker.restarts
+                    if decision.cloud:
+                        c = cfg.cloud
+                        log.info("cloud: %s (%s)", c.model, decision.reason)
+                        client = st.cloud_http
+                        req = client.build_request(
+                            "POST", c.base_url.rstrip("/") + "/chat/completions", json={**body, "model": c.model},
+                            headers={"authorization": f"Bearer {c.api_key}"},
+                        )
+                    else:
+                        spec = decision.spec
+                        st.broker.unstarted[spec.variant] += 1
+                        unstarted = spec.variant
+                        client = st.http
+                        req = client.build_request("POST", "/v1/chat/completions", json={**body, "model": spec.variant})
+                    try:
+                        upstream = await client.send(req, stream=True)
+                        if upstream.status_code >= 400:
+                            text = (await upstream.aread()).decode(errors="replace")
+                            await queue.put(sse_error(f"upstream returned {upstream.status_code}: {text[:500]}"))
+                            return
+                        async for chunk in upstream.aiter_bytes():
+                            started()
+                            seen = seen[-64:] + chunk  # a finish_reason may straddle two chunks
+                            finish = finish_reason(seen) or finish
+                            await queue.put(chunk)
+                    except httpx.TransportError:
+                        if unstarted is None or st.broker.restarts == restarts:
+                            raise
+                        # GPUs came back and Ollama was restarted before the first token (Broker.apply_dedication):
+                        # nothing reached the client yet, so do the request again on the restarted server.
+                        log.info("%s: Ollama was restarted before the first token; sending the request again",
+                                 spec.variant)
+                        started()
+                        if upstream is not None:
+                            with contextlib.suppress(Exception):
+                                await upstream.aclose()
+                            upstream = None
+                        await st.broker.release(spec)
+                        spec = None
+                        continue
+                    break
             except HTTPException as e:
                 await queue.put(sse_error(str(e.detail)))
             except Exception as e:  # noqa: BLE001 - report to the client instead of dropping the stream
                 log.warning("stream failed: %r", e)
                 await queue.put(sse_error(f"yuzuru: {e!r}"))
             finally:
+                started()
                 if decision is not None:
                     st.router.answered(decision.session, finish)
 

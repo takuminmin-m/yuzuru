@@ -96,6 +96,10 @@ class Broker:
         self.loaded: list[LoadedModel] = []
         self.leases: dict[str, Lease] = {}
         self.inflight: Counter[str] = Counter()
+        # Of those, streams that have not had their first chunk yet (server.stream_chat): they are
+        # redone on the restarted server if a restart cuts them, so they need not hold one back.
+        self.unstarted: Counter[str] = Counter()
+        self.restarts = 0  # Ollama restarts begun by apply_dedication, to tell a cut stream from a crash
         self.last_used: dict[str, float] = {}
         self.lock = asyncio.Lock()
         self._settled = asyncio.Event()
@@ -537,7 +541,10 @@ class Broker:
         is still growing gets the LLM's layers next to it and runs out of memory.
         A managed Ollama is restarted with those GPUs hidden. Requests wait for the
         restart (routing waits until leases settle), and a generation still running
-        on the old server is given drain_timeout to finish first.
+        on the old server is given drain_timeout to finish first. When GPUs are given
+        back, a generation still waiting for its first token is not waited for: the
+        restart cuts it and it is redone on the GPUs (a long prompt the LLM took on the
+        CPU while jobs held every GPU otherwise keeps them idle for drain_timeout).
         """
         if self.restrict is None:
             if self.dedicated() and not self._unenforced_warned:
@@ -550,12 +557,15 @@ class Broker:
         self._restricting += 1
         self._settled.clear()
         try:
+            giving_back = self.dedicated() < self._hidden
             deadline = time.time() + self.cfg.lease.drain_timeout
-            while time.time() < deadline and any(self.inflight.values()):
+            while time.time() < deadline and any(
+                    n > (self.unstarted[v] if giving_back else 0) for v, n in self.inflight.items()):
                 await asyncio.sleep(0.5)
             async with self.lock:
                 hide = self.dedicated()
                 log.info("restarting Ollama %s", f"without {', '.join(sorted(hide))}" if hide else "with every GPU")
+                self.restarts += 1  # before the kill: a stream it cuts may fail before restrict() returns
                 await self.restrict(hide)
                 self._hidden = hide
                 await self.refresh()
