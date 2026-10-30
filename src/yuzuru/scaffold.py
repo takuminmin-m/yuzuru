@@ -23,6 +23,7 @@ import httpx
 
 from .config import Config, load_config
 from .opencode import add_mcp, mcp_config, opencode_major, provider_config
+from .waits import outside_env
 
 # Unattended, so an allowlist: the agent may run its Python through uv and look around, nothing else.
 PERMISSION: dict[str, Any] = {
@@ -159,7 +160,8 @@ def write(path: Path, text: str, force: bool, report: list[str]) -> None:
 def run(cmd: list[str], cwd: Path, report: list[str]) -> bool:
     print("+ " + shlex.join(cmd), file=sys.stderr)
     try:
-        ok = subprocess.run(cmd, cwd=cwd).returncode == 0
+        # outside_env: under `uv run yuzuru init`, VIRTUAL_ENV is yuzuru's venv and `uv pip install` would go there.
+        ok = subprocess.run(cmd, cwd=cwd, env=outside_env()).returncode == 0
     except OSError as e:
         ok = False
         print(f"  {e}", file=sys.stderr)
