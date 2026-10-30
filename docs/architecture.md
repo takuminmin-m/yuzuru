@@ -203,6 +203,15 @@ MCP の `instructions` とツールの説明で、学習は bash ではなく `t
 
 `--install` を付けなければ、設定の断片を表示するだけです。
 
+### 課題ディレクトリの準備（`scaffold.py`、`templates/`）
+
+`yuzuru init <dir>` は、エージェントに渡す課題ディレクトリに次を作ります。すでにあるファイルは残し、`--force` のときだけ `.bak` を残して作り直します。
+
+- `yuzuru.yaml`（`templates/yuzuru.yaml` から）: `--gpu` の番号を `nvidia-smi` で UUID にして `resources.gpus` に書きます。モデルは `--model`、なければ yuzuru が前回 `large` に使ったもの（派生モデル `yuzuru-large:*` の digest から元のモデルを引く）、それもなければ一番大きいモデルです。`ollama.manage: true`、`isolation.memory_max`、`port` に加え、`resume.command` は出力を `<dir>/.yuzuru/resume.log` に追記する形にします。カレントディレクトリの `yuzuru.yaml` は `~/.config/yuzuru/config.yaml` より先に読まれるので、課題ディレクトリで動かした yuzuru はこの設定を使います
+- `opencode.json`: `opencode.py` と同じプロバイダと MCP の設定に、`disabled_providers: ["opencode"]` と、無人実行向けの権限の許可リスト（`scaffold.py` の `PERMISSION`）を足したもの
+- `AGENTS.md`（`templates/AGENTS.md` から）: `uv run python` を使う、GPU の処理は `yuzuru_train`（`vram` 必須）で動かしてターンを終える、学習のたびに設定と検証データの指標を `RESULTS.md` に 1 行足す、課題の `README.md` の終わる条件を確かめてから終える、など。採点のある課題を前提にしていません
+- `.gitignore` への追記、`uv venv` と `--packages` の導入（`pyproject.toml` があれば `uv sync`、`requirements.txt` があればそれも入れる）、リポジトリでなければ `git init` と最初の commit
+
 ## 学習ジョブの流れ
 
 エージェントが `yuzuru_train` を呼んでから、会話が再開するまでの流れです。
@@ -297,11 +306,13 @@ yuzuru が起動するプロセスの `PYTHONPATH` の先頭に、`gpu_pin/` を
 - 本文のある POST / PUT / PATCH は `application/json` だけ受け付ける
 - `YUZURU_TOKEN`（または設定の `token`）を設定すると、すべての API に Bearer トークンが必要になる
 
-コマンドの許可リストのように、エージェント自体に何をさせるかは OpenCode の `permission` 設定で決めます。例は [`examples/cifar10/task/opencode.json`](../examples/cifar10/task/opencode.json) と [チュートリアルの手順 7](tutorial.md#7-エージェントの準備をする) にあります。
+コマンドの許可リストのように、エージェント自体に何をさせるかは OpenCode の `permission` 設定で決めます。`yuzuru init` が作る `opencode.json` の許可リスト（`scaffold.py` の `PERMISSION`）と、その説明が [チュートリアルの手順 7](tutorial.md#7-エージェントの準備をする) にあります。
 
-## 採点（grader）
+## 採点（grader、任意）
 
-yuzuru 本体には採点の機能はありません。採点は、課題ごとにエージェントから見えない場所で行います。
+yuzuru 本体には採点の機能はなく、採点は必須でもありません。ハイパーパラメータやモデル構造のチューニングでは、エージェントは検証データの指標で設定を選び、結果を `RESULTS.md` に残して終わります（[チュートリアルの採点なしで使う](tutorial.md#採点なしで使うハイパーパラメータモデル構造のチューニング)）。
+
+隠したテストデータで採点したいときは、課題ごとにエージェントから見えない場所で行います。
 [`examples/cifar10/`](../examples/cifar10/) では、次のように分けています。
 
 - `prepare.py`: データを課題ディレクトリ（ラベルなしのテストデータ）と採点用ディレクトリ（テストの正解ラベル `test_labels.npy`）に分ける。テストデータの順番はシャッフルし、配布元の並びから答えを引けないようにする
@@ -326,15 +337,15 @@ yuzuru/
 │   ├── holder.py         hard 予約で VRAM を確保するプロセス
 │   ├── ollama.py         Ollama API のクライアント
 │   ├── opencode.py       OpenCode の設定の生成・書き込み
+│   ├── scaffold.py       yuzuru init（課題ディレクトリの準備）
+│   ├── templates/        yuzuru init が書く yuzuru.yaml と AGENTS.md のひな形
 │   ├── opencode/yuzuru.ts  OpenCode 1.x 用プラグイン
 │   └── gpu_pin/sitecustomize.py  CUDA_VISIBLE_DEVICES の固定
-├── examples/cifar10/     チュートリアルの課題（設定のひな形、データ準備、採点、課題ディレクトリ）
+├── examples/cifar10/     チュートリアルの課題（データ準備、採点、課題ディレクトリのひな形）
 ├── docs/                 チュートリアルとこのドキュメント
 ├── tests/                pytest
 └── yuzuru.example.yaml   全設定項目の例
 ```
-
-<!-- TODO: yuzuru init（scaffold.py、templates/）を追記する -->
 
 yuzuru が書き込むファイル（`state_dir`、既定 `~/.local/state/yuzuru/`）:
 

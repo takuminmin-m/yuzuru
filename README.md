@@ -74,7 +74,25 @@ yuzuru は、1 台のマシンの GPU を「ローカル LLM」と「機械学�
 
 3. 必要なら設定ファイルを書きます（[設定](#設定)）。設定ファイルがなくても、入っているモデルをパラメータ数で tier に自動で割り当てて動きます。
 
-<!-- TODO: yuzuru init -->
+### 課題ごとに設定一式を作る（`yuzuru init`）
+
+エージェントに課題を任せるなら、課題ディレクトリごとに `yuzuru init` で設定一式を作れます。
+
+```bash
+yuzuru init ~/work/my-task --gpu 1 --packages torch numpy   # --model / --port / --memory-max も指定できる
+cd ~/work/my-task && yuzuru serve                          # このディレクトリでは ./yuzuru.yaml が使われる
+```
+
+| 作るもの | 中身 |
+|---|---|
+| `yuzuru.yaml` | 使う GPU（`--gpu` の番号を UUID にして書く。既定は全部）、モデル（既定は前回 `large` に使ったもの、初めてなら一番大きいもの）、管理下の Ollama、RAM の上限、再開したターンの出力先（`.yuzuru/resume.log`） |
+| `opencode.json` | yuzuru のプロバイダと MCP、クラウドへの切り替えの無効化、無人で動かすための権限の許可リスト |
+| `AGENTS.md` | エージェントへの作業ルール（`uv run python` を使う、学習は `yuzuru_train` で動かしてターンを終える、試した設定と指標を `RESULTS.md` に残す、など） |
+| `.gitignore`、`.venv`、git | `.gitignore` への追記、`uv venv`（`--packages`、`requirements.txt`、`pyproject.toml` なら `uv sync`）、`git init` と最初の commit |
+
+すでにあるファイルはそのまま残します（`--force` を付けると `.bak` を残して作り直します）。課題を並行して動かすときは、課題ごとに `--port` を変えてください。
+
+課題は、採点のあるコンペ形式でなくても構いません。ハイパーパラメータやモデル構造のチューニングなら、課題の `README.md` に検証データの指標、変えてよい範囲、終わる条件を書けば十分です。エージェントは試した設定と指標を `RESULTS.md` に残して終わります（[チュートリアルの採点なしで使う](docs/tutorial.md#採点なしで使うハイパーパラメータモデル構造のチューニング)）。
 
 ## 最初の一回を動かす
 

@@ -270,6 +270,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--port", type=int)
     p.add_argument("--log-level", default="info")
 
+    p = sub.add_parser("init", help="set up a task directory for an agent: yuzuru.yaml, opencode.json, "
+                       "AGENTS.md, .gitignore, uv venv, git")
+    p.add_argument("dir", nargs="?", default=".", help="task directory (default: here; created if missing)")
+    p.add_argument("--gpu", action="append", help="GPU index or UUID to use (repeatable; default: all)")
+    p.add_argument("--model", help="Ollama model for the agent (default: the largest installed)")
+    p.add_argument("--port", type=int, default=11435, help="yuzuru's port; one per task run in parallel")
+    p.add_argument("--ctx", type=int, default=65536, help="context length (default 65536)")
+    p.add_argument("--memory-max", default="80%", help="RAM cap of the agent and of each job (default 80%%)")
+    p.add_argument("--packages", nargs="+", metavar="PKG", help="install into the task's .venv, e.g. torch numpy")
+    p.add_argument("--python", help="Python version for the .venv (uv venv --python)")
+    p.add_argument("--no-venv", action="store_true", help="do not create the .venv")
+    p.add_argument("--no-git", action="store_true", help="do not create a git repository")
+    p.add_argument("--force", action="store_true", help="replace existing files (keeping a .bak)")
+
     p = sub.add_parser("run", help="run a training job under a GPU lease")
     p.add_argument("--gpu", action="append", help="GPU index or UUID to dedicate (repeatable)")
     p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measured once the job's use settles; "
@@ -348,6 +362,10 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.command == "serve":
         return cmd_serve(args)
+    if args.command == "init":
+        from .scaffold import cmd_init
+
+        return cmd_init(args)
 
     cfg = load_config(args.config)
     client = Client(args.url or cfg.url, cfg.token)
