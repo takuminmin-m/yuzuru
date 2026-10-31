@@ -365,6 +365,29 @@ async def test_handover_from_hard_reservation_keeps_lease(cfg, world, http, monk
     assert job.id in broker.leases and job.state == "settling"
 
 
+async def test_lease_gpus_follow_nvidia_smi_order(cfg, world, http, monkeypatch):
+    _, broker, _ = await make(cfg, world, http)
+    lease = await broker.create_lease(pid=os.getpid(), label="t", gpus=["1", "GPU-0", "1"], vram=None)
+    assert lease.gpus == ["GPU-0", "GPU-1"]  # the job's cuda:0 is nvidia-smi's GPU 0
+    assert broker.devices(lease.gpus) == [{"uuid": "GPU-0", "index": 0, "name": "Fake 0"},
+                                          {"uuid": "GPU-1", "index": 1, "name": "Fake 1"}]
+    await broker.release_lease(lease.id)
+
+    # A whole-GPU hard reservation sizes each GPU by its own free memory: given as "1,0", the
+    # holder used to get GPU 0's size for GPU 1.
+    spawned = {}
+
+    async def fake_spawn(gpus, sizes, ttl):
+        spawned.update(gpus=gpus, sizes=sizes)
+        return os.getpid()
+
+    monkeypatch.setattr(broker, "_spawn_holder", fake_spawn)
+    world.foreign = [1 * GB, 2 * GB]
+    await broker.create_reservation(gpus=["1", "0"], vram=None, ttl=None, label="r", hard=True)
+    margin = cfg.resources.vram_margin_mb * 2**20
+    assert spawned == {"gpus": ["GPU-0", "GPU-1"], "sizes": [7 * GB - margin, 10 * GB - margin]}
+
+
 def enable_cloud(cfg, monkeypatch, **kw):
     from yuzuru.config import CloudConfig
 

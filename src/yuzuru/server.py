@@ -379,8 +379,9 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         except (KeyError, ValueError) as e:
             raise HTTPException(400, str(e)) from e
         watch = st.waiter.watch_lease(lease)
-        return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
-                "resident": lease.resident, "watch": watch.id if watch else None}
+        visible = st.broker.visible_gpus(lease)
+        return {"id": lease.id, "gpus": lease.gpus, "visible": visible, "devices": st.broker.devices(visible),
+                "state": lease.state, "resident": lease.resident, "watch": watch.id if watch else None}
 
     def job_fields(payload: dict[str, Any]) -> dict[str, Any]:
         return {"cwd": payload.get("cwd"), "log": payload.get("log"), "resume": bool(payload.get("resume")),
@@ -411,8 +412,9 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
         for k, v in job_fields(payload).items():
             setattr(lease, k, v)
         watch = st.waiter.watch_lease(lease)
-        return {"id": lease.id, "gpus": lease.gpus, "visible": st.broker.visible_gpus(lease), "state": lease.state,
-                "watch": watch.id if watch else None}
+        visible = st.broker.visible_gpus(lease)
+        return {"id": lease.id, "gpus": lease.gpus, "visible": visible, "devices": st.broker.devices(visible),
+                "state": lease.state, "watch": watch.id if watch else None}
 
     @app.get("/yuzuru/leases", dependencies=guarded)
     async def list_leases() -> list[dict[str, Any]]:

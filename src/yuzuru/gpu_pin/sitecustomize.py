@@ -9,6 +9,13 @@ excludes. Here that raises instead. Narrowing to some of the job's GPUs, or hidi
 accelerate's clear_environment() (used by the HF Trainer) clears and restores the whole
 environment and must keep working.
 
+A number is the GPU's nvidia-smi index, whatever CUDA_DEVICE_ORDER says, so
+`CUDA_VISIBLE_DEVICES=1` (or `accelerate launch --gpu_ids 1`) picks the same GPU with or without
+this pin. An allowed number is replaced by its UUID, which CUDA reads the same in either order.
+Indices come from NVML, or from YUZURU_GPU_INDEX ("0=GPU-...,1=GPU-...") when that is set.
+Nothing here depends on the rest of yuzuru: set PYTHONPATH to this directory and
+YUZURU_CUDA_VISIBLE_DEVICES to the allowed GPUs to use it in any project.
+
 `yuzuru agent` uses the same pin with no GPUs (YUZURU_AGENT=1): what the agent runs itself, such
 as `python train.py` from its shell, sees no GPU and is told to use yuzuru's train tool instead.
 
@@ -29,31 +36,90 @@ def _str(s):
     return s.decode() if isinstance(s, bytes) else str(s)
 
 
+_index = None  # nvidia-smi index -> UUID, read when a number first needs it
+
+
 def _entries(value):
-    return {e.strip() for e in _str(value).split(",")}
+    return [e.strip() for e in _str(value).split(",")]
+
+
+def _indices():
+    global _index
+    if _index is None:
+        given = os.environ.get("YUZURU_GPU_INDEX")
+        if given is not None:
+            _index = dict(e.strip().split("=", 1) for e in given.split(",") if "=" in e)
+        else:
+            _index = _nvml_indices()
+    return _index
+
+
+def _nvml_indices():
+    """NVML numbers GPUs as nvidia-smi does (PCI bus order) and ignores CUDA_VISIBLE_DEVICES."""
+    import ctypes
+
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+    except OSError:
+        return {}
+    if nvml.nvmlInit_v2() != 0:
+        return {}
+    try:
+        count, found = ctypes.c_uint(), {}
+        if nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+            return {}
+        for i in range(count.value):
+            handle, uuid = ctypes.c_void_p(), ctypes.create_string_buffer(96)
+            if (nvml.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) == 0
+                    and nvml.nvmlDeviceGetUUID(handle, uuid, len(uuid)) == 0):
+                found[str(i)] = uuid.value.decode()
+        return found
+    finally:
+        nvml.nvmlShutdown()
+
+
+def _uuid(entry):
+    return _indices().get(entry) if entry.isdigit() else entry
 
 
 def _allowed(value):
-    return _str(value).strip() in ("-1", "") or _entries(value) <= _entries(_PINNED)
+    """`value` as the job may keep it (numbers turned into UUIDs), or None if it leaves the job's GPUs."""
+    s = _str(value).strip()
+    if s in ("-1", ""):
+        return s
+    entries = _entries(s)
+    pinned = set(_entries(_PINNED)) - {"", "-1"}
+    if set(entries) <= pinned:  # the common case, and no NVML needed
+        return s
+    if not pinned:
+        return None
+    uuids = [_uuid(e) for e in entries]
+    if None in uuids or not set(uuids) <= {_uuid(p) for p in pinned}:
+        return None
+    return ",".join(uuids)
 
 
 def _check(value):
-    if not _allowed(value) and _AGENT:
+    kept = _allowed(value)
+    if kept is None and _AGENT:
         raise RuntimeError(f"{_KEY} cannot be set to {_str(value)!r} here. {_ADVICE}")
-    if not _allowed(value):
+    if kept is None:
         raise RuntimeError(
             f"{_KEY} is limited to this yuzuru job's GPUs ({_PINNED}); setting it to {_str(value)!r} "
             "would use GPUs yuzuru did not give the job")
+    return kept
 
 
 def _pin():
-    if _KEY not in os.environ or not _allowed(os.environ[_KEY]):
+    kept = _allowed(os.environ[_KEY]) if _KEY in os.environ else None
+    if kept is None:
         if _KEY in os.environ and _AGENT:  # e.g. `CUDA_VISIBLE_DEVICES=0 python train.py` from the agent's shell
             print(f"[yuzuru] {_KEY}={os.environ[_KEY]} ignored. {_ADVICE}", file=sys.stderr)
-        elif _KEY in os.environ:  # e.g. `CUDA_VISIBLE_DEVICES=1 python train.py` inside the job
+        elif _KEY in os.environ:  # e.g. `CUDA_VISIBLE_DEVICES=2 python train.py` inside the job
             print(f"[yuzuru] {_KEY}={os.environ[_KEY]} is outside this job's GPUs; using {_PINNED}",
                   file=sys.stderr)
-        os.environ[_KEY] = _PINNED
+        kept = _PINNED
+    os.environ[_KEY] = kept  # e.g. `accelerate launch --gpu_ids 1` hands its children "1": the UUID now
 
     environ = type(os.environ)
     setitem, delitem = environ.__setitem__, environ.__delitem__
@@ -61,7 +127,7 @@ def _pin():
 
     def __setitem__(self, key, value):
         if _str(key) == _KEY:
-            _check(value)
+            value = _check(value)
         setitem(self, key, value)
 
     def __delitem__(self, key):
@@ -79,7 +145,7 @@ def _pin():
 
     def checked_putenv(key, value):
         if _str(key) == _KEY:
-            _check(value)
+            value = _check(value)
         putenv(key, value)
 
     def checked_unsetenv(key):

@@ -335,13 +335,21 @@ class Broker:
                 log.warning("lease settle wait timed out; continuing")
 
     def _resolve_gpus(self, gpus: list[str]) -> list[str]:
-        resolved = []
+        """UUIDs of `gpus` in nvidia-smi order, whatever order they were given in: the job's
+        cuda:0, cuda:1, ... then follow nvidia-smi, and a hard reservation's per-GPU sizes
+        (taken in snapshot order) line up with the holder's devices."""
+        resolved: dict[str, int] = {}
         for g in gpus:
             gpu = self.snapshot.gpu(g)
             if gpu is None:
                 raise ValueError(f"unknown GPU {g!r}")
-            resolved.append(gpu.uuid)
-        return resolved
+            resolved[gpu.uuid] = gpu.index
+        return sorted(resolved, key=resolved.__getitem__)
+
+    def devices(self, uuids: list[str]) -> list[dict[str, Any]]:
+        """nvidia-smi index and name of each of `uuids`, in their order (the job's cuda:N)."""
+        by_uuid = {g.uuid: g for g in self.snapshot.gpus}
+        return [{"uuid": u, "index": by_uuid[u].index, "name": by_uuid[u].name} for u in uuids if u in by_uuid]
 
     def visible_gpus(self, lease: Lease) -> list[str]:
         """CUDA_VISIBLE_DEVICES for a lease's job: its GPUs, else every allowed one.

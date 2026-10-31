@@ -280,10 +280,19 @@ opencode service stop && yuzuru agent -- opencode service start
 yuzuru が起動するプロセスの `PYTHONPATH` の先頭に、`gpu_pin/` を置きます。その中の `sitecustomize.py` は、Python の起動時に読み込まれ、`CUDA_VISIBLE_DEVICES` を固定します。
 
 - **学習ジョブ**: lease の GPU に固定します。スクリプトが lease の外の GPU に変えようとすると `RuntimeError` にします。lease の GPU の一部に絞る、`-1` や空で全部隠す、は許します。削除は無視します（HF Trainer の中で `accelerate` が環境変数を一時的に全部消して戻すため）
+- **番号は `nvidia-smi` の番号**: `CUDA_VISIBLE_DEVICES=1` や `accelerate launch --gpu_ids 1` の `1` は、`CUDA_DEVICE_ORDER` によらず `nvidia-smi` の 1 番です。ピン留めがあってもなくても、同じ GPU を指します。lease の中の番号なら UUID に置き換えて渡し、外なら上と同じく断ります。番号と UUID の対応は NVML から読みます（`YUZURU_GPU_INDEX="0=GPU-…,1=GPU-…"` があればそれを使います）
 - **エージェント**（`yuzuru agent` と自動再開したターン）: GPU を見せません（`CUDA_VISIBLE_DEVICES=""`、`YUZURU_AGENT=1`）。CUDA 関係のエラーで落ちると、トレースバックの後に「`yuzuru_train` を使う」よう案内を出します。`isolation.hide_gpus_from_agent: false` で無効にできます
 - ジョブの venv などにある元の `sitecustomize` は、その後に通常どおり実行します
 
-これはうっかりした直接実行を防ぐためのもので、サンドボックスではありません。`python -S` / `-E` / `-I`、`env -u PYTHONPATH`、Python 以外のプログラム、`subprocess` に `env=` で直接渡した値には効きません。
+lease の GPU は、`--gpu` の書き方の順によらず `nvidia-smi` の順に並べます。ジョブの `cuda:0`、`cuda:1`、… も `nvidia-smi` の順になり、ジョブのログの最初に `cuda:0 = GPU 1 (NVIDIA GeForce RTX 3060)` のような対応を出します。
+
+`sitecustomize.py` は yuzuru の他の部分を使わないので、yuzuru を使わないプロジェクトでも使えます。
+
+```bash
+PYTHONPATH=/path/to/yuzuru/src/yuzuru/gpu_pin YUZURU_CUDA_VISIBLE_DEVICES=GPU-403d... python train.py
+```
+
+これはうっかりした直接実行を防ぐためのもので、サンドボックスではありません。`python -S` / `-E` / `-I`、`env -u PYTHONPATH`、Python 以外のプログラムには効きません。`subprocess` に `env=` で渡した値は、子の Python が起動したときに確かめます（`PYTHONPATH` を外した場合は効きません）。
 
 ## ガードレール
 

@@ -144,6 +144,7 @@ yuzuru、OpenCode、エージェント、uv の設定は `yuzuru init` がまと
 | `resume.command` | | 学習後に会話を再開するコマンド。出力を課題ディレクトリの `.yuzuru/resume.log` に残す |
 
 **`yuzuru.yaml` には GPU が UUID で書かれます**（`--gpu 1` は `nvidia-smi` の番号）。`nvidia-smi` の番号（PCI バス順）と、CUDA や PyTorch の番号（速い順）は一致しないことがあります。上の例では、CUDA の 0 番は 3060 です。
+yuzuru のジョブの中ではそろえてあり、`CUDA_VISIBLE_DEVICES=1` や `accelerate launch --gpu_ids 1` は `nvidia-smi` の 1 番を指します。
 
 設定項目の一覧は [architecture.md の主な設定項目](architecture.md#主な設定項目) にあります。
 
