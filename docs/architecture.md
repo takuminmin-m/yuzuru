@@ -173,7 +173,7 @@ Ollama が実際に使っているホスト RAM は、Ollama の cgroup の `mem
 | ツール | 引数 | 動き |
 |---|---|---|
 | `train` | `command`、`cwd`（必須）、`device`、`gpus`、`vram`、`log`、`resume_when_done`、`note` | `yuzuru run --detach` を `cwd` で起動する。GPU ジョブは `vram` か `gpus` がないとエラーを返す。`resume_when_done`（既定 true）なら終了時に会話を再開する |
-| `wait` | `pid` か `lease`、`note`、`log`、`cwd`、`device` | そのプロセスの終了を待ち、会話を再開する |
+| `wait` | `pid` か `lease`、`note`、`log`、`cwd`、`device` | そのプロセスの終了を待ち、会話を再開する。すでに待っているプロセスにもう一度呼ぶと、最大 `resume.repeat_wait_seconds` 秒止まってから答える（ポーリングで LLM を使い続けないように） |
 | `status` | — | GPU / RAM、予算、tier の配置見込み、lease |
 | `models` | — | 入っているモデルと担当 tier |
 | `model` | `tier`（必須）、`session` | セッションの tier かモデルを固定する（`auto` で解除） |
@@ -445,6 +445,7 @@ yuzuru が書き込むファイル（`state_dir`、既定 `~/.local/state/yuzuru
 | `warm_before_resume` | `true` | 再開の前にモデルを読み込む |
 | `log_tail_lines` | `40` | 再開のメッセージに入れるログの行数 |
 | `stall_nudges` | `1` | 止まったターンを続けて再開する回数（0 で無効） |
+| `repeat_wait_seconds` | `45` | すでに待っているプロセスに `wait` がもう一度呼ばれたら、その呼び出しをこの秒数（またはプロセスが終わるまで）止めてから答える。0 ですぐ答える |
 
 ### `isolation`
 
