@@ -217,12 +217,23 @@ class MCPServer:
             session = st.router.header_session(headers) or st.router.last_session
             if not (args.get("pid") or args.get("lease")):
                 raise ValueError("give pid or lease")
+            before = set(st.waiter.watches)
             w = await st.waiter.add(
                 session=session, pid=int(args["pid"]) if args.get("pid") else None, lease=args.get("lease"),
                 label=f"pid {args['pid']}" if args.get("pid") else f"lease {args['lease']}",
                 note=args.get("note") or "", log=args.get("log"), cwd=args.get("cwd"),
                 suspend=_device(args) != "cpu",
             )
+            if w.id in before and (seconds := st.cfg.resume.repeat_wait_seconds) > 0:
+                # Already waited for: the agent is polling. Hold the call instead of answering at once.
+                if ev := await st.waiter.hold(w, seconds):
+                    code = f" (exit code {ev.rc})" if ev.rc is not None else ""
+                    return (f"{w.label} ended{code} after {ev.duration / 60:.1f} min. Last lines of "
+                            f"{ev.log or 'its log'}:\n```\n{ev.log_tail[-2000:]}\n```\nStart the next job if there "
+                            "is one, then end your turn.")
+                return (f"still running: you already wait for it ({w.id}), so this call waited {seconds:.0f} s first. "
+                        "Checking again keeps the LLM busy (and any free GPU idle). End your turn now: session "
+                        f"{session} is resumed automatically with the outcome when it exits.")
             return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
                     f"turn now: session {session} is resumed automatically when the process exits.")
 

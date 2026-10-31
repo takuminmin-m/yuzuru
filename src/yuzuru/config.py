@@ -198,6 +198,10 @@ class ResumeConfig:
     # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
     # such a session this many times in a row, telling it so; 0 turns this off.
     stall_nudges: int = 1
+    # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
+    # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
+    # the process ends, before answering. Below the MCP clients' request timeout (60 s); 0: answer at once.
+    repeat_wait_seconds: float = 45.0
 
 
 @dataclass

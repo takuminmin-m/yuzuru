@@ -11,6 +11,7 @@ whole conversation on that turn, so the context comes back with it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
@@ -238,6 +239,14 @@ class Waiter:
             if st and st.updated > cutoff or self.router.in_turn(w.session, self.cfg.resume.turn_idle_seconds):
                 return False
         return True
+
+    async def hold(self, w: Watch, seconds: float) -> Event | None:
+        """Wait up to `seconds` for watch `w` to end; its event if it did."""
+        end = time.time() + seconds
+        while w.id in self.watches and (left := end - time.time()) > 0:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._changed.wait(), left)
+        return next((e for e in reversed(self.events) if e.watch == w.id), None)
 
     def _finish(self, w: Watch, rc: int | None) -> None:
         self.watches.pop(w.id, None)
