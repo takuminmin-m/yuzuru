@@ -277,3 +277,24 @@ async def test_whole_gpu_reservation_stays_dedicated_after_handover(cfg, world, 
     await broker.release_lease(job.id)
     await wait_for(lambda: len(hidden) == 2)
     assert hidden[-1] == set()
+
+
+async def test_a_gpu_taken_whole_takes_no_second_job(cfg, world, http):
+    import pytest
+
+    _, broker, _ = await make(cfg, world, http)
+
+    async def restrict(gpus):
+        pass
+
+    broker.restrict = restrict
+    first = await broker.create_lease(pid=os.getpid(), label="train", gpus=["1"], vram=None)
+    with pytest.raises(ValueError, match="one job per GPU"):
+        await broker.create_lease(pid=os.getpid(), label="train", gpus=["1"], vram=None)
+    with pytest.raises(ValueError, match="one job per GPU"):
+        await broker.create_lease(pid=os.getpid(), label="train", gpus=["1"], vram=4 * GB)
+    other = await broker.create_lease(pid=os.getpid(), label="train", gpus=["0"], vram=None)  # the other GPU is free
+    await broker.release_lease(first.id)
+    again = await broker.create_lease(pid=os.getpid(), label="train", gpus=["1"], vram=None)  # free again
+    await broker.release_lease(again.id)
+    await broker.release_lease(other.id)
