@@ -7,6 +7,7 @@ derived from what the resource probe reports at runtime.
 
 from __future__ import annotations
 
+import datetime
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -198,6 +199,28 @@ class ResumeConfig:
     # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
     # such a session this many times in a row, telling it so; 0 turns this off.
     stall_nudges: int = 1
+    # The task runs until this local time ("2026-10-31T06:15"), e.g. a time-boxed search: a resumed
+    # turn that ends before it with no job of the session running is continued, telling the agent
+    # how long is left (HPO run 1 declared itself done 3.5 hours early). Set it to when the last
+    # job should start. At most until_nudges times in a row; starting a job resets the count.
+    # After it, the train tool refuses GPU jobs (HPO run 2 went on three hours past its end time);
+    # CPU jobs still run, for the inference the deliverables need.
+    until: str | None = None
+    until_nudges: int = 3
+
+    def __post_init__(self) -> None:
+        self.deadline()
+
+    def deadline(self) -> float | None:
+        """`until` as a Unix time (a time without zone is local); None when unset."""
+        if self.until is None:
+            return None
+        if isinstance(self.until, datetime.datetime):  # YAML reads 2026-10-31T06:15:00 as a datetime
+            return self.until.timestamp()
+        try:
+            return datetime.datetime.fromisoformat(str(self.until)).timestamp()
+        except ValueError:
+            raise ValueError(f"resume.until must be a date and time like 2026-10-31T06:15, not {self.until!r}") from None
 
 
 @dataclass

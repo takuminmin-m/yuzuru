@@ -32,6 +32,10 @@ STALLED = ("[yuzuru] Your last turn ended after a single reply with no tool call
            "nothing continues this session unless you do. Continue the task from where you left off. If the task "
            "is finished, say so and summarize the result.")
 
+UNTIL = ("[yuzuru] Your turn ended and no job of yours is running, but this task goes on until {until} "
+         "({minutes} min from now). Do not finish early: check the end conditions in README.md and use the time "
+         "left (start the next job, then end your turn). Keep the deliverables up to date as you go.")
+
 
 @dataclass
 class Watch:
@@ -148,6 +152,9 @@ class Waiter:
         # Outcomes held back until their session's turn ends: one resume reports them all.
         self._held: dict[str, list[tuple[Event, Watch]]] = {}
         self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
+        # session -> its latest resume: a client yuzuru started earlier can stay attached while the session
+        # goes on (HPO run 1 had eight), and only the latest one may decide to continue the session.
+        self.latest_resume: dict[str, asyncio.subprocess.Process] = {}
         broker.on_lease_end.append(self._lease_ended)
 
     # ---------------------------------------------------------------- watches
@@ -349,6 +356,7 @@ class Waiter:
             log.warning("could not resume session %s: %s", session, e)
             return str(e)
         log.info("resumed session %s (pid %d)", session, proc.pid)
+        self.latest_resume[session] = proc
         # Reaped when the resumed turn ends (no zombies in a long-running server), then checked.
         self._spawn(self._after_turn(session, before, cwd, proc))
         return None
@@ -363,8 +371,24 @@ class Waiter:
         # `opencode run` can exit while the turn goes on in the OpenCode service.
         while self.router.in_turn(session, self.cfg.resume.turn_idle_seconds):
             await asyncio.sleep(1.0)
+        if self.latest_resume.get(session) is not proc:
+            return
         if session in self._held or any(w.session == session for w in self.watches.values()) \
                 or any(l.session == session for l in self.broker.leases.values()):
+            return
+        deadline = self.cfg.resume.deadline()
+        if deadline is not None and (left := deadline - time.time()) > 60:
+            done, limit = self.nudges.get(session, 0), self.cfg.resume.until_nudges
+            if done >= limit:
+                log.warning("session %s ended its turn %.0f min before resume.until with no job running; "
+                            "not continuing it again (%d in a row)", session, left / 60, done)
+                return
+            self.nudges[session] = done + 1
+            log.warning("session %s ended its turn %.0f min before resume.until with no job running; "
+                        "continuing it (%d/%d)", session, left / 60, done + 1, limit)
+            if not self.watches and self.cfg.resume.warm_before_resume:
+                await self._warm(session)
+            await self._continue(session, UNTIL.format(until=self.cfg.resume.until, minutes=round(left / 60)), cwd)
             return
         st = self.router.sessions.get(session)
         replies = (st.replies if st else 0) - before
