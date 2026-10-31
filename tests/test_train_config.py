@@ -66,3 +66,30 @@ async def test_jobs_do_not_inherit_the_servers_venv(cfg, monkeypatch, tmp_path):
     await MCPServer(st).tools["train"][1]({"command": "uv run python train.py", "cwd": str(tmp_path),
                                            "vram": "4G", "resume_when_done": False}, {})
     assert "VIRTUAL_ENV" not in seen[0] and own not in seen[0]["PATH"].split(os.pathsep)
+
+
+async def test_no_new_gpu_job_after_resume_until(cfg, tmp_path, monkeypatch):
+    import datetime
+
+    import pytest
+
+    cfg.isolation.scope = "off"
+    st = State(cfg)
+    ran = []
+
+    def run(argv, cwd, **kw):
+        ran.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"pid": 1, "log": "/l"}), "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    train = MCPServer(st).tools["train"][1]
+    job = {"command": "python train.py", "cwd": str(tmp_path), "vram": "4G", "resume_when_done": False}
+    cfg.resume.until = (datetime.datetime.now() - datetime.timedelta(minutes=1)).isoformat(timespec="minutes")
+    with pytest.raises(ValueError, match="resume.until"):
+        await train(job, {})
+    assert ran == []
+    await train({**{k: v for k, v in job.items() if k != "vram"}, "device": "cpu"}, {})  # inference for the deliverables
+    assert len(ran) == 1
+    cfg.resume.until = (datetime.datetime.now() + datetime.timedelta(minutes=30)).isoformat(timespec="minutes")
+    await train(job, {})
+    assert len(ran) == 2

@@ -203,6 +203,8 @@ class ResumeConfig:
     # turn that ends before it with no job of the session running is continued, telling the agent
     # how long is left (HPO run 1 declared itself done 3.5 hours early). Set it to when the last
     # job should start. At most until_nudges times in a row; starting a job resets the count.
+    # After it, the train tool refuses GPU jobs (HPO run 2 went on three hours past its end time);
+    # CPU jobs still run, for the inference the deliverables need.
     until: str | None = None
     until_nudges: int = 3
 
