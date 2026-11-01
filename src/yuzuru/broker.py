@@ -398,8 +398,18 @@ class Broker:
             return lease
         await self.refresh()
         resolved = self._resolve_gpus(gpus)
+        whole = bool(resolved) and vram is None
+        self._update_leases()  # a job that has just ended no longer holds its GPU
+        for other in self.leases.values():
+            # A GPU taken whole is that job's alone (HPO run 3 put two jobs on one dedicated GPU).
+            shared = set(resolved) & set(other.gpus)
+            if shared and (whole or other.whole):
+                raise ValueError(
+                    f"{', '.join(sorted(shared))} is already {'taken whole' if other.whole else 'in use'} by lease "
+                    f"{other.id} ({other.label}, pid {other.pid}): one job per GPU. Wait for it to end, or use "
+                    "another GPU")
         lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=resolved, vram=vram, session=session,
-                      whole=bool(resolved) and vram is None, **extra)
+                      whole=whole, **extra)
         self._settled.clear()
         self.leases[lease.id] = lease
         await self._clear_gpus(lease, drain)

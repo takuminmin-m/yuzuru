@@ -220,6 +220,7 @@ MCP の `instructions` とツールの説明で、学習は bash ではなく `t
 2. `yuzuru run` が `POST /yuzuru/leases` を呼ぶ。Broker は lease を `draining` で作る。
 3. Broker は、生成中の応答が終わるのを最大 `lease.drain_timeout`（既定 300 秒）待つ。次に GPU 上のモデルを解放し、実際に VRAM から消えるのを最大 `lease.unload_timeout`（既定 60 秒）待つ。消えなければ、ジョブのログに警告を出す。
 4. lease が GPU を丸ごと取るなら、管理下の Ollama をその GPU を隠して再起動する。
+   GPU を丸ごと取った lease があるあいだ、その GPU にはほかのジョブの lease を作らない（エラーを返す）。
 5. lease が `settling` になり、`yuzuru run` がジョブを起動する。ジョブには lease の GPU だけが見える。
 6. Waiter が lease の watch を作る。セッションが静かになったら、全モデルを解放する。
 7. ジョブの VRAM 使用量が `lease.settle_seconds` 安定すると、lease は `active` になる。予約する量が決まり、残りは LLM が使える。
