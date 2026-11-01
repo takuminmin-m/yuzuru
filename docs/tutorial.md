@@ -136,7 +136,7 @@ yuzuru、OpenCode、エージェント、uv の設定は `yuzuru init` がまと
 
 | 設定 | `init` の引数 | 意味 |
 |---|---|---|
-| `resources.gpus` | `--gpu`（番号か UUID、複数可。既定は全部） | ここに書いた GPU だけを、LLM にも学習にも使う。学習ジョブには `CUDA_VISIBLE_DEVICES` が自動で設定される |
+| `resources.gpus` | `--gpu`（番号か UUID、複数可。`--gpu 0,1` か `--gpu 0 --gpu 1`。既定は全部） | ここに書いた GPU だけを、LLM にも学習にも使う。学習ジョブには `CUDA_VISIBLE_DEVICES` が自動で設定される |
 | `tiers` | `--model`、`--ctx`（既定 65536） | モデル 1 つだけの `large`。モデルの既定は、yuzuru が前回 `large` に使ったもの（初めてなら `ollama list` で一番大きいもの）。`num_ctx` は 32k 以上にする（OpenCode はシステムプロンプトとツール定義だけで 2 万トークン近く送る） |
 | `ollama.manage: true` | | yuzuru が、上の GPU だけが見える専用の `ollama serve` を起動する。システムの `ollama.service`（:11434）は動いたままでよい。重みはシンボリックリンクで共有するので、ディスクは増えない |
 | `isolation.memory_max` | `--memory-max`（既定 80%） | エージェントと学習ジョブ 1 つあたりの RAM 上限。超えたプロセスだけが殺され、yuzuru や端末は無事 |
