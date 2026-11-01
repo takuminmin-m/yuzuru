@@ -6,9 +6,19 @@ keep free; yuzuru's own value only reached the process environment.
 
 import argparse
 import json
+import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 from .test_gpu_allowlist import FakeClient, call_run
+
+
+@pytest.fixture(autouse=True)
+def nvidia_smi_indices(monkeypatch):
+    # What NVML would say: nvidia-smi index -> UUID. GPU-9 is a GPU the jobs here never get.
+    monkeypatch.setenv("YUZURU_GPU_INDEX", "0=GPU-0,1=GPU-1,2=GPU-9")
 
 # Tries each way of changing CUDA_VISIBLE_DEVICES and records what the job ends up with.
 PROBE = r"""
@@ -51,7 +61,7 @@ def test_job_cannot_leave_its_gpus(tmp_path, monkeypatch):
     args, out = job(tmp_path)
     call_run(args, FakeClient({"id": "abc", "gpus": [], "visible": ["GPU-0", "GPU-1"]}))
     assert json.loads(out.read_text()) == {
-        "start": "GPU-0,GPU-1", "other": "refused", "index": "refused", "putenv": "refused",
+        "start": "GPU-0,GPU-1", "other": "refused", "index": "GPU-0", "putenv": "refused",
         "narrow": "GPU-1", "delete": "GPU-1", "clear": ["CUDA_VISIBLE_DEVICES"], "restored": True, "hide": "-1",
     }
 
@@ -166,3 +176,65 @@ def test_job_started_from_the_agents_shell_gets_its_gpus(tmp_path, monkeypatch):
     call_run(args, FakeClient({"id": "abc", "gpus": ["GPU-0"]}))
     seen = json.loads(out.read_text())
     assert seen["start"] == "GPU-0" and seen["other"] == "refused"
+
+
+# Numbers are nvidia-smi indices, so a value means the same GPU with or without the pin.
+
+def started_with(tmp_path, value, lease):
+    args, out = job(tmp_path, "env", f"CUDA_VISIBLE_DEVICES={value}")
+    call_run(args, FakeClient(lease))
+    return json.loads(out.read_text())["start"]
+
+
+def test_index_set_before_python_starts_becomes_its_uuid(tmp_path, capfd):
+    # `accelerate launch --gpu_ids 1` hands its children CUDA_VISIBLE_DEVICES=1.
+    two = {"id": "abc", "gpus": ["GPU-0", "GPU-1"]}
+    assert started_with(tmp_path, "1", two) == "GPU-1"
+    assert started_with(tmp_path, "1,0", two) == "GPU-1,GPU-0"
+    assert started_with(tmp_path, "0,GPU-1", two) == "GPU-0,GPU-1"
+    assert "outside" not in capfd.readouterr().err
+    # nvidia-smi's GPU 0 is not this job's: replaced, as any GPU outside the lease is.
+    assert started_with(tmp_path, "0", {"id": "abc", "gpus": ["GPU-1"]}) == "GPU-1"
+    assert "CUDA_VISIBLE_DEVICES=0 is outside this job's GPUs; using GPU-1" in capfd.readouterr().err
+
+
+PIN = Path(__file__).resolve().parents[1] / "src" / "yuzuru" / "gpu_pin"
+
+
+def pinned_python(code, pinned, value, index="0=GPU-0,1=GPU-1,2=GPU-9"):
+    """Python with only the pin: no yuzuru server, client or config."""
+    env = {"PYTHONPATH": str(PIN), "YUZURU_CUDA_VISIBLE_DEVICES": pinned, "CUDA_VISIBLE_DEVICES": value,
+           "YUZURU_GPU_INDEX": index}
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.split("\n")[:-1]
+
+
+def test_index_outside_the_job_or_unknown_is_refused():
+    code = ("import os\nfor v in ('1', '2', '7'):\n    try:\n        os.environ['CUDA_VISIBLE_DEVICES'] = v\n"
+            "        print(v, os.environ['CUDA_VISIBLE_DEVICES'])\n"
+            "    except RuntimeError:\n        print(v, 'refused')\n")
+    assert pinned_python(code, "GPU-0,GPU-1", "GPU-0,GPU-1") == ["1 GPU-1", "2 refused", "7 refused"]
+
+
+def test_index_without_nvml_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUZURU_GPU_INDEX", "")  # no GPU numbering known
+    assert started_with(tmp_path, "1", {"id": "abc", "gpus": ["GPU-1"]}) == "GPU-1"  # replaced, not trusted
+    args, out = job(tmp_path)
+    call_run(args, FakeClient({"id": "abc", "gpus": ["GPU-0", "GPU-1"]}))
+    assert json.loads(out.read_text())["index"] == "refused"
+
+
+def test_pinned_by_index_takes_the_same_gpu_by_uuid():
+    # Without a server the pin is resources.gpus as written, e.g. "1".
+    code = "import os; os.environ['CUDA_VISIBLE_DEVICES'] = 'GPU-1'; print(os.environ['CUDA_VISIBLE_DEVICES'])"
+    assert pinned_python(code, "1", "1") == ["GPU-1"]
+
+
+def test_pin_works_without_yuzuru():
+    # Any project: PYTHONPATH and the allowed GPUs are all it needs. A launcher that hands its
+    # children a plain dict (as accelerate does) is caught when the child starts.
+    child = "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"
+    code = ("import os, subprocess, sys\nprint(os.environ['CUDA_VISIBLE_DEVICES'], flush=True)\n"
+            f"subprocess.run([sys.executable, '-c', {child!r}], env=dict(os.environ, CUDA_VISIBLE_DEVICES='0'))\n")
+    assert pinned_python(code, "GPU-0,GPU-1", "1") == ["GPU-1", "GPU-0"]

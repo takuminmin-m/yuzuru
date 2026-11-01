@@ -85,6 +85,7 @@ async def test_lease_endpoint_tells_job_which_gpus_to_see(cfg, world, http):
         r = await c.post("/yuzuru/leases", json={"pid": os.getpid(), "label": "train"})
         assert r.status_code == 200
         assert r.json()["gpus"] == [] and r.json()["visible"] == ["GPU-1"]
+        assert r.json()["devices"] == [{"uuid": "GPU-1", "index": 1, "name": "Fake 1"}]
         status = (await c.get("/yuzuru/status")).json()
         assert [g["uuid"] for g in status["gpus"]] == ["GPU-1"]
         assert status["gpu_allowlist"] == ["GPU-1"]
@@ -129,6 +130,14 @@ def test_run_limits_job_to_allowed_gpus_without_gpu_flag(tmp_path, monkeypatch):
     out = tmp_path / "seen"
     call_run(run_args(tmp_path, out), FakeClient({"id": "abc", "gpus": [], "visible": ["GPU-0"]}))
     assert out.read_text() == "GPU-0"
+
+
+def test_run_says_which_nvidia_smi_gpu_each_cuda_device_is(tmp_path, capfd):
+    lease = {"id": "abc", "gpus": ["GPU-0", "GPU-1"], "visible": ["GPU-0", "GPU-1"],
+             "devices": [{"uuid": "GPU-0", "index": 0, "name": "RTX 3050"},
+                         {"uuid": "GPU-1", "index": 1, "name": "RTX 3060"}]}
+    call_run(run_args(tmp_path, tmp_path / "seen"), FakeClient(lease))
+    assert "lease abc: cuda:0 = GPU 0 (RTX 3050), cuda:1 = GPU 1 (RTX 3060)" in capfd.readouterr().err
 
 
 async def test_cpu_lease_endpoint_hides_every_gpu(cfg, world, http):

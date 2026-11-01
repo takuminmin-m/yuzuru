@@ -154,6 +154,7 @@ yuzuru run --log train.log -- python train.py
 ただし、その後の最初のステップや評価で使用量が増えると、LLM がすでに隣に載っていて OOM になることがあります。
 
 ジョブには `CUDA_VISIBLE_DEVICES` が lease の GPU の UUID で設定されます。
+GPU は `nvidia-smi` の順に並び、ジョブの中で `CUDA_VISIBLE_DEVICES=1` や `accelerate launch --gpu_ids 1` と書くと `nvidia-smi` の 1 番を指します（lease の外の GPU は使えません）。
 `yuzuru serve` に繋がらないときも、ジョブはそのまま実行されます（lease なし）。
 
 ### GPU メモリを先に確保する（`yuzuru reserve`）

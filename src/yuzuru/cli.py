@@ -154,6 +154,10 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
         if visible := lease.get("visible") or lease["gpus"]:
             # UUIDs are unambiguous regardless of CUDA_DEVICE_ORDER.
             pin_gpus(env, ",".join(visible))
+        if devices := lease.get("devices"):
+            # The job counts its GPUs from 0; say which nvidia-smi GPU each one is.
+            print(f"[yuzuru] lease {lease_id}: " + ", ".join(
+                f"cuda:{i} = GPU {d['index']} ({d['name']})" for i, d in enumerate(devices)), file=sys.stderr)
         env["YUZURU_LEASE"] = lease_id
         if args.cpu:
             print(f"[yuzuru] lease {lease_id}: CPU only (no GPU visible)", file=sys.stderr)
