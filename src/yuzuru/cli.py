@@ -22,6 +22,16 @@ from .config import GB, MB, Config, load_config
 UNITS = {"": GB, "b": 1, "k": 1024, "m": MB, "g": GB, "t": 1024 * GB}
 
 
+class GpuList(argparse.Action):
+    """`--gpu`: repeatable and comma-separated (`--gpu 0,1` = `--gpu 0 --gpu 1`), as in yuzuru_train's `gpus`."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        got = [g.strip() for g in values.split(",") if g.strip()]
+        if not got:
+            parser.error(f"{option_string}: no GPU given")
+        setattr(namespace, self.dest, (getattr(namespace, self.dest) or []) + got)
+
+
 def parse_size(text: str | None) -> int | None:
     """'10G', '512M', '12gb', '8' (GiB) -> bytes."""
     if not text:
@@ -277,7 +287,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("init", help="set up a task directory for an agent: yuzuru.yaml, opencode.json, "
                        "AGENTS.md, .gitignore, uv venv, git")
     p.add_argument("dir", nargs="?", default=".", help="task directory (default: here; created if missing)")
-    p.add_argument("--gpu", action="append", help="GPU index or UUID to use (repeatable; default: all)")
+    p.add_argument("--gpu", action=GpuList, help="GPU index or UUID to use (repeatable or comma-separated; default: all)")
     p.add_argument("--model", help="Ollama model for the agent (default: the largest installed)")
     p.add_argument("--port", type=int, default=11435, help="yuzuru's port; one per task run in parallel")
     p.add_argument("--ctx", type=int, default=65536, help="context length (default 65536)")
@@ -289,7 +299,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--force", action="store_true", help="replace existing files (keeping a .bak)")
 
     p = sub.add_parser("run", help="run a training job under a GPU lease")
-    p.add_argument("--gpu", action="append", help="GPU index or UUID to dedicate (repeatable)")
+    p.add_argument("--gpu", action=GpuList, help="GPU index or UUID to dedicate (repeatable or comma-separated)")
     p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measured once the job's use settles; "
                    "a job that grows later, e.g. at its first evaluation, should give it)")
     p.add_argument("--cpu", action="store_true",
@@ -307,7 +317,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
     p = sub.add_parser("reserve", help="force-reserve VRAM / GPUs now (LLM is moved out, memory is held)")
-    p.add_argument("--gpu", action="append", help="GPU index or UUID (repeatable); default: the only GPU")
+    p.add_argument("--gpu", action=GpuList, help="GPU index or UUID (repeatable or comma-separated); default: the only GPU")
     p.add_argument("--vram", help="amount, e.g. 10G (default: everything free on the chosen GPUs)")
     p.add_argument("--for", dest="ttl", help="expire after e.g. 30m, 2h (default: until released)")
     p.add_argument("--soft", action="store_true", help="only subtract from the LLM budget; do not allocate")
