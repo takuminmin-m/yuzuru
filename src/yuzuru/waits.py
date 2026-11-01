@@ -355,10 +355,18 @@ class Waiter:
                 held = self._held.pop(ev.session, [(ev, w)])
             # The agent kept working after the job ended and started another one: it has
             # seen this outcome, and the new job's own resume will continue the session.
-            if any(x.session == ev.session for x in self.watches.values()):
-                log.info("session %s moved on to another job; not resuming for %s",
-                         ev.session, ", ".join(e.label for e, _ in held))
-                return
+            # Not so for a job that ended after the newest running one started (HPO run 3: of two
+            # jobs started together, one failed in 4 s and the agent ended its turn unaware).
+            running = [x.created for x in self.watches.values() if x.session == ev.session]
+            if running:
+                unseen = [(e, x) for e, x in held if e.ts > max(running)]
+                if not unseen:
+                    log.info("session %s moved on to another job; not resuming for %s",
+                             ev.session, ", ".join(e.label for e, _ in held))
+                    return
+                log.info("session %s moved on to another job, but %d ended after it started; resuming",
+                         ev.session, len(unseen))
+                held = unseen
             earlier = [e for e, _ in held[:-1]]
             ev, w = held[-1]
         if not self.watches:

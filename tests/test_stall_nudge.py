@@ -143,3 +143,43 @@ async def test_a_job_ending_while_a_resumed_turn_starts_does_not_resume_it_again
     go.touch()
     await wait_for(lambda: len(turns(out)) == 2)
     assert "finished" in turns(out)[1][1]
+async def lease_for(broker, waiter, tmp_path):
+    lease = await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, session="s1",
+                                      cwd=str(tmp_path), resume=True, note="")
+    waiter.watch_lease(lease)
+    return lease
+
+
+async def test_a_job_that_fails_after_the_next_one_started_is_reported(cfg, world, http, tmp_path):
+    # Two jobs started in one turn; one fails at once and the agent ends its turn unaware (HPO run 3).
+    out, go = agent(cfg, tmp_path, nudges=0)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    reply(router, "tool_calls")  # the agent is in its turn
+    running = await lease_for(broker, waiter, tmp_path)
+    failed = await lease_for(broker, waiter, tmp_path)
+    await asyncio.sleep(0.05)
+    await broker.release_lease(failed.id, rc=1)
+    await asyncio.sleep(0.2)
+    assert turns(out) == []  # held while the turn goes on
+    reply(router)  # the turn ends
+    await wait_for(lambda: len(turns(out)) == 1)
+    assert "code 1" in turns(out)[0][1]
+    go.touch()
+    await broker.release_lease(running.id, rc=0)
+
+
+async def test_a_job_that_ended_before_the_next_one_started_is_not_reported_again(cfg, world, http, tmp_path):
+    out, go = agent(cfg, tmp_path, nudges=0)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    reply(router, "tool_calls")
+    failed = await lease_for(broker, waiter, tmp_path)
+    await broker.release_lease(failed.id, rc=1)
+    await asyncio.sleep(0.05)
+    running = await lease_for(broker, waiter, tmp_path)  # it read the failure and started the next job
+    reply(router)
+    await asyncio.sleep(1.5)
+    assert turns(out) == []
+    go.touch()
+    await broker.release_lease(running.id, rc=0)
