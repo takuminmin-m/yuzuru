@@ -209,7 +209,7 @@ MCP の `instructions` とツールの説明で、学習は bash ではなく `t
 
 - `yuzuru.yaml`（`templates/yuzuru.yaml` から）: `--gpu` の番号を `nvidia-smi` で UUID にして `resources.gpus` に書きます。モデルは `--model`、なければ yuzuru が前回 `large` に使ったもの（派生モデル `yuzuru-large:*` の digest から元のモデルを引く）、それもなければ一番大きいモデルです。`ollama.manage: true`、`isolation.memory_max`、`port` に加え、`resume.command` は出力を `<dir>/.yuzuru/resume.log` に追記する形にします。カレントディレクトリの `yuzuru.yaml` は `~/.config/yuzuru/config.yaml` より先に読まれるので、課題ディレクトリで動かした yuzuru はこの設定を使います
 - `opencode.json`: `opencode.py` と同じプロバイダと MCP の設定に、`disabled_providers: ["opencode"]` と、無人実行向けの権限の許可リスト（`scaffold.py` の `PERMISSION`）を足したもの
-- `AGENTS.md`（`templates/AGENTS.md` から）: `uv run python` を使う、GPU の処理は `yuzuru_train`（`vram` 必須）で動かしてターンを終える、学習のたびに設定と検証データの指標を `RESULTS.md` に 1 行足す、課題の `README.md` の終わる条件を確かめてから終える、など。採点のある課題を前提にしていません
+- `AGENTS.md`（`templates/AGENTS.md` から）: `uv run python` を使う、GPU の処理は `yuzuru_train`（`vram` 必須）で動かしてターンを終える、学習のたびに設定と検証データの指標を `RESULTS.md` に 1 行足す、前処理を学習と推論で共有する、推論スクリプトを検証データにも走らせて指標が学習ログと合うか確かめる、課題の `README.md` の終わる条件を確かめてから終える、など。採点のある課題を前提にしていません
 - `.gitignore` への追記、`uv venv` と `--packages` の導入（`pyproject.toml` があれば `uv sync`、`requirements.txt` があればそれも入れる）、リポジトリでなければ `git init` と最初の commit
 
 ## 学習ジョブの流れ
