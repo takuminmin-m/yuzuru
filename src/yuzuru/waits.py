@@ -11,13 +11,14 @@ whole conversation on that turn, so the context comes back with it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import subprocess
 import sys
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,7 @@ class Watch:
     suspend: bool = True
     resume: bool = True
     created: float = field(default_factory=time.time)
+    repeats: int = 0  # `wait` calls on it after the first
 
 
 @dataclass
@@ -66,6 +68,7 @@ class Event:
     ts: float = field(default_factory=time.time)
     resumed: bool = False
     resume_error: str | None = None
+    delivered: bool = False  # answered a held `wait` call: the agent has it already
 
 
 def outside_env() -> dict[str, str]:
@@ -159,6 +162,7 @@ class Waiter:
         # then the router does not see the turn (the client starts, the model loads), and a second job ending
         # there would resume the session a second time (HPO run 2: two clients 10 s apart).
         self.resuming: dict[str, tuple[asyncio.subprocess.Process, int, float]] = {}
+        self.holding: Counter[str] = Counter()  # session -> `wait` calls being held
         broker.on_lease_end.append(self._lease_ended)
 
     # ---------------------------------------------------------------- watches
@@ -250,6 +254,26 @@ class Waiter:
                 return False
         return True
 
+    async def hold(self, w: Watch, seconds: float) -> list[Event]:
+        """Hold a `wait` call on `w` up to `seconds`, until a job of w's session ends; the events
+        of those that did (w's own, or another job the agent would want to know about: a GPU freed).
+
+        Their outcome goes back in the call, so they do not resume the session afterwards.
+        """
+        session = w.session or ""
+        mine = {x.id for x in self.watches.values() if x.session == w.session} | {w.id}
+        end = time.time() + seconds
+        self.holding[session] += 1
+        try:
+            while mine <= set(self.watches) and (left := end - time.time()) > 0:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._changed.wait(), left)
+        finally:
+            self.holding[session] -= 1
+            if self.holding[session] <= 0:
+                del self.holding[session]
+        return [e for e in self.events if e.watch in mine and e.delivered]
+
     def _finish(self, w: Watch, rc: int | None) -> None:
         self.watches.pop(w.id, None)
         ev = Event(
@@ -260,11 +284,13 @@ class Waiter:
         self._next += 1
         if not self.watches:
             self.suspend_pending = False
+        if w.session and self.holding[w.session]:
+            ev.delivered = True  # a held `wait` call of the session reports it
         self.events.append(ev)
         self._changed.set()
         self._changed = asyncio.Event()
         log.info("event %d: %s ended (rc=%s) after %.0fs", ev.id, w.label, rc, ev.duration)
-        if w.resume and w.session and self.cfg.resume.enabled:
+        if w.resume and w.session and self.cfg.resume.enabled and not ev.delivered:
             self._spawn(self.resume(ev, w))
         elif not self.watches:
             self._spawn(self.unsuspend())
@@ -374,7 +400,7 @@ class Waiter:
         """
         await proc.wait()
         # `opencode run` can exit while the turn goes on in the OpenCode service.
-        while self.router.in_turn(session, self.cfg.resume.turn_idle_seconds):
+        while self.in_turn(session):
             await asyncio.sleep(1.0)
         if self.latest_resume.get(session) is not proc:
             return
@@ -430,9 +456,11 @@ class Waiter:
         log.info("session %s finished its turn after %.0fs", session, time.time() - start)
 
     def in_turn(self, session: str | None) -> bool:
-        """The session's turn is running, counting one yuzuru resumed that has not finished a reply yet."""
+        """The session's turn is running, counting one yuzuru resumed that has not finished a reply yet,
+        and one holding a `wait` call (a long hold sends nothing to the LLM, so the router alone would
+        call the turn over)."""
         idle = self.cfg.resume.turn_idle_seconds
-        if self.router.in_turn(session, idle):
+        if self.router.in_turn(session, idle) or (session and self.holding[session]):
             return True
         started = self.resuming.get(session) if session else None
         if started is None:

@@ -225,12 +225,21 @@ class MCPServer:
             session = st.router.header_session(headers) or st.router.last_session
             if not (args.get("pid") or args.get("lease")):
                 raise ValueError("give pid or lease")
+            before = set(st.waiter.watches)
             w = await st.waiter.add(
                 session=session, pid=int(args["pid"]) if args.get("pid") else None, lease=args.get("lease"),
                 label=f"pid {args['pid']}" if args.get("pid") else f"lease {args['lease']}",
                 note=args.get("note") or "", log=args.get("log"), cwd=args.get("cwd"),
                 suspend=_device(args) != "cpu",
             )
+            if w.id in before:
+                w.repeats += 1
+                r = st.cfg.resume
+                seconds = r.repeat_wait_seconds
+                if seconds > 0 and w.repeats > 1:  # it ignored the first hold's "end your turn"
+                    seconds = max(seconds, r.repeat_wait_max_seconds)
+                if seconds > 0:
+                    return await _held_wait(st, w, session, seconds)
             return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
                     f"turn now: session {session} is resumed automatically when the process exits.")
 
@@ -272,6 +281,30 @@ class MCPServer:
                 log.warning("tool %s failed: %s", name, e)
                 return _ok(mid, {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True})
         return _error(mid, -32601, f"method not found: {method}")
+
+
+
+def _span(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
+async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> str:
+    """A repeated `wait`: the agent is polling. Hold the call instead of answering at once."""
+    ended = await st.waiter.hold(w, seconds)
+    if not ended:
+        return (f"still running: you already wait for it ({w.id}), so this call waited {_span(seconds)} "
+                f"first{'' if w.repeats == 1 else ' (you called wait again instead of ending your turn)'}. "
+                "Checking again keeps the LLM busy (and any free GPU idle). End your turn now: session "
+                f"{session} is resumed automatically with the outcome when it exits.")
+    parts = []
+    for ev in ended:
+        code = f" (exit code {ev.rc})" if ev.rc is not None else ""
+        parts.append(f"{ev.label} ended{code} after {ev.duration / 60:.1f} min. Last lines of "
+                     f"{ev.log or 'its log'}:\n```\n{ev.log_tail[-2000:]}\n```")
+    if w.id in st.waiter.watches:
+        parts.append(f"{w.label} is still running.")
+    parts.append("Start the next job if there is one, then end your turn.")
+    return "\n\n".join(parts)
 
 
 def _ok(mid: Any, result: dict[str, Any]) -> dict[str, Any]:
