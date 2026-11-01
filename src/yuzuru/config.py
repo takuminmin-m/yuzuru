@@ -202,6 +202,10 @@ class ResumeConfig:
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
     # the process ends, before answering. Below the MCP clients' request timeout (60 s); 0: answer at once.
     repeat_wait_seconds: float = 45.0
+    # Called again after that (HPO run 3's agent ignored "end your turn" and waited 81 times, one turn
+    # lasting 3.4 hours), hold until a job of the session ends, up to this long. OpenCode allows a tool
+    # call 12 hours (mcp.timeout.execution); lower it for a client with a shorter one, e.g. to 45.
+    repeat_wait_max_seconds: float = 3600.0
 
 
 @dataclass
