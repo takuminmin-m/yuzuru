@@ -126,3 +126,20 @@ async def test_turn_still_running_in_the_service_is_waited_for(cfg, world, http,
     reply(router)
     await asyncio.sleep(1.5)
     assert len(turns(out)) == 1  # three replies: it worked
+
+
+async def test_a_job_ending_while_a_resumed_turn_starts_does_not_resume_it_again(cfg, world, http, tmp_path):
+    # The resumed client has not sent a request yet (it starts, the model loads): the router sees no
+    # turn, but a second resume now would put two clients on the session (HPO run 2).
+    out, go = agent(cfg, tmp_path, nudges=0)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await job_ends(broker, waiter, tmp_path)
+    await wait_for(lambda: len(turns(out)) == 1)
+    await job_ends(broker, waiter, tmp_path, rc=0)
+    await asyncio.sleep(1.5)
+    assert len(turns(out)) == 1  # held for the turn that is starting
+    reply(router)
+    go.touch()
+    await wait_for(lambda: len(turns(out)) == 2)
+    assert "finished" in turns(out)[1][1]
