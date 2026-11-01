@@ -224,6 +224,9 @@ MCP の `instructions` とツールの説明で、学習は bash ではなく `t
 6. Waiter が lease の watch を作る。セッションが静かになったら、全モデルを解放する。
 7. ジョブの VRAM 使用量が `lease.settle_seconds` 安定すると、lease は `active` になる。予約する量が決まり、残りは LLM が使える。
 8. ジョブが終わると、`yuzuru run` が lease を返す。Broker は watch に終了を知らせる。
+   GPU を丸ごと取っていた lease なら、Ollama を全 GPU が見える状態で再起動する。このとき、最初のトークンをまだ返していない応答は待たない。
+   たとえば、ジョブが GPU を全部取っている間に LLM が CPU で長いプロンプトを処理していた場合、`drain_timeout` まで GPU が遊んでしまうからです。
+   再起動で切れた応答は、クライアントにはまだ何も届いていないので、yuzuru が再起動後の Ollama（GPU）に送り直す。トークンを返している途中の応答は、これまでどおり `drain_timeout` まで待つ。
 9. Waiter は、そのセッションのターンが終わっているのを確かめる（[ターンが続いている間は再開しない](#ターンが続いている間は再開しない)）。
 10. セッションのモデルを読み込み、`resume.command`（既定 `opencode run --session {session} {message}`）を `yuzuru-agent-*.scope` の中で起動する。OpenCode は会話の履歴をすべて送り直すので、文脈はそのまま戻る。
 11. ほかに lease がなければ、Broker は lease の前に載っていたモデルを読み込み直す（`lease.restore_after`）。
@@ -429,7 +432,7 @@ yuzuru が書き込むファイル（`state_dir`、既定 `~/.local/state/yuzuru
 | `settle_timeout` | `180` | 安定しなくても `active` にするまでの秒数 |
 | `settle_tolerance_mb` | `256` | 「安定」とみなす変動の幅 |
 | `headroom_mb` | `1024` | `active` のジョブが増える分として空けておく量 |
-| `drain_timeout` | `300` | lease の前に、生成中の応答を待つ秒数 |
+| `drain_timeout` | `300` | Ollama を止める前（lease の前、GPU を返したあとの再起動の前）に、生成中の応答を待つ秒数。GPU を返すときは、最初のトークンをまだ返していない応答は待たずに送り直す |
 | `unload_timeout` | `60` | 解放したモデルが VRAM から消えるのを待つ秒数 |
 | `restore_after` | `true` | ジョブの後に、前に載っていたモデルを読み込み直す |
 
