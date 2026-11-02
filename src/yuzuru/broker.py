@@ -23,6 +23,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from .catalog import Catalog, ModelSpec
@@ -350,6 +351,41 @@ class Broker:
             resolved[gpu.uuid] = gpu.index
         return sorted(resolved, key=resolved.__getitem__)
 
+    def pick_gpus(self, count: int, vram: int | None = None) -> list[str]:
+        """`count` GPUs no job holds, the most memory first (usually the fastest of a machine's GPUs)."""
+        if count < 1:
+            raise ValueError(f"gpu_count must be at least 1, not {count}")
+        self._update_leases()  # a job that has just ended no longer holds its GPU
+        for l in self.leases.values():
+            if l.kind == "job" and not l.cpu and not l.gpus:
+                raise ValueError(f"lease {l.id} ({l.label}, pid {l.pid}) may be on any GPU: wait for it to end, "
+                                 "or name the GPUs yourself")
+        taken = {g for l in self.leases.values() for g in l.gpus}
+        margin = self.cfg.resources.vram_margin_mb * MB
+        free = [g for g in self.snapshot.gpus
+                if g.uuid not in taken and (vram is None or g.total - margin >= vram)]
+        if len(free) < count:
+            raise ValueError(f"{count} free GPU(s) needed but {len(free)} available. {self.gpu_usage_line()}. "
+                             "End your turn: you are resumed when a job ends, then start this one")
+        return [g.uuid for g in sorted(free, key=lambda g: (-g.total, g.index))[:count]]
+
+    def gpu_usage(self) -> list[dict[str, Any]]:
+        """What runs on each GPU right now: leases naming it and jobs that may be on any GPU."""
+        self._update_leases()
+        out = []
+        for g in self.snapshot.gpus:
+            jobs = [l for l in self.leases.values() if not l.cpu and
+                    (g.uuid in l.gpus or (l.kind == "job" and not l.gpus))]
+            out.append({"index": g.index, "name": g.name, "uuid": g.uuid, "jobs": [
+                {"id": l.id, "pid": l.pid, "label": Path(l.log).name if l.log else l.label} for l in jobs]})
+        return out
+
+    def gpu_usage_line(self) -> str:
+        """One line for the agent, e.g. `GPU 1 (RTX 3060): exp7.log (pid 12); GPU 0 (RTX 3050): free`."""
+        return "GPUs now: " + "; ".join(
+            f"GPU {u['index']} ({u['name']}): " + (", ".join(f"{j['label']} (pid {j['pid']})" for j in u["jobs"]) or "free")
+            for u in self.gpu_usage())
+
     def devices(self, uuids: list[str]) -> list[dict[str, Any]]:
         """nvidia-smi index and name of each of `uuids`, in their order (the job's cuda:N)."""
         by_uuid = {g.uuid: g for g in self.snapshot.gpus}
@@ -393,10 +429,12 @@ class Broker:
 
     async def create_lease(
         self, pid: int, label: str, gpus: list[str], vram: int | None, session: str | None = None,
-        drain: bool = True, **extra: Any,
+        drain: bool = True, gpu_count: int | None = None, **extra: Any,
     ) -> Lease:
+        if gpus and gpu_count:
+            raise ValueError("give the GPUs or how many, not both")
         if extra.get("cpu"):
-            if gpus or vram:
+            if gpus or vram or gpu_count:
                 raise ValueError("a CPU-only job takes no --gpu or --vram")
             # Nothing to make room for: no drain, no unload, no settling.
             lease = Lease(id=uuid.uuid4().hex[:8], pid=pid, label=label, gpus=[], vram=None, session=session,
@@ -405,7 +443,8 @@ class Broker:
             log.info("lease %s (%s, pid %d, CPU only) created", lease.id, label, pid)
             return lease
         await self.refresh()
-        resolved = self._resolve_gpus(gpus)
+        # No await from here to the lease being recorded: two jobs started together get different GPUs.
+        resolved = self._resolve_gpus(self.pick_gpus(gpu_count, vram) if gpu_count else gpus)
         whole = bool(resolved) and vram is None
         self._update_leases()  # a job that has just ended no longer holds its GPU
         for other in self.leases.values():
@@ -679,6 +718,7 @@ class Broker:
             "budget": asdict(b),
             "loaded": [asdict(m) | {"inflight": self.inflight[m.name]} for m in self.loaded],
             "leases": [asdict(l) | {"grown": l.grown} for l in self.leases.values()],
+            "gpu_usage": self.gpu_usage(),
             "tiers": {
                 name: {
                     "model": s.base,

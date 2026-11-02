@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import os
 import subprocess
 import sys
 import time
@@ -23,7 +25,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__, scope
-from .waits import outside_env
+from .waits import outside_env, tail
 
 log = logging.getLogger("yuzuru.mcp")
 
@@ -49,6 +51,9 @@ def _device(args: dict[str, Any]) -> str:
     return device
 
 
+PLACEMENT_WAIT = 10.0  # seconds for a started job to get its lease
+
+
 def gb(n: float) -> str:
     return f"{n / 2**30:.1f} GB"
 
@@ -67,7 +72,12 @@ def format_status(s: dict[str, Any]) -> str:
         lines.append("Loaded: " + ", ".join(f"{m['name']} ({gb(m['size_vram'])} GPU)" for m in s["loaded"]))
     for l in s["leases"]:
         use = "CPU only" if l.get("cpu") else f"using +{gb(l['grown'])}"
-        lines.append(f"Lease {l['id']}: {l['label']} pid {l['pid']} {l['state']}, {use}")
+        index = {g["uuid"]: g["index"] for g in s["gpus"]}
+        where = "" if l.get("cpu") else " on " + (", ".join(f"GPU {index.get(g, g)}" for g in l["gpus"]) or "any GPU")
+        lines.append(f"Lease {l['id']}: {l['label']} pid {l['pid']} {l['state']}{where}, {use}")
+    if len(s["gpus"]) > 1:
+        free = [f"GPU {u['index']} ({u['name']})" for u in s["gpu_usage"] if not u["jobs"]]
+        lines.append("Free GPUs: " + (", ".join(free) or "none"))
     return "\n".join(lines)
 
 
@@ -76,6 +86,26 @@ class MCPServer:
         self.st = state
         self.tools: dict[str, tuple[dict[str, Any], Handler]] = {}
         self._register()
+
+    async def _placement(self, pid: int, log_path: str) -> str:
+        """Which GPUs the job just started got. The job asks for its lease itself, so wait for that: a
+        refusal (no free GPU) would otherwise only reach its log, and nothing resumes the session."""
+        broker = self.st.broker
+        deadline = time.monotonic() + PLACEMENT_WAIT
+        while True:
+            if lease := next((l for l in broker.leases.values() if l.pid == pid), None):
+                devices = broker.devices(broker.visible_gpus(lease))
+                job = ", ".join(f"cuda:{i} = GPU {d['index']} ({d['name']})" for i, d in enumerate(devices))
+                return f"\nThe job sees: {job}\n{broker.gpu_usage_line()}"
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                raise RuntimeError(f"the job did not start:\n{tail(log_path, None, 5)}") from None
+            except PermissionError:
+                pass
+            if time.monotonic() >= deadline:
+                return ""
+            await asyncio.sleep(0.1)
 
     def tool(self, name: str, description: str, properties: dict[str, Any], required: list[str] | None = None):
         def deco(fn: Handler) -> Handler:
@@ -132,6 +162,7 @@ class MCPServer:
             "train",
             "Start a training / fine-tuning job in the background. For a GPU job (the default) yuzuru first moves "
             "the local LLM out of GPU memory and keeps `vram` free for the job; the LLM may use the rest. "
+            "With several GPUs, yuzuru puts the job on a free GPU of its own (set gpu_count for more than one). "
             "With device 'cpu' the job sees no GPU, the LLM is left alone and the job yields CPU to it. "
             "Returns the PID and log file; read the log to follow progress.",
             {
@@ -139,9 +170,14 @@ class MCPServer:
                 "cwd": {"type": "string", "description": "absolute working directory (the project root)"},
                 "device": {"type": "string", "enum": ["gpu", "cpu"],
                            "description": "'cpu' for a job that uses no GPU (default 'gpu')"},
-                "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional)"},
+                "gpu_count": {"type": "integer", "description": "how many whole GPUs the job needs; yuzuru picks "
+                              "free ones, the fastest first (default 1 when there are several GPUs). Use 2 for "
+                              "`accelerate launch --multi_gpu --num_processes 2`"},
+                "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional; "
+                         "rarely needed, prefer gpu_count)"},
                 "vram": {"type": "string", "description": "VRAM the job needs at its peak, e.g. '6G' (required for "
-                         "a GPU job unless `gpus` dedicates whole GPUs to it)"},
+                         "a GPU job when the machine has one GPU; with several, the job gets one free GPU and the "
+                         "LLM may use the rest of it)"},
                 "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
                 "resume_when_done": {"type": "boolean", "description": "free the LLM while the job runs and "
                                      "resume this session when it ends (default true); end your turn after starting"},
@@ -161,9 +197,16 @@ class MCPServer:
                     f"the task's time for new GPU jobs ended at {st.cfg.resume.until} (resume.until): do not start "
                     "another experiment. Finish with what you have: write up RESULTS.md and the deliverables the "
                     "README asks for. Inference for them can run with device 'cpu'")
-            if cpu and (args.get("gpus") or args.get("vram")):
-                raise ValueError("device 'cpu' takes no gpus or vram")
-            if not cpu and not (args.get("gpus") or args.get("vram")):
+            count = args.get("gpu_count")
+            if cpu and (args.get("gpus") or args.get("vram") or count):
+                raise ValueError("device 'cpu' takes no gpus, gpu_count or vram")
+            if count and (args.get("gpus") or args.get("vram")):
+                raise ValueError("gpu_count takes whole GPUs that yuzuru picks: drop gpus and vram")
+            # Not left to the agent: HPO run 4 left the 3050 idle for hours, DDP run 2 stacked three jobs on both GPUs.
+            several = len(st.broker.snapshot.gpus) > 1
+            if not cpu and not count and not args.get("gpus") and several:
+                count = 1
+            if not cpu and not (args.get("gpus") or args.get("vram") or count):
                 # Measured from the job's first seconds (model loaded, no step taken yet), the lease is too
                 # small: the LLM moves back into the rest and the job runs out of memory when it grows.
                 raise ValueError(
@@ -180,6 +223,8 @@ class MCPServer:
                 argv.append("--cpu")
             for g in filter(None, (x.strip() for x in (args.get("gpus") or "").split(","))):
                 argv += ["--gpu", g]
+            if count:
+                argv += ["--gpu-count", str(int(count))]
             if args.get("vram"):
                 argv += ["--vram", args["vram"]]
             session = st.router.header_session(headers) or st.router.last_session
@@ -199,6 +244,8 @@ class MCPServer:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+            if not cpu:
+                text += await self._placement(info["pid"], info["log"])
             if resume:
                 text += ("\n" + ("The local LLM stays loaded (CPU-only job)." if cpu else
                                  "The local LLM is released while the job runs.") +

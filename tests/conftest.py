@@ -233,3 +233,9 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(autouse=True)
+def no_placement_wait(monkeypatch):
+    """Fake jobs never ask for a lease: `train` should not wait for one."""
+    monkeypatch.setattr("yuzuru.mcp.PLACEMENT_WAIT", 0)

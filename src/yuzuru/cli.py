@@ -148,15 +148,16 @@ def cmd_run(args: argparse.Namespace, client: Client) -> None:
     job = {"pid": os.getpid(), "session": session, "cwd": os.getcwd(),
            "log": str(Path(args.log).resolve()) if args.log else None,
            "resume": args.resume, "note": args.note, "cpu": args.cpu}
-    if args.cpu and (args.gpu or args.vram or args.use):
-        sys.exit("yuzuru run: --cpu takes no --gpu, --vram or --use")
+    if args.cpu and (args.gpu or args.gpu_count or args.vram or args.use):
+        sys.exit("yuzuru run: --cpu takes no --gpu, --gpu-count, --vram or --use")
     try:
         if args.use:
             lease = client.call("POST", f"/yuzuru/leases/{args.use}/handover", job, timeout=60)
         else:
             lease = client.call(
                 "POST", "/yuzuru/leases",
-                job | {"label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [], "vram": parse_size(args.vram)},
+                job | {"label": args.label or Path(cmd[0]).name, "gpus": args.gpu or [], "gpu_count": args.gpu_count,
+                       "vram": parse_size(args.vram)},
                 timeout=900,  # the server drains running generations first (lease.drain_timeout)
             )
         lease_id = lease["id"]
@@ -250,7 +251,8 @@ def print_status(s: dict[str, Any]) -> None:
     if s["leases"]:
         print("\nLeases:")
         for l in s["leases"]:
-            where = "CPU only" if l.get("cpu") else ",".join(g[:12] for g in l["gpus"]) or "any GPU"
+            index = {g["uuid"]: g["index"] for g in s["gpus"]}
+            where = "CPU only" if l.get("cpu") else ",".join(f"GPU{index.get(g, g[:12])}" for g in l["gpus"]) or "any GPU"
             if l["kind"] == "reservation":
                 left = f", {int((l['expires'] - time.time()) / 60)} min left" if l["expires"] else ""
                 print(f"  {l['id']} {l['label']:<20} {'held' if l['hard'] else 'soft':<13} {gb(l['vram'] or 0)} on {where}{left}")
@@ -300,6 +302,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("run", help="run a training job under a GPU lease")
     p.add_argument("--gpu", action=GpuList, help="GPU index or UUID to dedicate (repeatable or comma-separated)")
+    p.add_argument("--gpu-count", type=int, help="how many GPUs: yuzuru picks free ones, the most memory first")
     p.add_argument("--vram", help="VRAM to reserve, e.g. 10G (default: measured once the job's use settles; "
                    "a job that grows later, e.g. at its first evaluation, should give it)")
     p.add_argument("--cpu", action="store_true",

@@ -51,7 +51,7 @@ open(sys.argv[1], "w").write(json.dumps(seen))
 def job(tmp_path, *prefix, config=None, cpu=False):
     out = tmp_path / "seen.json"
     cmd = ["--", *prefix, sys.executable, "-c", PROBE, str(out)]
-    args = argparse.Namespace(cmd=cmd, detach=False, log=None, session=None, resume=False, note="",
+    args = argparse.Namespace(gpu_count=None, cmd=cmd, detach=False, log=None, session=None, resume=False, note="",
                               use=None, label=None, gpu=None, vram=None, config=config, cpu=cpu)
     return args, out
 

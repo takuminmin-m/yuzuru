@@ -96,7 +96,7 @@ async def test_lease_endpoint_tells_job_which_gpus_to_see(cfg, world, http):
 
 def run_args(tmp_path, out, config=None, cpu=False):
     code = f"import os; open({str(out)!r}, 'w').write(os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>'))"
-    return argparse.Namespace(
+    return argparse.Namespace(gpu_count=None,
         cmd=["--", sys.executable, "-c", code], detach=False, log=None, session=None, resume=False, note="",
         use=None, label=None, gpu=None, vram=None, config=config, cpu=cpu,
     )

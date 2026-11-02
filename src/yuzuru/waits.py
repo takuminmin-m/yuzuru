@@ -338,6 +338,8 @@ class Waiter:
             parts.append(f"Your note for this moment: {ev.note}")
         if ev.log_tail:
             parts.append(f"Last lines of {ev.log}:\n```\n{ev.log_tail}\n```")
+        if len(self.broker.snapshot.gpus) > 1:
+            parts.append(self.broker.gpu_usage_line())
         parts.append("Continue the task from here.")
         return "\n\n".join(parts)
 
@@ -427,7 +429,10 @@ class Waiter:
                         "continuing it (%d/%d)", session, left / 60, done + 1, limit)
             if not self.watches and self.cfg.resume.warm_before_resume:
                 await self._warm(session)
-            await self._continue(session, UNTIL.format(until=self.cfg.resume.until, minutes=round(left / 60)), cwd)
+            text = UNTIL.format(until=self.cfg.resume.until, minutes=round(left / 60))
+            if len(self.broker.snapshot.gpus) > 1:
+                text += "\n\n" + self.broker.gpu_usage_line()
+            await self._continue(session, text, cwd)
             return
         st = self.router.sessions.get(session)
         replies = (st.replies if st else 0) - before
