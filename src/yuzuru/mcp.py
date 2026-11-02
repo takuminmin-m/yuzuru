@@ -162,7 +162,7 @@ class MCPServer:
             "train",
             "Start a training / fine-tuning job in the background. For a GPU job (the default) yuzuru first moves "
             "the local LLM out of GPU memory and keeps `vram` free for the job; the LLM may use the rest. "
-            "With several GPUs, yuzuru puts the job on a free GPU of its own (set gpu_count for more than one). "
+            "With several GPUs, yuzuru gives the job a free GPU to itself (set gpu_count for more than one). "
             "With device 'cpu' the job sees no GPU, the LLM is left alone and the job yields CPU to it. "
             "Returns the PID and log file; read the log to follow progress.",
             {
@@ -175,9 +175,9 @@ class MCPServer:
                               "`accelerate launch --multi_gpu --num_processes 2`"},
                 "gpus": {"type": "string", "description": "comma-separated GPU indices/UUIDs to dedicate (optional; "
                          "rarely needed, prefer gpu_count)"},
-                "vram": {"type": "string", "description": "VRAM the job needs at its peak, e.g. '6G' (required for "
-                         "a GPU job when the machine has one GPU; with several, the job gets one free GPU and the "
-                         "LLM may use the rest of it)"},
+                "vram": {"type": "string", "description": "VRAM the job needs at its peak, e.g. '6G'. Required for "
+                         "a GPU job when the machine has one GPU. With several, leave it out: the job gets a whole "
+                         "free GPU, and vram only rules out GPUs too small for it"},
                 "log": {"type": "string", "description": "log file (optional; default .yuzuru/logs/train-<pid>.log)"},
                 "resume_when_done": {"type": "boolean", "description": "free the LLM while the job runs and "
                                      "resume this session when it ends (default true); end your turn after starting"},

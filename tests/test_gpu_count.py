@@ -39,13 +39,30 @@ async def test_gpu_count_two_lists_gpus_in_nvidia_smi_order(cfg, two_gpus, http)
     assert (await lease(broker, gpu_count=2)).gpus == ["GPU-0", "GPU-1"]
 
 
-async def test_gpu_count_with_vram_shares_the_gpu_with_the_llm(cfg, two_gpus, http):
+async def test_gpu_count_with_vram_takes_the_gpu_whole(cfg, two_gpus, http):
     broker = make_broker(cfg, two_gpus, http, [])
     placed = await broker.create_lease(pid=os.getpid(), label="job", gpus=[], vram=4 * GB, drain=False, gpu_count=1)
-    assert placed.gpus == ["GPU-1"] and not placed.whole
-    # Too big for the other GPU, even though it is free.
-    with pytest.raises(ValueError, match="needed but 0 available"):
+    assert placed.gpus == ["GPU-1"] and placed.whole and placed.vram is None
+    assert broker.dedicated() == {"GPU-1"}
+    # Its full size is enough: nothing else is on a GPU taken whole (Alloc run 1 asked 8G of the 3050).
+    other = await broker.create_lease(pid=os.getpid(), label="job", gpus=[], vram=8 * GB, drain=False, gpu_count=1)
+    assert other.gpus == ["GPU-0"] and other.whole
+
+
+async def test_refusal_says_why_a_free_gpu_is_not_enough(cfg, two_gpus, http):
+    broker = make_broker(cfg, two_gpus, http, [])
+    await broker.create_lease(pid=os.getpid(), label="job", gpus=[], vram=None, drain=False, gpu_count=1)
+    with pytest.raises(ValueError, match=r"(?s)with 10\.0 GB needed but 0 available: GPU 0 \(.*\) is free but has only "
+                                         r"8\.0 GB.*ask for less now; otherwise end your turn"):
         await broker.create_lease(pid=os.getpid(), label="job", gpus=[], vram=10 * GB, drain=False, gpu_count=1)
+
+
+async def test_refusal_does_not_say_wait_when_waiting_cannot_help(cfg, two_gpus, http):
+    broker = make_broker(cfg, two_gpus, http, [])
+    for kw in ({"vram": 13 * GB, "gpu_count": 1}, {"vram": None, "gpu_count": 3}, {"vram": 10 * GB, "gpu_count": 2}):
+        with pytest.raises(ValueError, match="this machine has") as e:
+            await broker.create_lease(pid=os.getpid(), label="job", gpus=[], drain=False, **kw)
+        assert "End your turn" not in str(e.value) and "end your turn" not in str(e.value)
 
 
 async def test_gpu_count_waits_for_a_job_that_may_be_anywhere(cfg, two_gpus, http):

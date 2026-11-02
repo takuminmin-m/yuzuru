@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import Catalog, ModelSpec
-from .config import MB, Config
+from .config import GB, MB, Config
 from .ollama import LoadedModel, Ollama, OllamaError
 from .resources import Probe, Snapshot
 
@@ -352,7 +352,8 @@ class Broker:
         return sorted(resolved, key=resolved.__getitem__)
 
     def pick_gpus(self, count: int, vram: int | None = None) -> list[str]:
-        """`count` GPUs no job holds, the most memory first (usually the fastest of a machine's GPUs)."""
+        """`count` GPUs no job holds and big enough for `vram`, the most memory first (usually the
+        fastest of a machine's GPUs)."""
         if count < 1:
             raise ValueError(f"gpu_count must be at least 1, not {count}")
         self._update_leases()  # a job that has just ended no longer holds its GPU
@@ -361,13 +362,22 @@ class Broker:
                 raise ValueError(f"lease {l.id} ({l.label}, pid {l.pid}) may be on any GPU: wait for it to end, "
                                  "or name the GPUs yourself")
         taken = {g for l in self.leases.values() for g in l.gpus}
-        margin = self.cfg.resources.vram_margin_mb * MB
-        free = [g for g in self.snapshot.gpus
-                if g.uuid not in taken and (vram is None or g.total - margin >= vram)]
-        if len(free) < count:
-            raise ValueError(f"{count} free GPU(s) needed but {len(free)} available. {self.gpu_usage_line()}. "
-                             "End your turn: you are resumed when a job ends, then start this one")
-        return [g.uuid for g in sorted(free, key=lambda g: (-g.total, g.index))[:count]]
+        gpus = self.snapshot.gpus
+        big = [g for g in gpus if vram is None or g.total >= vram]
+        free = [g for g in big if g.uuid not in taken]
+        if len(free) >= count:
+            return [g.uuid for g in sorted(free, key=lambda g: (-g.total, g.index))[:count]]
+        need = f"{count} free GPU(s)" + (f" with {vram / GB:.1f} GB" if vram else "")
+        small = [f"GPU {g.index} ({g.name}) is free but has only {g.total / GB:.1f} GB"
+                 for g in gpus if g.uuid not in taken and g not in big]
+        said = f"{need} needed but {len(free)} available" + (f": {', '.join(small)}" if small else "")
+        if len(big) < count:
+            # No job ending would help: waiting would never get there.
+            have = f"{len(gpus)} GPU(s)" if vram is None else f"{len(big)} GPU(s) with {vram / GB:.1f} GB"
+            raise ValueError(f"{said}, and this machine has {have}. Ask for less. {self.gpu_usage_line()}")
+        then = ("If the job fits in less, ask for less now; otherwise end your turn" if small else "End your turn")
+        raise ValueError(f"{said}. {self.gpu_usage_line()}. {then}: you are resumed when a job ends, "
+                         "then start this one")
 
     def gpu_usage(self) -> list[dict[str, Any]]:
         """What runs on each GPU right now: leases naming it and jobs that may be on any GPU."""
@@ -445,6 +455,9 @@ class Broker:
         await self.refresh()
         # No await from here to the lease being recorded: two jobs started together get different GPUs.
         resolved = self._resolve_gpus(self.pick_gpus(gpu_count, vram) if gpu_count else gpus)
+        if gpu_count:
+            # Alloc run 1: the LLM stayed beside `vram` jobs, ran out of memory loading, and the resume died.
+            vram = None  # only said which GPU is big enough: the job has the GPU to itself
         whole = bool(resolved) and vram is None
         self._update_leases()  # a job that has just ended no longer holds its GPU
         for other in self.leases.values():

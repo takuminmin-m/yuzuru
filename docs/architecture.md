@@ -298,7 +298,7 @@ yuzuru が起動するプロセスの `PYTHONPATH` の先頭に、`gpu_pin/` を
 - **エージェント**（`yuzuru agent` と自動再開したターン）: GPU を見せません（`CUDA_VISIBLE_DEVICES=""`、`YUZURU_AGENT=1`）。CUDA 関係のエラーで落ちると、トレースバックの後に「`yuzuru_train` を使う」よう案内を出します。`isolation.hide_gpus_from_agent: false` で無効にできます
 - ジョブの venv などにある元の `sitecustomize` は、その後に通常どおり実行します
 
-`--gpu-count N`（MCP の `gpu_count`）では、どのジョブも持っていない GPU をメモリの多い順に N 枚選びます。メモリの多さを速さの目安にしています。GPU を重ねて使いたいときは、`gpus` と `vram` で GPU を名指しします。
+`--gpu-count N`（MCP の `gpu_count`）では、どのジョブも持っていない GPU をメモリの多い順に N 枚選びます。メモリの多さを速さの目安にしています。選んだ GPU はジョブが丸ごと使い、LLM は載りません。`vram` を一緒に指定すると、それより小さい GPU を候補から外すだけです（MCP の `yuzuru_train` は、GPU が 2 枚以上あれば `vram` だけの指定もこの扱いにします）。GPU を重ねて使いたいときは、`gpus` と `vram` で GPU を名指しします。
 
 lease の GPU は、`--gpu` の書き方の順によらず `nvidia-smi` の順に並べます。ジョブの `cuda:0`、`cuda:1`、… も `nvidia-smi` の順になり、ジョブのログの最初に `cuda:0 = GPU 1 (NVIDIA GeForce RTX 3060)` のような対応を出します。
 
