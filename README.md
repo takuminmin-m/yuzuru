@@ -142,6 +142,7 @@ yuzuru run --log train.log -- python train.py
 
 | オプション | 意味 |
 |---|---|
+| `--gpu-count <枚数>` | 空いている GPU をその枚数だけ yuzuru が選び、ジョブ専用にする（メモリの多い GPU から）。空きが足りなければ断る。`--gpu` とは併用できない |
 | `--vram 10G` | ジョブが最大で使う VRAM を申告する。その分は LLM に使わせない。残りは LLM が使える |
 | `--gpu <番号か UUID>` | その GPU をジョブ専用にする（複数指定可。`--gpu 0,1` のようにカンマ区切りでも、`--gpu 0 --gpu 1` のように繰り返してもよい）。ジョブの間、LLM はその GPU を一切使わない |
 | `--cpu` | GPU を使わないジョブ。LLM は降ろさない。ジョブには GPU を見せない |
@@ -190,7 +191,7 @@ yuzuru release <id>                        # 枠を返す
 
 | ツール | 用途 |
 |---|---|
-| `yuzuru_train` | 学習ジョブをバックグラウンドで起動する。GPU ジョブには `vram`（または `gpus`）が必須。CPU ジョブは `device: "cpu"` |
+| `yuzuru_train` | 学習ジョブをバックグラウンドで起動する。GPU が 1 枚なら GPU ジョブに `vram`（または `gpus`）が必須。2 枚以上なら空いている GPU を丸ごと割り当てる。CPU ジョブは `device: "cpu"` |
 | `yuzuru_wait` | 自分で起動したのではないプロセス（PID か lease）の終了を待つ |
 | `yuzuru_status` | GPU / RAM、載せられる tier、学習ジョブを見る |
 | `yuzuru_models` | 入っているモデルの一覧 |

@@ -408,6 +408,7 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                 gpus=[str(g) for g in payload.get("gpus") or []],
                 vram=int(payload["vram"]) if payload.get("vram") else None,
                 session=payload.get("session"),
+                gpu_count=int(payload["gpu_count"]) if payload.get("gpu_count") else None,
                 **job_fields(payload),
             )
         except (KeyError, ValueError) as e:

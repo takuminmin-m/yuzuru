@@ -172,7 +172,7 @@ Ollama が実際に使っているホスト RAM は、Ollama の cgroup の `mem
 
 | ツール | 引数 | 動き |
 |---|---|---|
-| `train` | `command`、`cwd`（必須）、`device`、`gpus`、`vram`、`log`、`resume_when_done`、`note` | `yuzuru run --detach` を `cwd` で起動する。GPU ジョブは `vram` か `gpus` がないとエラーを返す。`resume_when_done`（既定 true）なら終了時に会話を再開する |
+| `train` | `command`、`cwd`（必須）、`device`、`gpu_count`、`gpus`、`vram`、`log`、`resume_when_done`、`note` | `yuzuru run --detach` を `cwd` で起動する。GPU が 1 枚の機械では、GPU ジョブは `vram` か `gpus` がないとエラーを返す。2 枚以上なら、`gpus` がない限り yuzuru が空いている GPU を選ぶ（`gpu_count`、既定 1。`vram` だけなら 1 枚を選び、残りは LLM が使える）。空きがなければ断る。応答に、ジョブから見える GPU と各 GPU の使用状況（`GPUs now:`）を返す。`resume_when_done`（既定 true）なら終了時に会話を再開する |
 | `wait` | `pid` か `lease`、`note`、`log`、`cwd`、`device` | そのプロセスの終了を待ち、会話を再開する。すでに待っているプロセスにもう一度呼ぶと、最大 `resume.repeat_wait_seconds` 秒止まってから答える（ポーリングで LLM を使い続けないように）。3 回目からは、そのセッションのジョブのどれかが終わるまで（最大 `resume.repeat_wait_max_seconds` 秒、既定 240 秒）止まる。止まっている間に終わったジョブの結果はこの呼び出しで返し、あとから会話を再開することはしない |
 | `status` | — | GPU / RAM、予算、tier の配置見込み、lease |
 | `models` | — | 入っているモデルと担当 tier |
@@ -297,6 +297,8 @@ yuzuru が起動するプロセスの `PYTHONPATH` の先頭に、`gpu_pin/` を
 - **番号は `nvidia-smi` の番号**: `CUDA_VISIBLE_DEVICES=1` や `accelerate launch --gpu_ids 1` の `1` は、`CUDA_DEVICE_ORDER` によらず `nvidia-smi` の 1 番です。ピン留めがあってもなくても、同じ GPU を指します。lease の中の番号なら UUID に置き換えて渡し、外なら上と同じく断ります。番号と UUID の対応は NVML から読みます（`YUZURU_GPU_INDEX="0=GPU-…,1=GPU-…"` があればそれを使います）
 - **エージェント**（`yuzuru agent` と自動再開したターン）: GPU を見せません（`CUDA_VISIBLE_DEVICES=""`、`YUZURU_AGENT=1`）。CUDA 関係のエラーで落ちると、トレースバックの後に「`yuzuru_train` を使う」よう案内を出します。`isolation.hide_gpus_from_agent: false` で無効にできます
 - ジョブの venv などにある元の `sitecustomize` は、その後に通常どおり実行します
+
+`--gpu-count N`（MCP の `gpu_count`）では、どのジョブも持っていない GPU をメモリの多い順に N 枚選びます。メモリの多さを速さの目安にしています。選んだ GPU はジョブが丸ごと使い、LLM は載りません。`vram` を一緒に指定すると、それより小さい GPU を候補から外すだけです（MCP の `yuzuru_train` は、GPU が 2 枚以上あれば `vram` だけの指定もこの扱いにします）。GPU を重ねて使いたいときは、`gpus` と `vram` で GPU を名指しします。
 
 lease の GPU は、`--gpu` の書き方の順によらず `nvidia-smi` の順に並べます。ジョブの `cuda:0`、`cuda:1`、… も `nvidia-smi` の順になり、ジョブのログの最初に `cuda:0 = GPU 1 (NVIDIA GeForce RTX 3060)` のような対応を出します。
 

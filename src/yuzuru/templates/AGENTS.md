@@ -12,11 +12,16 @@
 - **GPU を使う処理は、必ず MCP の `yuzuru_train` ツールで実行する**
   （`command: "uv run python train.py"`、`cwd: "{cwd}"`、`log` にログファイル名）。
   シェルからは GPU が見えない（`torch.cuda.is_available()` が False になる）
-- **GPU はあなた自身（LLM）と共有している**。`yuzuru_train` では必ず `vram` に学習で使う VRAM 量を
+- **GPU が 1 枚の課題:** GPU はあなた自身（LLM）と共有している。`yuzuru_train` では必ず `vram` に学習で使う VRAM 量を
   指定する（例 `"4G"`）。指定した量を超えて使うと、LLM とぶつかって学習が OOM で落ちることがある
+- **GPU が 2 枚以上の課題:** `vram` も GPU の番号も書かない。`yuzuru_train` が空いている GPU を丸ごと 1 枚割り当てる
+  （コマンドに `CUDA_VISIBLE_DEVICES` も書かない）。1 つの学習に複数枚使うときだけ `gpu_count` に枚数を書く
+  （`accelerate launch --multi_gpu --num_processes 2` なら `2`）
 - GPU を使わない学習（LightGBM、scikit-learn、前処理など）は `yuzuru_train` に `device: "cpu"` を付けて実行する（`vram` は不要）
 - ツールを呼んだらそのターンは終えること。学習が終わると、終了コードとログの末尾付きで会話が自動で再開する
-- 学習は一度に 1 つだけ。前の学習が終わってから次を始める
+- GPU が 1 枚なら、学習は一度に 1 つだけ。前の学習が終わってから次を始める
+- GPU が 2 枚以上なら、再開のメッセージや `yuzuru_train` の応答の `GPUs now:` を見て、空いている GPU があれば次の学習を始めてからターンを終える。
+  空きがなければ `yuzuru_train` は断られるので、ターンを終えて待つ
 - 学習スクリプトの `print` には `flush=True` を付ける（付けないとログに出るのが遅れる）
 - 実行中の学習の様子は `tail -n 50 <log>` で見る。`sleep` で待たない。実行中の学習を止めようとしない
 - 設定や手法の良し悪しは `README.md` で指定された検証データの指標で判断する。テストデータがあっても選ぶのには使わない

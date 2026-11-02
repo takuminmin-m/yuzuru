@@ -33,6 +33,11 @@ STALLED = ("[yuzuru] Your last turn ended after a single reply with no tool call
            "nothing continues this session unless you do. Continue the task from where you left off. If the task "
            "is finished, say so and summarize the result.")
 
+LLM_BACK = ("[yuzuru] Your turn stopped because the local LLM could not be loaded. It can be loaded again now. "
+            "Continue the task from where you left off.")
+
+LOAD_RETRIES = 6  # resumes in a row retried after a failed LLM load, one per LOAD_FAILURE_COOLDOWN: about an hour
+
 UNTIL = ("[yuzuru] Your turn ended and no job of yours is running, but this task goes on until {until} "
          "({minutes} min from now). Do not finish early: check the end conditions in README.md and use the time "
          "left (start the next job, then end your turn). Keep the deliverables up to date as you go.")
@@ -163,6 +168,8 @@ class Waiter:
         # there would resume the session a second time (HPO run 2: two clients 10 s apart).
         self.resuming: dict[str, tuple[asyncio.subprocess.Process, int, float]] = {}
         self.holding: Counter[str] = Counter()  # session -> `wait` calls being held
+        self.load_retries: dict[str, int] = {}  # session -> resumes in a row lost to a failed LLM load
+        self.undelivered: dict[str, str] = {}  # session -> what such a resume was to say
         broker.on_lease_end.append(self._lease_ended)
 
     # ---------------------------------------------------------------- watches
@@ -338,6 +345,8 @@ class Waiter:
             parts.append(f"Your note for this moment: {ev.note}")
         if ev.log_tail:
             parts.append(f"Last lines of {ev.log}:\n```\n{ev.log_tail}\n```")
+        if len(self.broker.snapshot.gpus) > 1:
+            parts.append(self.broker.gpu_usage_line())
         parts.append("Continue the task from here.")
         return "\n\n".join(parts)
 
@@ -378,6 +387,8 @@ class Waiter:
 
     async def _continue(self, session: str, message: str, cwd: str | None) -> str | None:
         """Run the resume command for `session` with `message`; the error if it could not start."""
+        if earlier := self.undelivered.pop(session, None):
+            message = f"{earlier}\n\n{message}"
         argv = [a.format(session=session, message=message, cwd=cwd or "") for a in self.cfg.resume.command]
         if await asyncio.to_thread(scope.use, self.cfg.isolation.scope):
             if outside := await asyncio.to_thread(scope.opencode_service_outside):
@@ -397,10 +408,11 @@ class Waiter:
         self.latest_resume[session] = proc
         self.resuming[session] = (proc, before, time.time())
         # Reaped when the resumed turn ends (no zombies in a long-running server), then checked.
-        self._spawn(self._after_turn(session, before, cwd, proc))
+        self._spawn(self._after_turn(session, before, cwd, proc, message))
         return None
 
-    async def _after_turn(self, session: str, before: int, cwd: str | None, proc: asyncio.subprocess.Process) -> None:
+    async def _after_turn(self, session: str, before: int, cwd: str | None, proc: asyncio.subprocess.Process,
+                          message: str) -> None:
         """Continue a resumed turn that stalled: one reply and no tool call, and no job left running.
 
         Nothing else would wake such a session: yuzuru resumes an agent only when a job of its ends.
@@ -411,6 +423,8 @@ class Waiter:
         while self.in_turn(session):
             await asyncio.sleep(1.0)
         if self.latest_resume.get(session) is not proc:
+            return
+        if await self._retry_load_failure(session, before, cwd, proc, message):
             return
         if session in self._held or any(w.session == session for w in self.watches.values()) \
                 or any(l.session == session for l in self.broker.leases.values()):
@@ -427,7 +441,10 @@ class Waiter:
                         "continuing it (%d/%d)", session, left / 60, done + 1, limit)
             if not self.watches and self.cfg.resume.warm_before_resume:
                 await self._warm(session)
-            await self._continue(session, UNTIL.format(until=self.cfg.resume.until, minutes=round(left / 60)), cwd)
+            text = UNTIL.format(until=self.cfg.resume.until, minutes=round(left / 60))
+            if len(self.broker.snapshot.gpus) > 1:
+                text += "\n\n" + self.broker.gpu_usage_line()
+            await self._continue(session, text, cwd)
             return
         st = self.router.sessions.get(session)
         replies = (st.replies if st else 0) - before
@@ -446,6 +463,30 @@ class Waiter:
         if not self.watches and self.cfg.resume.warm_before_resume:
             await self._warm(session)
         await self._continue(session, STALLED, cwd)
+
+    async def _retry_load_failure(self, session: str, before: int, cwd: str | None,
+                                  proc: asyncio.subprocess.Process, message: str) -> bool:
+        """Resume again a turn the LLM could not be loaded for. A job still running would not wake it until it
+        ends (Alloc run 1: the 3060 sat idle for 112 min), and with none running nothing would."""
+        st = self.router.sessions.get(session)
+        replies = (st.replies if st else 0) - before
+        failed = [until for v, until in list(self.broker.failed.items()) if self.broker.is_failed(v)]
+        if not failed or (replies > 0 and proc.returncode == 0):
+            self.load_retries.pop(session, None)
+            return False
+        done = self.load_retries.get(session, 0)
+        if done >= LOAD_RETRIES:
+            log.warning("session %s: the LLM still cannot be loaded; not resuming it again (%d in a row)", session, done)
+            return False
+        self.load_retries[session] = done + 1
+        self.undelivered[session] = message if replies == 0 else LLM_BACK
+        wait = max(failed) - time.time() + 1.0
+        log.warning("session %s: the LLM could not be loaded for its turn; resuming it in %.0f s (%d/%d)",
+                    session, wait, done + 1, LOAD_RETRIES)
+        await asyncio.sleep(max(wait, 0.0))
+        if self.latest_resume.get(session) is proc and session in self.undelivered:
+            await self._continue(session, self.undelivered.pop(session), cwd)
+        return True
 
     async def _turn_over(self, session: str | None) -> None:
         """Wait until the session's client has finished its turn.
