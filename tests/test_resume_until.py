@@ -48,6 +48,39 @@ async def test_after_until_a_finished_turn_is_left_alone(cfg, world, http, tmp_p
     assert len(turns(out)) == 1
 
 
+async def test_between_until_and_finish_by_a_turn_is_continued_to_finish(cfg, world, http, tmp_path):
+    # Alloc run 2 ended its turn 25 min before the end of the task, with no deliverable written.
+    out, go = agent(cfg, tmp_path)
+    cfg.resume.until, cfg.resume.finish_by, cfg.resume.finish_nudges = in_minutes(-5), in_minutes(30), 2
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await job_ends(broker, waiter, tmp_path, rc=0)
+    await wait_for(lambda: len(turns(out)) == 1)
+    reply(router, "tool_calls")
+    reply(router)
+    go.touch()
+    await wait_for(lambda: len(turns(out)) == 3)  # continued, and that turn ended the same way: again
+    message = turns(out)[1][1]
+    assert message.startswith("[yuzuru]") and cfg.resume.finish_by in message and "device 'cpu'" in message
+    await asyncio.sleep(1.5)
+    assert len(turns(out)) == 3  # finish_nudges: then it is left alone
+    assert waiter.finish_nudges["s1"] == 2
+
+
+async def test_after_finish_by_a_finished_turn_is_left_alone(cfg, world, http, tmp_path):
+    out, go = agent(cfg, tmp_path)
+    cfg.resume.until, cfg.resume.finish_by = in_minutes(-30), in_minutes(-5)
+    catalog, broker, router = await make(cfg, world, http)
+    waiter = Waiter(cfg, broker, router)
+    await job_ends(broker, waiter, tmp_path, rc=0)
+    await wait_for(lambda: len(turns(out)) == 1)
+    reply(router, "tool_calls")
+    reply(router)
+    go.touch()
+    await asyncio.sleep(1.5)
+    assert len(turns(out)) == 1
+
+
 async def test_only_the_latest_resume_continues_a_session(cfg, world, http, tmp_path, caplog):
     out, go = agent(cfg, tmp_path)
     cfg.resume.until, cfg.resume.until_nudges = in_minutes(120), 1
@@ -73,3 +106,12 @@ def test_until_is_parsed_as_local_time():
     assert ResumeConfig(until=t).deadline() == t.timestamp()  # what YAML makes of 2026-10-31T06:15:00
     with pytest.raises(ValueError, match="resume.until"):
         ResumeConfig(until="06:15 tomorrow")
+
+
+def test_finish_by_must_come_after_until():
+    assert ResumeConfig(until="2026-10-31T06:15", finish_by="2026-10-31T06:50").finish_time() is not None
+    for until in (None, "2026-10-31T06:50", "2026-10-31T07:00"):
+        with pytest.raises(ValueError, match="resume.finish_by"):
+            ResumeConfig(until=until, finish_by="2026-10-31T06:50")
+    with pytest.raises(ValueError, match="resume.finish_by"):
+        ResumeConfig(until="2026-10-31T06:15", finish_by="later")

@@ -42,6 +42,11 @@ UNTIL = ("[yuzuru] Your turn ended and no job of yours is running, but this task
          "({minutes} min from now). Do not finish early: check the end conditions in README.md and use the time "
          "left (start the next job, then end your turn). Keep the deliverables up to date as you go.")
 
+FINISH = ("[yuzuru] Your turn ended and no job of yours is running. New GPU jobs ended at {until}, but the task "
+          "ends at {finish_by} ({minutes} min from now). Check that every deliverable README.md and AGENTS.md ask "
+          "for exists and is correct, and make what is missing now from the best results you have. Inference can "
+          "run through yuzuru_train with device 'cpu'. If everything is there, say so and end your turn.")
+
 
 @dataclass
 class Watch:
@@ -160,6 +165,7 @@ class Waiter:
         # Outcomes held back until their session's turn ends: one resume reports them all.
         self._held: dict[str, list[tuple[Event, Watch]]] = {}
         self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
+        self.finish_nudges: dict[str, int] = {}  # session -> turns continued between resume.until and finish_by
         # session -> its latest resume: a client yuzuru started earlier can stay attached while the session
         # goes on (HPO run 1 had eight), and only the latest one may decide to continue the session.
         self.latest_resume: dict[str, asyncio.subprocess.Process] = {}
@@ -445,6 +451,22 @@ class Waiter:
             if len(self.broker.snapshot.gpus) > 1:
                 text += "\n\n" + self.broker.gpu_usage_line()
             await self._continue(session, text, cwd)
+            return
+        finish = self.cfg.resume.finish_time()
+        if finish is not None and deadline is not None and time.time() >= deadline \
+                and (left := finish - time.time()) > 60:
+            done, limit = self.finish_nudges.get(session, 0), self.cfg.resume.finish_nudges
+            if done >= limit:
+                log.warning("session %s ended its turn %.0f min before resume.finish_by with no job running; "
+                            "not continuing it again (%d so far)", session, left / 60, done)
+                return
+            self.finish_nudges[session] = done + 1
+            log.warning("session %s ended its turn %.0f min before resume.finish_by with no job running; "
+                        "continuing it (%d/%d)", session, left / 60, done + 1, limit)
+            if not self.watches and self.cfg.resume.warm_before_resume:
+                await self._warm(session)
+            await self._continue(session, FINISH.format(until=self.cfg.resume.until, minutes=round(left / 60),
+                                                        finish_by=self.cfg.resume.finish_by), cwd)
             return
         st = self.router.sessions.get(session)
         replies = (st.replies if st else 0) - before
