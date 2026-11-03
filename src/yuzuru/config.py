@@ -173,6 +173,18 @@ class LeaseConfig:
     restore_after: bool = True
 
 
+def _local_time(name: str, value: Any) -> float | None:
+    """A `resume` time as a Unix time (a time without zone is local); None when unset."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):  # YAML reads 2026-10-31T06:15:00 as a datetime
+        return value.timestamp()
+    try:
+        return datetime.datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        raise ValueError(f"resume.{name} must be a date and time like 2026-10-31T06:15, not {value!r}") from None
+
+
 @dataclass
 class ResumeConfig:
     """Free the LLM while an agent waits for a process, and resume it afterwards."""
@@ -207,20 +219,27 @@ class ResumeConfig:
     # CPU jobs still run, for the inference the deliverables need.
     until: str | None = None
     until_nudges: int = 3
+    # When the task itself ends, after `until`. A resumed turn that ends between the two with no job of
+    # the session running is continued, telling the agent to finish the deliverables (Alloc run 2 ended
+    # its turn 25 min before the end, with none written). At most finish_nudges times for a session,
+    # whatever it does between them: only CPU jobs are left to start, and a finished agent gets them too.
+    finish_by: str | None = None
+    finish_nudges: int = 2
 
     def __post_init__(self) -> None:
-        self.deadline()
+        until, finish = self.deadline(), self.finish_time()
+        if finish is not None and (until is None or finish <= until):
+            raise ValueError(f"resume.finish_by must come after resume.until, not {self.finish_by!r} "
+                             f"with until {self.until!r}")
 
     def deadline(self) -> float | None:
         """`until` as a Unix time (a time without zone is local); None when unset."""
-        if self.until is None:
-            return None
-        if isinstance(self.until, datetime.datetime):  # YAML reads 2026-10-31T06:15:00 as a datetime
-            return self.until.timestamp()
-        try:
-            return datetime.datetime.fromisoformat(str(self.until)).timestamp()
-        except ValueError:
-            raise ValueError(f"resume.until must be a date and time like 2026-10-31T06:15, not {self.until!r}") from None
+        return _local_time("until", self.until)
+
+    def finish_time(self) -> float | None:
+        """`finish_by` as a Unix time, like `deadline`."""
+        return _local_time("finish_by", self.finish_by)
+
     # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
     # the process ends, before answering. Below the MCP clients' request timeout (60 s); 0: answer at once.
