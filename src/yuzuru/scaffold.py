@@ -41,7 +41,7 @@ PERMISSION: dict[str, Any] = {
             "uv run *", "uv pip install *", "uv pip list*", "uv pip show *",
             "cd *", "pwd", "ls", "ls *", "cat *", "head *", "tail *", "grep *", "wc *", "find *", "diff *",
             "sed -n *", "echo *", "mkdir *", "cp *", "mv *", "rm *", "touch *",
-            "nvidia-smi*", "free*", "df *",
+            "nvidia-smi*", "free*", "df *", "date*",
             "git status*", "git diff*", "git log*", "git show*", "git add *", "git commit *",
         )},
         **{cmd: "deny" for cmd in ("rm -r*", "rm -f*", "rm -rf*", "*--break-system-packages*", "sudo *")},
