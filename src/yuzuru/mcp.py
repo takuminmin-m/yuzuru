@@ -288,7 +288,8 @@ class MCPServer:
                 if seconds > 0:
                     return await _held_wait(st, w, session, seconds)
             return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
-                    f"turn now: session {session} is resumed automatically when the process exits.")
+                    f"turn now: session {session} is resumed automatically when the process exits."
+                    + st.waiter.free_gpu_hint())
 
     async def handle(self, request: Request) -> Response:
         try:
@@ -342,7 +343,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
         return (f"still running: you already wait for it ({w.id}), so this call waited {_span(seconds)} "
                 f"first{'' if w.repeats == 1 else ' (you called wait again instead of ending your turn)'}. "
                 "Checking again keeps the LLM busy (and any free GPU idle). End your turn now: session "
-                f"{session} is resumed automatically with the outcome when it exits.")
+                f"{session} is resumed automatically with the outcome when it exits." + st.waiter.free_gpu_hint())
     parts = []
     for ev in ended:
         code = f" (exit code {ev.rc})" if ev.rc is not None else ""
@@ -351,7 +352,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
     if w.id in st.waiter.watches:
         parts.append(f"{w.label} is still running.")
     parts.append("Start the next job if there is one, then end your turn.")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts) + st.waiter.free_gpu_hint()
 
 
 def _ok(mid: Any, result: dict[str, Any]) -> dict[str, Any]:

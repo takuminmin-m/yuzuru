@@ -50,6 +50,8 @@ FINISH = ("[yuzuru] Your turn ended and no job of yours is running. New GPU jobs
 IDLE_GPU = ("[yuzuru] Your turn ended with a GPU free, and new GPU jobs can start until {until} ({minutes} min from "
             "now). Do not wait for the job that is running: start the next experiment on the free GPU now, then end "
             "your turn. If no experiment is worth running, say why and end your turn.")
+IDLE_GPU_WAIT = ("A GPU is free, and new GPU jobs can start until {until} ({minutes} min from now). Before you end "
+                 "your turn or wait again, start the next experiment on the free GPU.")
 IDLE_GPU_MIN_LEFT = 600.0  # with less time left than this, a new job is not worth asking for
 IDLE_GPU_SETTLE = 2.0  # lets a resume for a job that ended during the turn go first
 
@@ -510,18 +512,32 @@ class Waiter:
             self._idle_gpu_checks.discard(session)
         await self._nudge_idle_gpu(session, cwd)
 
+    def _free_gpu_minutes(self) -> float | None:
+        """Minutes left to start a job on a GPU that is free now, if asking for one is worth it."""
+        deadline = self.cfg.resume.deadline()
+        if not self.cfg.resume.idle_gpu_nudges or deadline is None \
+                or (left := deadline - time.time()) < IDLE_GPU_MIN_LEFT:
+            return None
+        usage = self.broker.gpu_usage()
+        return None if len(usage) < 2 or all(u["jobs"] for u in usage) else left / 60
+
+    def free_gpu_hint(self) -> str:
+        """For the answer to `wait`. An agent that keeps calling `wait` stays in its turn, so the nudge below never
+        comes (Loop run 3: the 3050 sat idle for 21 min, the agent "waiting for Exp7")."""
+        if (minutes := self._free_gpu_minutes()) is None:
+            return ""
+        text = IDLE_GPU_WAIT.format(until=self.cfg.resume.until, minutes=round(minutes))
+        return f"\n\n{text}\n{self.broker.gpu_usage_line()}"
+
     async def _nudge_idle_gpu(self, session: str, cwd: str | None) -> None:
         """Continue a turn that ended with a job running and a GPU free. Otherwise nothing wakes the agent until
         that job ends (Overfit run 2: the 3050 sat idle for 42 min, the agent "waiting for Exp2")."""
-        deadline, limit = self.cfg.resume.deadline(), self.cfg.resume.idle_gpu_nudges
-        if deadline is None or (left := deadline - time.time()) < IDLE_GPU_MIN_LEFT:
+        if (minutes := self._free_gpu_minutes()) is None:
             return
         if session in self._held or self.in_turn(session) \
                 or not any(l.session == session for l in self.broker.leases.values()):
             return
-        usage = self.broker.gpu_usage()
-        if len(usage) < 2 or all(u["jobs"] for u in usage):
-            return
+        limit = self.cfg.resume.idle_gpu_nudges
         done = self.idle_gpu_nudges.get(session, 0)
         if done >= limit:
             log.info("session %s ended its turn with a GPU free; not continuing it again (%d since its last job)",
@@ -529,8 +545,8 @@ class Waiter:
             return
         self.idle_gpu_nudges[session] = done + 1
         log.warning("session %s ended its turn with a GPU free, %.0f min before resume.until; continuing it (%d/%d)",
-                    session, left / 60, done + 1, limit)
-        text = IDLE_GPU.format(until=self.cfg.resume.until, minutes=round(left / 60))
+                    session, minutes, done + 1, limit)
+        text = IDLE_GPU.format(until=self.cfg.resume.until, minutes=round(minutes))
         await self._continue(session, f"{text}\n\n{self.broker.gpu_usage_line()}", cwd)
 
     async def _retry_load_failure(self, session: str, before: int, cwd: str | None,
