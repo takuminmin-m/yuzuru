@@ -219,6 +219,10 @@ class ResumeConfig:
     # CPU jobs still run, for the inference the deliverables need.
     until: str | None = None
     until_nudges: int = 3
+    # A turn that ends before `until` with a job running and a GPU free is continued, telling the agent to use
+    # that GPU; nothing else would wake it until the job ends (Overfit run 2: the 3050 idle for 42 min, with the
+    # rule in AGENTS.md). At most this many times since the session last started a job; 0 turns this off.
+    idle_gpu_nudges: int = 2
     # When the task itself ends, after `until`. A resumed turn that ends between the two with no job of
     # the session running is continued, telling the agent to finish the deliverables (Alloc run 2 ended
     # its turn 25 min before the end, with none written). At most finish_nudges times for a session,
