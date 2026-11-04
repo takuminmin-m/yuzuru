@@ -38,6 +38,9 @@ LLM_BACK = ("[yuzuru] Your turn stopped because the local LLM could not be loade
 
 LOAD_RETRIES = 6  # resumes in a row retried after a failed LLM load, one per LOAD_FAILURE_COOLDOWN: about an hour
 
+TIME_LIMIT_RC = 124  # what `timeout` exits with
+TIME_LIMIT_TEXT = "stopped by yuzuru: it reached the task's time limit for a job"
+
 UNTIL = ("[yuzuru] Your turn ended and no job of yours is running, but this task goes on until {until} "
          "({minutes} min from now). Do not finish early: check the end conditions in README.md and use the time "
          "left (start the next job, then end your turn). Keep the deliverables up to date as you go.")
@@ -337,12 +340,18 @@ class Waiter:
                     log.warning("reloading %s failed: %s", name, e)
 
     @staticmethod
+    def _ended(ev: Event) -> str:
+        if ev.rc == TIME_LIMIT_RC:
+            return TIME_LIMIT_TEXT
+        return "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
+
+    @staticmethod
     def _status(ev: Event) -> str:
-        status = "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
+        status = Waiter._ended(ev)
         return f"{ev.label} {status} after {ev.duration / 60:.1f} min"
 
     def message(self, ev: Event, earlier: list[Event] | None = None) -> str:
-        status = "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
+        status = Waiter._ended(ev)
         minutes = ev.duration / 60
         parts = [f"[yuzuru] The process you were waiting for ({ev.label}) {status} after {minutes:.1f} min."]
         if earlier:

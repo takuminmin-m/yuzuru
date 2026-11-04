@@ -211,6 +211,9 @@ class ResumeConfig:
     # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
     # such a session this many times in a row, telling it so; 0 turns this off.
     stall_nudges: int = 1
+    # Stop a GPU job after this many minutes; 0 is no limit. A rule in README.md does not hold: Loop run 4 spent
+    # its 2.5 hours on 3 jobs of 116+ min, while Rules run 1 got 7 trials with jobs of at most 33 min.
+    job_max_minutes: float = 0.0
     # The task runs until this local time ("2026-10-31T06:15"), e.g. a time-boxed search: a resumed
     # turn that ends before it with no job of the session running is continued, telling the agent
     # how long is left (HPO run 1 declared itself done 3.5 hours early). Set it to when the last
@@ -231,6 +234,14 @@ class ResumeConfig:
         if finish is not None and (until is None or finish <= until):
             raise ValueError(f"resume.finish_by must come after resume.until, not {self.finish_by!r} "
                              f"with until {self.until!r}")
+
+    def job_limit(self, now: float) -> float | None:
+        """Seconds a GPU job started at `now` may run: job_max_minutes, and no later than finish_by."""
+        finish = self.finish_time()
+        limits = [self.job_max_minutes * 60] if self.job_max_minutes > 0 else []
+        if finish is not None:
+            limits.append(max(1.0, finish - now))
+        return min(limits, default=None)
 
     def deadline(self) -> float | None:
         """`until` as a Unix time (a time without zone is local); None when unset."""

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import logging
 import os
 import os
@@ -25,7 +26,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__, scope
-from .waits import outside_env, tail
+from .waits import TIME_LIMIT_RC, TIME_LIMIT_TEXT, outside_env, tail
 
 log = logging.getLogger("yuzuru.mcp")
 
@@ -233,7 +234,11 @@ class MCPServer:
                 argv += ["--session", session]
             if resume:
                 argv += ["--resume", "--note", args.get("note") or ""]
-            argv += ["--", "bash", "-c", args["command"]]
+            limit = None if cpu else st.cfg.resume.job_limit(time.time())
+            argv.append("--")
+            if limit is not None:  # the job's process group, data loader workers too
+                argv += ["timeout", "--signal=TERM", "--kill-after=30", f"{math.ceil(limit)}s"]
+            argv += ["bash", "-c", args["command"]]
             if await asyncio.to_thread(scope.use, st.cfg.isolation.scope):
                 # Not in yuzuru's own unit: a job that runs out of memory is killed alone (its lease
                 # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
@@ -246,6 +251,9 @@ class MCPServer:
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])
+            if limit is not None:
+                text += (f"\nThis job is stopped after {limit / 60:.0f} min (the task's time limit). Save the best "
+                         "weights whenever they improve, not only at the end, and fit the epochs into that time.")
             if resume:
                 text += ("\n" + ("The local LLM stays loaded (CPU-only job)." if cpu else
                                  "The local LLM is released while the job runs.") +
@@ -345,7 +353,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
                 f"{session} is resumed automatically with the outcome when it exits.")
     parts = []
     for ev in ended:
-        code = f" (exit code {ev.rc})" if ev.rc is not None else ""
+        code = f" ({TIME_LIMIT_TEXT})" if ev.rc == TIME_LIMIT_RC else f" (exit code {ev.rc})" if ev.rc is not None else ""
         parts.append(f"{ev.label} ended{code} after {ev.duration / 60:.1f} min. Last lines of "
                      f"{ev.log or 'its log'}:\n```\n{ev.log_tail[-2000:]}\n```")
     if w.id in st.waiter.watches:
