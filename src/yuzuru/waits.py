@@ -26,6 +26,7 @@ from typing import Any
 from . import scope
 from .broker import Broker, Lease, Placement, _pid_alive
 from .config import Config
+from .weights import WeightKeeper
 
 log = logging.getLogger("yuzuru.waits")
 
@@ -153,6 +154,7 @@ def tail(path: str | None, cwd: str | None, lines: int) -> str:
 class Waiter:
     def __init__(self, cfg: Config, broker: Broker, router: Any) -> None:
         self.cfg = cfg
+        self.weights = WeightKeeper(cfg.resume.keep_weights_gb)
         self.broker = broker
         self.router = router
         self.watches: dict[str, Watch] = {}
@@ -351,6 +353,8 @@ class Waiter:
             parts.append(f"Your note for this moment: {ev.note}")
         if ev.log_tail:
             parts.append(f"Last lines of {ev.log}:\n```\n{ev.log_tail}\n```")
+        if news := self.weights.news():
+            parts.append(news.strip())
         if len(self.broker.snapshot.gpus) > 1:
             parts.append(self.broker.gpu_usage_line())
         parts.append("Continue the task from here.")
