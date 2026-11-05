@@ -225,6 +225,9 @@ class ResumeConfig:
     # whatever it does between them: only CPU jobs are left to start, and a finished agent gets them too.
     finish_by: str | None = None
     finish_nudges: int = 2
+    # When a job starts, copy the weight files in its directory to .yuzuru/kept-weights, up to this
+    # many GB in all (Loop run 9 overwrote its best weights with a worse run); 0 turns this off.
+    keep_weights_gb: float = 5.0
 
     def __post_init__(self) -> None:
         until, finish = self.deadline(), self.finish_time()

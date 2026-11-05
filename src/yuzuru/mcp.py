@@ -239,6 +239,8 @@ class MCPServer:
                 # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
                 argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True,
                                   cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
+            if st.waiter:
+                await asyncio.to_thread(st.waiter.weights.keep, cwd)
             r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=outside_env(), capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
@@ -251,7 +253,7 @@ class MCPServer:
                                  "The local LLM is released while the job runs.") +
                          " End your turn now: this session is resumed automatically with the exit status and "
                          "the log tail when the job ends.")
-            return text
+            return (st.waiter.weights.news() if st.waiter else "") + text
 
         @self.tool(
             "wait",
