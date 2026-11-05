@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ LLM_BACK = ("[yuzuru] Your turn stopped because the local LLM could not be loade
 LOAD_RETRIES = 6  # resumes in a row retried after a failed LLM load, one per LOAD_FAILURE_COOLDOWN: about an hour
 
 TIME_LIMIT_RC = 124  # what `timeout` exits with
+EPOCHS_ARG = re.compile(r"--(?:num[-_])?epochs?[= ]+(\d+)")
 TIME_LIMIT_TEXT = ("stopped by yuzuru: it reached the task's time limit for a job. It did not finish, so do not compare "
                    "it with finished runs; start the next job with fewer epochs")
 
@@ -84,6 +86,7 @@ class Event:
     resume_error: str | None = None
     delivered: bool = False  # answered a held `wait` call: the agent has it already
     told: bool = False  # a limit stop named in a resume or in another tool's answer
+    refused: bool = False  # refused a job with as many epochs, which the agent may repeat
 
 
 def outside_env() -> dict[str, str]:
@@ -180,6 +183,7 @@ class Waiter:
         self.resuming: dict[str, tuple[asyncio.subprocess.Process, int, float]] = {}
         self.holding: Counter[str] = Counter()  # session -> `wait` calls being held
         self.load_retries: dict[str, int] = {}  # session -> resumes in a row lost to a failed LLM load
+        self.job_epochs: dict[str, int] = {}  # log -> the job's --epochs
         self.undelivered: dict[str, str] = {}  # session -> what such a resume was to say
         broker.on_lease_end.append(self._lease_ended)
 
@@ -351,6 +355,34 @@ class Waiter:
     def _status(ev: Event) -> str:
         status = Waiter._ended(ev)
         return f"{ev.label} {status} after {ev.duration / 60:.1f} min"
+
+    def note_job(self, log: str | None, command: str) -> None:
+        """Remember the epochs a job was started with, for `refuse_after_stop`."""
+        if log and (m := EPOCHS_ARG.search(command)):
+            self.job_epochs[log] = int(m.group(1))
+
+    def refuse_after_stop(self, session: str | None, command: str) -> str | None:
+        """Why a job with as many epochs as a job stopped at the time limit should not start, once per stop.
+
+        Loop run 8: told in every resume to use fewer epochs, the agent kept 150 and all five jobs were stopped.
+        A refusal is read where a line in an answer is not; a job that fits a faster GPU can simply be sent again.
+        """
+        m = EPOCHS_ARG.search(command)
+        if not session or not m:
+            return None
+        stops = [e for e in self.events if e.session == session and e.rc == TIME_LIMIT_RC and not e.refused
+                 and self.job_epochs.get(e.log or "", int(m.group(1)) + 1) <= int(m.group(1))]
+        for e in stops:
+            e.refused = True
+        if not stops:
+            return None
+        last = stops[-1]
+        line = next((x for x in reversed(last.log_tail.splitlines()) if x.strip()), "")
+        return (f"not started: {last.log} used --epochs {self.job_epochs[last.log]} and was stopped at the time limit "
+                f"after {last.duration / 60:.0f} min, before its learning rate finished falling. Its last line: {line!r}. "
+                f"This command has --epochs {m.group(1)}. From the seconds per epoch in that log, work out the epochs that "
+                "fit, leave a margin, and use those from now on. If this job really fits (a faster GPU, a smaller "
+                "model), send the same command again.")
 
     def stop_news(self, session: str | None) -> str:
         """Jobs of `session` stopped at the time limit that the agent has not been told about.

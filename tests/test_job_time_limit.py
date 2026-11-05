@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from yuzuru.mcp import MCPServer
 from yuzuru.server import State
 from yuzuru.waits import TIME_LIMIT_RC, TIME_LIMIT_TEXT, Event, Waiter, Watch
@@ -114,3 +116,35 @@ async def test_a_resume_counts_as_telling(cfg, world, http, tmp_path):
     st.waiter._finish(w, TIME_LIMIT_RC)
     assert TIME_LIMIT_TEXT in st.waiter.message(st.waiter.events[-1])
     assert st.waiter.stop_news("s1") == ""
+
+
+async def test_a_job_with_as_many_epochs_is_refused_once_after_a_stop(cfg, world, http, tmp_path, monkeypatch):
+    # Loop run 8: told in each resume to use fewer epochs, the agent kept 150; all five jobs were stopped.
+    cfg.resume.enabled = False
+    cfg.isolation.scope = "off"
+    st, _ = await tools(cfg, world, http)
+    train = MCPServer(st).tools["train"][1]
+    headers = {"x-opencode-session": "s1"}
+    logs = iter(["/exp1.log", "/exp2.log", "/exp3.log", "/exp4.log", "/exp5.log"])
+    monkeypatch.setattr(subprocess, "run", lambda argv, cwd, **kw: subprocess.CompletedProcess(
+        argv, 0, json.dumps({"pid": os.getpid(), "log": next(logs)}), ""))
+
+    async def start(epochs, **job):
+        return await train({"command": f"python train.py --epochs {epochs}", "cwd": str(tmp_path), "gpus": "0",
+                            "vram": "1G", "resume_when_done": False, **job}, headers)
+
+    def stop(log):
+        w = Watch(id=log, session="s1", label="train", log=log)
+        st.waiter.watches[w.id] = w
+        st.waiter._finish(w, TIME_LIMIT_RC)
+
+    await start(150)
+    stop("/exp1.log")
+    with pytest.raises(ValueError, match="exp1.log used --epochs 150.*has --epochs 150"):
+        await start(150)
+    await start(150)  # sent again: it may fit a faster GPU
+    stop("/exp2.log")
+    await start(100)  # fewer epochs than the stopped job: no second look
+    stop("/exp3.log")
+    with pytest.raises(ValueError, match="exp3.log used --epochs 100"):
+        await start(120)  # more than the stopped 100; exp2's 150 is not reached

@@ -198,6 +198,9 @@ class MCPServer:
                     f"the task's time for new GPU jobs ended at {st.cfg.resume.until} (resume.until): do not start "
                     "another experiment. Finish with what you have: write up RESULTS.md and the deliverables the "
                     "README asks for. Inference for them can run with device 'cpu'")
+            if not cpu and st.waiter and (refusal := st.waiter.refuse_after_stop(
+                    st.router.header_session(headers) or st.router.last_session, args["command"])):
+                raise ValueError(refusal)
             count = args.get("gpu_count")
             if cpu and (args.get("gpus") or args.get("vram") or count):
                 raise ValueError("device 'cpu' takes no gpus, gpu_count or vram")
@@ -248,6 +251,8 @@ class MCPServer:
             if r.returncode != 0:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
+            if st.waiter:
+                st.waiter.note_job(info["log"], args["command"])
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])
