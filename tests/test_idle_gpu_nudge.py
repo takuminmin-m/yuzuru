@@ -7,6 +7,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -97,6 +98,76 @@ async def test_zero_turns_it_off(cfg, two_gpus, http, tmp_path):
     await asyncio.sleep(3.0)
     assert not turns(out)
     await broker.release_lease(lease.id, rc=0)
+
+
+def request(text="result", role="tool"):
+    return {"messages": [{"role": "user", "content": "go"}, {"role": role, "content": text}]}
+
+
+async def test_a_long_free_gpu_reaches_an_agent_in_the_middle_of_a_turn(cfg, two_gpus, http, tmp_path, monkeypatch):
+    # Loop run 10: 109 min of debugging in one long turn, with both GPUs almost unused.
+    out, go, broker, router, waiter = await setup(cfg, two_gpus, http, tmp_path)
+    cfg.resume.idle_gpu_remind_minutes = 15
+    clock = [1000.0 + time.time()]
+    monkeypatch.setattr("yuzuru.waits.time.time", lambda: clock[0])
+    cfg.resume.until = None
+    monkeypatch.setattr(type(cfg.resume), "deadline", lambda self: clock[0] + 7200)
+
+    def tick(minutes):
+        clock[0] += minutes * 60
+        body = request()
+        waiter.remind_of_free_gpu(body)
+        return body["messages"][-1]["content"]
+
+    assert tick(0) == "result"  # the clock starts here
+    assert tick(14) == "result"
+    assert "free for 15 min" in tick(1)
+    assert tick(14) == "result"  # not in every request
+    assert "free for 30 min" in tick(1)
+    # With every GPU busy the wait starts again.
+    leases = [await broker.create_lease(pid=os.getpid(), label="train", gpus=[], vram=None, drain=False, gpu_count=1,
+                                        session="s1", cwd=str(tmp_path), resume=False, note="") for _ in range(2)]
+    assert tick(60) == "result"
+    for l in leases:
+        await broker.release_lease(l.id, rc=0)
+    assert tick(0) == "result"
+    assert tick(14) == "result"
+    assert "free for 15 min" in tick(1)
+
+
+async def test_the_reminder_keeps_the_form_of_the_message(cfg, two_gpus, http, tmp_path, monkeypatch):
+    out, go, broker, router, waiter = await setup(cfg, two_gpus, http, tmp_path)
+    cfg.resume.idle_gpu_remind_minutes = 0.0001
+    waiter.remind_of_free_gpu(request())  # starts the clock
+    await asyncio.sleep(0.05)
+    parts = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+    waiter.remind_of_free_gpu(parts)
+    assert parts["messages"][0]["content"][0]["text"] == "hi" and "A GPU has been free" in parts["messages"][0]["content"][1]["text"]
+    await asyncio.sleep(0.05)
+    own = request(role="assistant")  # not put in the agent's own mouth
+    waiter.remind_of_free_gpu(own)
+    assert own["messages"][-1]["content"] == "result"
+
+
+@pytest.mark.parametrize("until", [None, -5, 5])
+async def test_no_reminder_without_time_to_use_it(cfg, two_gpus, http, tmp_path, until):
+    out, go, broker, router, waiter = await setup(cfg, two_gpus, http, tmp_path, until=until)
+    cfg.resume.idle_gpu_remind_minutes = 0.0001
+    waiter.remind_of_free_gpu(request())
+    await asyncio.sleep(0.05)
+    body = request()
+    waiter.remind_of_free_gpu(body)
+    assert body["messages"][-1]["content"] == "result"
+
+
+async def test_zero_turns_the_reminder_off(cfg, two_gpus, http, tmp_path):
+    out, go, broker, router, waiter = await setup(cfg, two_gpus, http, tmp_path)
+    cfg.resume.idle_gpu_remind_minutes = 0
+    waiter.remind_of_free_gpu(request())
+    await asyncio.sleep(0.05)
+    body = request()
+    waiter.remind_of_free_gpu(body)
+    assert body["messages"][-1]["content"] == "result"
 
 
 async def wait_answers(cfg, world, http, tmp_path, until):

@@ -229,6 +229,9 @@ class ResumeConfig:
     # whatever it does between them: only CPU jobs are left to start, and a finished agent gets them too.
     finish_by: str | None = None
     finish_nudges: int = 2
+    # With `until` set and several GPUs: when one has been free this long, add a reminder to the next LLM
+    # request, and again after as long (Loop run 10 debugged for 109 min in one long turn); 0 turns this off.
+    idle_gpu_remind_minutes: float = 15.0
 
     def __post_init__(self) -> None:
         until, finish = self.deadline(), self.finish_time()
