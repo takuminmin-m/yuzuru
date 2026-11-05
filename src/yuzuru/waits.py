@@ -47,6 +47,18 @@ FINISH = ("[yuzuru] Your turn ended and no job of yours is running. New GPU jobs
           "for exists and is correct, and make what is missing now from the best results you have. Inference can "
           "run through yuzuru_train with device 'cpu'. If everything is there, say so and end your turn.")
 
+IDLE_GPU = ("[yuzuru] Your turn ended with a GPU free, and new GPU jobs can start until {until} ({minutes} min from "
+            "now). Do not wait for the job that is running: start the next experiment on the free GPU now, then end "
+            "your turn. If no experiment is worth running, say why and end your turn.")
+IDLE_GPU_WAIT = ("A GPU is free, and new GPU jobs can start until {until} ({minutes} min from now). Before you end "
+                 "your turn or wait again, start the next experiment on the free GPU.")
+IDLE_GPU_REMINDER = ("[yuzuru] A GPU has been free for {free} min, and new GPU jobs can start until {until} ({minutes} "
+                     "min from now). Whatever you are working on, keep the GPUs busy: start the best setting so far with "
+                     "one change on the free GPU now, and carry on alongside it. If a method has not worked after a "
+                     "couple of attempts, use a library's version of it or drop it.")
+IDLE_GPU_MIN_LEFT = 600.0  # with less time left than this, a new job is not worth asking for
+IDLE_GPU_SETTLE = 2.0  # lets a resume for a job that ended during the turn go first
+
 
 @dataclass
 class Watch:
@@ -166,6 +178,11 @@ class Waiter:
         self._held: dict[str, list[tuple[Event, Watch]]] = {}
         self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
         self.finish_nudges: dict[str, int] = {}  # session -> turns continued between resume.until and finish_by
+        self.idle_gpu_nudges: dict[str, int] = {}  # session -> turns continued for a free GPU since it last started a job
+        self.idle_gpu_answers: dict[str, int] = {}  # session -> repeated `wait`s not held for a free GPU since its last job
+        self._gpu_free_since: float | None = None  # since when some GPU has been free, as seen by LLM requests
+        self._gpu_reminded = 0.0  # when the agent was last reminded of it
+        self._idle_gpu_checks: set[str] = set()  # sessions with a check waiting for their turn to end
         # session -> its latest resume: a client yuzuru started earlier can stay attached while the session
         # goes on (HPO run 1 had eight), and only the latest one may decide to continue the session.
         self.latest_resume: dict[str, asyncio.subprocess.Process] = {}
@@ -214,6 +231,11 @@ class Waiter:
         if not (lease.resume and lease.session):
             return None
         self.nudges.pop(lease.session, None)  # it started a job: not stalled
+        self.idle_gpu_nudges.pop(lease.session, None)
+        self.idle_gpu_answers.pop(lease.session, None)
+        if self.cfg.resume.deadline() is not None and lease.session not in self._idle_gpu_checks:
+            self._idle_gpu_checks.add(lease.session)
+            self._spawn(self._idle_gpu_after_turn(lease.session, lease.cwd))
         for w in self.watches.values():
             if w.session == lease.session and w.pid == lease.pid and not w.lease:
                 # The agent called `wait` on the job before its lease existed: take that watch over.
@@ -434,6 +456,7 @@ class Waiter:
             return
         if session in self._held or any(w.session == session for w in self.watches.values()) \
                 or any(l.session == session for l in self.broker.leases.values()):
+            await self._nudge_idle_gpu(session, cwd)
             return
         deadline = self.cfg.resume.deadline()
         if deadline is not None and (left := deadline - time.time()) > 60:
@@ -485,6 +508,96 @@ class Waiter:
         if not self.watches and self.cfg.resume.warm_before_resume:
             await self._warm(session)
         await self._continue(session, STALLED, cwd)
+
+    async def _idle_gpu_after_turn(self, session: str, cwd: str | None) -> None:
+        """Check for a free GPU when the turn that started a job ends. That turn may be the agent's first,
+        which `_after_turn` does not follow."""
+        try:
+            while self.in_turn(session):
+                await asyncio.sleep(1.0)
+            await asyncio.sleep(IDLE_GPU_SETTLE)
+        finally:
+            self._idle_gpu_checks.discard(session)
+        await self._nudge_idle_gpu(session, cwd)
+
+    def _free_gpu_minutes(self) -> float | None:
+        """Minutes left to start a job on a GPU that is free now, if asking for one is worth it."""
+        deadline = self.cfg.resume.deadline()
+        if not self.cfg.resume.idle_gpu_nudges or deadline is None \
+                or (left := deadline - time.time()) < IDLE_GPU_MIN_LEFT:
+            return None
+        usage = self.broker.gpu_usage()
+        return None if len(usage) < 2 or all(u["jobs"] for u in usage) else left / 60
+
+    def free_gpu_hint(self) -> str:
+        """For the answer to `wait`. An agent that keeps calling `wait` stays in its turn, so the nudge below never
+        comes (Loop run 3: the 3050 sat idle for 21 min, the agent "waiting for Exp7")."""
+        if (minutes := self._free_gpu_minutes()) is None:
+            return ""
+        text = IDLE_GPU_WAIT.format(until=self.cfg.resume.until, minutes=round(minutes))
+        return f"\n\n{text}\n{self.broker.gpu_usage_line()}"
+
+    def remind_of_free_gpu(self, body: dict[str, Any]) -> None:
+        """Add a reminder to an LLM request when a GPU has long been free, whatever the agent is doing.
+
+        The nudges wait for a turn to end and the hints for `wait`: an agent debugging in one long turn meets neither
+        (Loop run 10: 109 min on a hand-written CutMix with both GPUs almost unused).
+        """
+        every = self.cfg.resume.idle_gpu_remind_minutes * 60
+        minutes = self._free_gpu_minutes()
+        now = time.time()
+        if minutes is None:
+            self._gpu_free_since = None
+            return
+        if self._gpu_free_since is None:
+            self._gpu_free_since = now
+        if every <= 0 or now - max(self._gpu_free_since, self._gpu_reminded) < every:
+            return
+        messages = body.get("messages") or []
+        if not messages or messages[-1].get("role") not in ("user", "tool"):
+            return
+        text = IDLE_GPU_REMINDER.format(free=round((now - self._gpu_free_since) / 60), until=self.cfg.resume.until,
+                                        minutes=round(minutes))
+        content = messages[-1].get("content")
+        if isinstance(content, str):
+            messages[-1]["content"] = f"{content}\n\n{text}"
+        elif isinstance(content, list):
+            content.append({"type": "text", "text": text})
+        else:
+            return
+        self._gpu_reminded = now
+        log.info("reminded the agent of a free GPU (free for %.0f min)", (now - self._gpu_free_since) / 60)
+
+    def answer_at_once_for_free_gpu(self, session: str | None) -> bool:
+        """Whether a repeated `wait` should say at once that a GPU is free, rather than after a long hold (Loop run 5:
+        with the 3050 free, two holds of 4 min and more went by before the agent started a job, 18 min idle)."""
+        if not session or self._free_gpu_minutes() is None:
+            return False
+        done = self.idle_gpu_answers.get(session, 0)
+        if done >= self.cfg.resume.idle_gpu_nudges:  # it has been told: holding the call keeps it from polling
+            return False
+        self.idle_gpu_answers[session] = done + 1
+        return True
+
+    async def _nudge_idle_gpu(self, session: str, cwd: str | None) -> None:
+        """Continue a turn that ended with a job running and a GPU free. Otherwise nothing wakes the agent until
+        that job ends (Overfit run 2: the 3050 sat idle for 42 min, the agent "waiting for Exp2")."""
+        if (minutes := self._free_gpu_minutes()) is None:
+            return
+        if session in self._held or self.in_turn(session) \
+                or not any(l.session == session for l in self.broker.leases.values()):
+            return
+        limit = self.cfg.resume.idle_gpu_nudges
+        done = self.idle_gpu_nudges.get(session, 0)
+        if done >= limit:
+            log.info("session %s ended its turn with a GPU free; not continuing it again (%d since its last job)",
+                     session, done)
+            return
+        self.idle_gpu_nudges[session] = done + 1
+        log.warning("session %s ended its turn with a GPU free, %.0f min before resume.until; continuing it (%d/%d)",
+                    session, minutes, done + 1, limit)
+        text = IDLE_GPU.format(until=self.cfg.resume.until, minutes=round(minutes))
+        await self._continue(session, f"{text}\n\n{self.broker.gpu_usage_line()}", cwd)
 
     async def _retry_load_failure(self, session: str, before: int, cwd: str | None,
                                   proc: asyncio.subprocess.Process, message: str) -> bool:
