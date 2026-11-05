@@ -259,7 +259,7 @@ class MCPServer:
                                  "The local LLM is released while the job runs.") +
                          " End your turn now: this session is resumed automatically with the exit status and "
                          "the log tail when the job ends.")
-            return text
+            return (st.waiter.stop_news(session) if st.waiter else "") + text
 
         @self.tool(
             "wait",
@@ -294,8 +294,9 @@ class MCPServer:
                 if seconds > 0 and w.repeats > 1:  # it ignored the first hold's "end your turn"
                     seconds = max(seconds, r.repeat_wait_max_seconds)
                 if seconds > 0:
-                    return await _held_wait(st, w, session, seconds)
-            return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
+                    answer = await _held_wait(st, w, session, seconds)
+                    return st.waiter.stop_news(session) + answer
+            return (st.waiter.stop_news(session) + f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
                     f"turn now: session {session} is resumed automatically when the process exits.")
 
     async def handle(self, request: Request) -> Response:

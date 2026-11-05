@@ -83,6 +83,7 @@ class Event:
     resumed: bool = False
     resume_error: str | None = None
     delivered: bool = False  # answered a held `wait` call: the agent has it already
+    told: bool = False  # a limit stop named in a resume or in another tool's answer
 
 
 def outside_env() -> dict[str, str]:
@@ -351,7 +352,22 @@ class Waiter:
         status = Waiter._ended(ev)
         return f"{ev.label} {status} after {ev.duration / 60:.1f} min"
 
+    def stop_news(self, session: str | None) -> str:
+        """Jobs of `session` stopped at the time limit that the agent has not been told about.
+
+        A job that ends during a turn is held for the turn's end, and is dropped once the agent starts
+        another job: in Loop run 7 two stops never reached it, and it started the next job with the same epochs.
+        """
+        unseen = [e for e in self.events
+                  if session and e.session == session and e.rc == TIME_LIMIT_RC and not (e.delivered or e.told)]
+        for e in unseen:
+            e.told = True
+        return "".join(f"[yuzuru] {e.log or e.label}: {TIME_LIMIT_TEXT} (after {e.duration / 60:.1f} min)\n\n"
+                       for e in unseen)
+
     def message(self, ev: Event, earlier: list[Event] | None = None) -> str:
+        for e in [ev, *(earlier or [])]:
+            e.told = True
         status = Waiter._ended(ev)
         minutes = ev.duration / 60
         parts = [f"[yuzuru] The process you were waiting for ({ev.label}) {status} after {minutes:.1f} min."]

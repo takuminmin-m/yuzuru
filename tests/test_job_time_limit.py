@@ -9,7 +9,9 @@ import time
 
 from yuzuru.mcp import MCPServer
 from yuzuru.server import State
-from yuzuru.waits import TIME_LIMIT_RC, TIME_LIMIT_TEXT, Event, Waiter
+from yuzuru.waits import TIME_LIMIT_RC, TIME_LIMIT_TEXT, Event, Waiter, Watch
+
+from .test_repeated_wait import tools
 
 
 def minutes_from_now(n):
@@ -80,3 +82,35 @@ def test_the_outcome_says_why_it_stopped():
     ev = Event(id=1, watch="w", session="s1", label="train", rc=TIME_LIMIT_RC, duration=2700.0, log=None, log_tail="",
                note="")
     assert TIME_LIMIT_TEXT in Waiter._status(ev)
+
+
+async def test_a_stop_during_a_turn_reaches_the_next_answer(cfg, world, http, tmp_path):
+    # Loop run 7: the agent was polling, and the stop text reached it only at the end of the task.
+    cfg.resume.enabled = False
+    cfg.resume.repeat_wait_seconds = 0.0
+    st, wait = await tools(cfg, world, http)
+    w = Watch(id="w1", session="s1", label="train", log="exp2.log")
+    st.waiter.watches[w.id] = w
+    st.waiter._finish(w, TIME_LIMIT_RC)
+    other = Watch(id="w2", session="s2", label="train", log="other.log")
+    st.waiter.watches[other.id] = other
+    st.waiter._finish(other, TIME_LIMIT_RC)
+    job = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        headers = {"x-opencode-session": "s1"}
+        first = await wait({"pid": job.pid, "device": "cpu"}, headers)
+        assert "exp2.log" in first and TIME_LIMIT_TEXT in first and "other.log" not in first  # the other session's stays
+        assert TIME_LIMIT_TEXT not in await wait({"pid": job.pid, "device": "cpu"}, headers)  # said once
+    finally:
+        job.kill()
+        job.wait()
+
+
+async def test_a_resume_counts_as_telling(cfg, world, http, tmp_path):
+    cfg.resume.enabled = False
+    st, _ = await tools(cfg, world, http)
+    w = Watch(id="w1", session="s1", label="train", log="exp2.log")
+    st.waiter.watches[w.id] = w
+    st.waiter._finish(w, TIME_LIMIT_RC)
+    assert TIME_LIMIT_TEXT in st.waiter.message(st.waiter.events[-1])
+    assert st.waiter.stop_news("s1") == ""
