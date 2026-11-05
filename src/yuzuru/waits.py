@@ -175,6 +175,7 @@ class Waiter:
         self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
         self.finish_nudges: dict[str, int] = {}  # session -> turns continued between resume.until and finish_by
         self.idle_gpu_nudges: dict[str, int] = {}  # session -> turns continued for a free GPU since it last started a job
+        self.idle_gpu_answers: dict[str, int] = {}  # session -> repeated `wait`s not held for a free GPU since its last job
         self._idle_gpu_checks: set[str] = set()  # sessions with a check waiting for their turn to end
         # session -> its latest resume: a client yuzuru started earlier can stay attached while the session
         # goes on (HPO run 1 had eight), and only the latest one may decide to continue the session.
@@ -225,6 +226,7 @@ class Waiter:
             return None
         self.nudges.pop(lease.session, None)  # it started a job: not stalled
         self.idle_gpu_nudges.pop(lease.session, None)
+        self.idle_gpu_answers.pop(lease.session, None)
         if self.cfg.resume.deadline() is not None and lease.session not in self._idle_gpu_checks:
             self._idle_gpu_checks.add(lease.session)
             self._spawn(self._idle_gpu_after_turn(lease.session, lease.cwd))
@@ -528,6 +530,17 @@ class Waiter:
             return ""
         text = IDLE_GPU_WAIT.format(until=self.cfg.resume.until, minutes=round(minutes))
         return f"\n\n{text}\n{self.broker.gpu_usage_line()}"
+
+    def answer_at_once_for_free_gpu(self, session: str | None) -> bool:
+        """Whether a repeated `wait` should say at once that a GPU is free, rather than after a long hold (Loop run 5:
+        with the 3050 free, two holds of 4 min and more went by before the agent started a job, 18 min idle)."""
+        if not session or self._free_gpu_minutes() is None:
+            return False
+        done = self.idle_gpu_answers.get(session, 0)
+        if done >= self.cfg.resume.idle_gpu_nudges:  # it has been told: holding the call keeps it from polling
+            return False
+        self.idle_gpu_answers[session] = done + 1
+        return True
 
     async def _nudge_idle_gpu(self, session: str, cwd: str | None) -> None:
         """Continue a turn that ended with a job running and a GPU free. Otherwise nothing wakes the agent until

@@ -285,7 +285,7 @@ class MCPServer:
                 seconds = r.repeat_wait_seconds
                 if seconds > 0 and w.repeats > 1:  # it ignored the first hold's "end your turn"
                     seconds = max(seconds, r.repeat_wait_max_seconds)
-                if seconds > 0:
+                if seconds > 0 and not st.waiter.answer_at_once_for_free_gpu(session):
                     return await _held_wait(st, w, session, seconds)
             return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
                     f"turn now: session {session} is resumed automatically when the process exits."
