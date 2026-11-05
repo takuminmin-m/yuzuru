@@ -39,7 +39,8 @@ LLM_BACK = ("[yuzuru] Your turn stopped because the local LLM could not be loade
 LOAD_RETRIES = 6  # resumes in a row retried after a failed LLM load, one per LOAD_FAILURE_COOLDOWN: about an hour
 
 TIME_LIMIT_RC = 124  # what `timeout` exits with
-TIME_LIMIT_TEXT = "stopped by yuzuru: it reached the task's time limit for a job"
+TIME_LIMIT_TEXT = ("stopped by yuzuru: it reached the task's time limit for a job. It did not finish, so do not compare "
+                   "it with finished runs; start the next job with fewer epochs")
 
 UNTIL = ("[yuzuru] Your turn ended and no job of yours is running, but this task goes on until {until} "
          "({minutes} min from now). Do not finish early: check the end conditions in README.md and use the time "
