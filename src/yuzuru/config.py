@@ -214,6 +214,11 @@ class ResumeConfig:
     # Stop a GPU job after this many minutes; 0 is no limit. A rule in README.md does not hold: Loop run 4 spent
     # its 2.5 hours on 3 jobs of 116+ min, while Rules run 1 got 7 trials with jobs of at most 33 min.
     job_max_minutes: float = 0.0
+    # Stop a job early whose epochs, at the speed its log shows, would take this much longer than the job's
+    # limit (0.1: 10 %), and tell the agent the epochs that fit. Checked in the first half of the limit only;
+    # 0 turns it off. Loop run 12: four of five jobs ran their whole 45 min and were stopped with the learning
+    # rate still high (200 epochs at 16 s), the only one that fit was the best.
+    overrun_margin: float = 0.1
     # The task runs until this local time ("2026-10-31T06:15"), e.g. a time-boxed search: a resumed
     # turn that ends before it with no job of the session running is continued, telling the agent
     # how long is left (HPO run 1 declared itself done 3.5 hours early). Set it to when the last
