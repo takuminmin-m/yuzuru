@@ -44,6 +44,40 @@ TIME_LIMIT_RC = 124  # what `timeout` exits with
 EPOCHS_ARG = re.compile(r"--(?:num[-_])?epochs?[= ]+(\d+)")
 OVERRUN_CHECK_SECONDS = 30.0  # how often a running job's log is read for its progress
 OVERRUN_MIN_EPOCHS = 3  # epochs seen go by before their speed is trusted
+# Options that only name a run or say where its outputs go: two commands that differ only in these train the same.
+RUN_NAME_ARG = re.compile(
+    r"\s--(?:name|run[-_]?name|exp(?:[-_]?name)?|tag|out(?:put)?(?:[-_]?dir)?|save(?:[-_]?(?:dir|path))?|"
+    r"ckpt|checkpoint|log(?:[-_]?(?:dir|file))?)(?:[= ]+(?:\"[^\"]*\"|'[^']*'|\S+))")
+SCRIPT_ARG = re.compile(r"[\w./-]+\.py\b")
+
+
+@dataclass
+class Started:
+    """A GPU job as it was started: what it ran and the scripts it ran, to tell a repeat from a change."""
+
+    session: str
+    log: str
+    command: str
+    key: str
+    scripts: str
+    refused: bool = False
+
+
+def run_key(command: str) -> str:
+    """`command` without the options that only name the run, with its spaces evened out."""
+    return " ".join(RUN_NAME_ARG.sub("", " " + command).split())
+
+
+def scripts_digest(command: str, cwd: str | Path) -> str:
+    """The contents of the Python scripts `command` names, so that a command run again after a fix is not a repeat."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for name in sorted(set(SCRIPT_ARG.findall(command))):
+        p = Path(cwd) / name
+        with contextlib.suppress(OSError):
+            h.update(name.encode() + b"\0" + p.read_bytes())
+    return h.hexdigest()
 
 
 def epochs_done(text: str, total: int) -> int | None:
@@ -217,6 +251,7 @@ class Waiter:
         self.progress: dict[str, tuple[float, int]] = {}  # watch -> (time, epochs) when first seen going
         self.progress_read: dict[str, float] = {}  # watch -> when its log was last read
         self.overruns: dict[str, Overrun] = {}  # lease -> why yuzuru stopped it
+        self.started: list[Started] = []  # GPU jobs started, for `refuse_repeat`
         self.undelivered: dict[str, str] = {}  # session -> what such a resume was to say
         broker.on_lease_end.append(self._lease_ended)
 
@@ -471,6 +506,40 @@ class Waiter:
                 f"This command has --epochs {m.group(1)}. From the seconds per epoch in that log, work out the epochs that "
                 "fit, leave a margin, and use those from now on. If this job really fits (a faster GPU, a smaller "
                 "model), send the same command again.")
+
+    def note_started(self, session: str | None, log: str | None, command: str, cwd: str | Path) -> None:
+        """Remember a GPU job of `session`, for `refuse_repeat`."""
+        if session and log:
+            self.started.append(Started(session=session, log=log, command=command, key=run_key(command),
+                                        scripts=scripts_digest(command, cwd)))
+
+    def refuse_repeat(self, session: str | None, command: str, cwd: str | Path) -> str | None:
+        """Why a GPU job that trains the same as one this session already ran should not start, once per such job.
+
+        Loop run 17: of the 3 hours, four 75-100 epoch jobs ran one setting under four names (r18, cutmix,
+        r18_v2, r18_v3: 76.2-76.9%), while the rule to check RESULTS.md for the same setting was in AGENTS.md.
+        The same command after a change to its script is not a repeat, nor one after a job that failed or was
+        stopped at its time limit (`refuse_after_stop` answers that one).
+        """
+        if not session:
+            return None
+        key, digest = run_key(command), scripts_digest(command, cwd)
+        ended = {e.log: e for e in self.events if e.session == session and e.log}
+        same = [s for s in self.started if s.session == session and not s.refused and s.key == key
+                and s.scripts == digest and (s.log not in ended or ended[s.log].rc == 0)]
+        if not same:
+            return None
+        for s in same:
+            s.refused = True
+        last = same[-1]
+        e = ended.get(last.log)
+        line = next((x for x in reversed(tail(last.log, str(cwd), 20).splitlines()) if x.strip()), "")
+        how = "is still running" if e is None else f"finished after {e.duration / 60:.0f} min"
+        return (f"not started: this trains the same as {last.log}, which {how}: the same command apart from the "
+                f"run's name ({last.command!r}), and the same scripts. Its last line: {line!r}. Running one setting "
+                "again only shows how much results vary from run to run. Change one setting for the next experiment "
+                "(look in RESULTS.md for what was tried), and check that the change is in the command or the script. "
+                "If you do mean to measure that variation, send the same command again.")
 
     def stop_news(self, session: str | None) -> str:
         """Jobs of `session` stopped at the time limit that the agent has not been told about.
