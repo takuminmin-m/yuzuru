@@ -15,6 +15,7 @@ import contextlib
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -41,6 +42,33 @@ LOAD_RETRIES = 6  # resumes in a row retried after a failed LLM load, one per LO
 
 TIME_LIMIT_RC = 124  # what `timeout` exits with
 EPOCHS_ARG = re.compile(r"--(?:num[-_])?epochs?[= ]+(\d+)")
+OVERRUN_CHECK_SECONDS = 30.0  # how often a running job's log is read for its progress
+OVERRUN_MIN_EPOCHS = 3  # epochs seen go by before their speed is trusted
+
+
+def epochs_done(text: str, total: int) -> int | None:
+    """The last "k/total" in a log ("Ep 12/200", "[epoch] 44/45", "E3/100"): the epochs finished so far."""
+    found = re.findall(rf"(?<![\d.])(\d+)\s*/\s*{total}(?![\d.])", text)
+    done = [int(k) for k in found if 0 < int(k) <= total]
+    return done[-1] if done else None
+
+
+@dataclass
+class Overrun:
+    epochs: int  # the job's --epochs
+    done: int  # epochs finished when it was stopped
+    per_epoch: float
+    need: float  # seconds the job would have taken
+    limit: float
+    fit: int  # epochs that end in about 8/10 of the limit
+
+    def text(self) -> str:
+        return (f"stopped early by yuzuru after {self.done} of {self.epochs} epochs: at {self.per_epoch:.0f} s per "
+                f"epoch it needs about {self.need / 60:.0f} min, over the time limit of {self.limit / 60:.0f} min, "
+                "and would have been stopped there with its learning rate still high. Start it again with "
+                f"--epochs {self.fit} or fewer (about 8/10 of the limit on this GPU; a slower GPU needs fewer)")
+
+
 TIME_LIMIT_TEXT = ("stopped by yuzuru: it reached the task's time limit for a job. It did not finish, so do not compare "
                    "it with finished runs; start the next job with fewer epochs")
 
@@ -87,6 +115,7 @@ class Event:
     delivered: bool = False  # answered a held `wait` call: the agent has it already
     told: bool = False  # a limit stop named in a resume or in another tool's answer
     refused: bool = False  # refused a job with as many epochs, which the agent may repeat
+    overrun: Overrun | None = None  # stopped early: its epochs would not fit the time limit
 
 
 def outside_env() -> dict[str, str]:
@@ -184,6 +213,10 @@ class Waiter:
         self.holding: Counter[str] = Counter()  # session -> `wait` calls being held
         self.load_retries: dict[str, int] = {}  # session -> resumes in a row lost to a failed LLM load
         self.job_epochs: dict[str, int] = {}  # log -> the job's --epochs
+        self.job_limits: dict[str, float] = {}  # log -> the job's time limit in seconds
+        self.progress: dict[str, tuple[float, int]] = {}  # watch -> (time, epochs) when first seen going
+        self.progress_read: dict[str, float] = {}  # watch -> when its log was last read
+        self.overruns: dict[str, Overrun] = {}  # lease -> why yuzuru stopped it
         self.undelivered: dict[str, str] = {}  # session -> what such a resume was to say
         broker.on_lease_end.append(self._lease_ended)
 
@@ -260,6 +293,7 @@ class Waiter:
         for w in [w for w in self.watches.values() if w.pid is not None and not w.lease]:
             if not _pid_alive(w.pid):
                 self._finish(w, None)
+        self.check_overruns()
         # Only a watch that asked for it suspends (a CPU-only job's does not).
         if self.suspend_pending and any(w.suspend for w in self.watches.values()) and self._quiet():
             self.suspend_pending = False
@@ -304,6 +338,10 @@ class Waiter:
             log_tail=tail(w.log, w.cwd, self.cfg.resume.log_tail_lines), note=w.note,
         )
         self._next += 1
+        self.progress.pop(w.id, None)
+        self.progress_read.pop(w.id, None)
+        if w.lease and (over := self.overruns.pop(w.lease, None)):
+            ev.rc, ev.overrun = TIME_LIMIT_RC, over  # a stop like the limit's, with the epochs that fit
         if not self.watches:
             self.suspend_pending = False
         if w.session and self.holding[w.session]:
@@ -347,6 +385,8 @@ class Waiter:
 
     @staticmethod
     def _ended(ev: Event) -> str:
+        if over := getattr(ev, "overrun", None):
+            return over.text()
         if ev.rc == TIME_LIMIT_RC:
             return TIME_LIMIT_TEXT
         return "finished" if ev.rc == 0 else (f"exited with code {ev.rc}" if ev.rc is not None else "exited")
@@ -356,10 +396,55 @@ class Waiter:
         status = Waiter._ended(ev)
         return f"{ev.label} {status} after {ev.duration / 60:.1f} min"
 
-    def note_job(self, log: str | None, command: str) -> None:
-        """Remember the epochs a job was started with, for `refuse_after_stop`."""
+    def note_job(self, log: str | None, command: str, limit: float | None = None) -> None:
+        """Remember the epochs a job was started with (for `refuse_after_stop`) and its time limit."""
         if log and (m := EPOCHS_ARG.search(command)):
             self.job_epochs[log] = int(m.group(1))
+            if limit is not None:
+                self.job_limits[log] = limit
+            else:
+                self.job_limits.pop(log, None)
+
+    def check_overruns(self, now: float | None = None) -> None:
+        """Stop a GPU job early whose epochs will not fit its time limit, at the speed its log shows.
+
+        Such a job runs its whole limit and ends with its learning rate still high: neither a result nor a
+        comparison (Loop run 12 lost four of its five 45-min jobs so). The agent cannot stop a job itself.
+        A job a little over (within `overrun_margin`) runs on: near its end the learning rate is low already.
+        """
+        margin = self.cfg.resume.overrun_margin
+        if margin <= 0:
+            return
+        now = time.time() if now is None else now
+        for w in list(self.watches.values()):
+            epochs, limit = self.job_epochs.get(w.log or ""), self.job_limits.get(w.log or "")
+            lease = self.broker.leases.get(w.lease) if w.lease else None
+            if not (epochs and limit and lease) or lease.cpu or w.lease in self.overruns:
+                continue
+            elapsed = now - w.created
+            if elapsed > limit / 2 or now - self.progress_read.get(w.id, 0.0) < OVERRUN_CHECK_SECONDS:
+                continue
+            self.progress_read[w.id] = now
+            done = epochs_done(tail(w.log, w.cwd, 30), epochs)
+            if done is None:
+                continue
+            first_at, first = self.progress.setdefault(w.id, (now, done))
+            if done - first < OVERRUN_MIN_EPOCHS:
+                continue
+            per = (now - first_at) / (done - first)
+            need = elapsed + (epochs - done) * per
+            if need <= limit * (1 + margin):
+                continue
+            startup = max(0.0, elapsed - done * per)
+            fit = max(1, int((0.8 * limit - startup) / per))
+            over = Overrun(epochs=epochs, done=done, per_epoch=per, need=need, limit=limit, fit=fit)
+            self.overruns[lease.id] = over
+            log.info("stopping lease %s (pid %s) early: %s", lease.id, lease.pid, over.text())
+            try:
+                os.kill(lease.pid, signal.SIGTERM)  # `timeout`: it passes the signal on to the job's process group
+            except OSError as e:
+                log.warning("stopping pid %s: %s", lease.pid, e)
+                self.overruns.pop(lease.id, None)
 
     def refuse_after_stop(self, session: str | None, command: str) -> str | None:
         """Why a job with as many epochs as a job stopped at the time limit should not start, once per stop.
@@ -378,8 +463,11 @@ class Waiter:
             return None
         last = stops[-1]
         line = next((x for x in reversed(last.log_tail.splitlines()) if x.strip()), "")
-        return (f"not started: {last.log} used --epochs {self.job_epochs[last.log]} and was stopped at the time limit "
-                f"after {last.duration / 60:.0f} min, before its learning rate finished falling. Its last line: {line!r}. "
+        how = (f"was stopped early, after {last.overrun.done} epochs: at {last.overrun.per_epoch:.0f} s per epoch it "
+               f"needed about {last.overrun.need / 60:.0f} min" if last.overrun else
+               f"was stopped at the time limit after {last.duration / 60:.0f} min")
+        return (f"not started: {last.log} used --epochs {self.job_epochs[last.log]} and {how}, "
+                f"before its learning rate finished falling. Its last line: {line!r}. "
                 f"This command has --epochs {m.group(1)}. From the seconds per epoch in that log, work out the epochs that "
                 "fit, leave a margin, and use those from now on. If this job really fits (a faster GPU, a smaller "
                 "model), send the same command again.")
@@ -394,7 +482,7 @@ class Waiter:
                   if session and e.session == session and e.rc == TIME_LIMIT_RC and not (e.delivered or e.told)]
         for e in unseen:
             e.told = True
-        return "".join(f"[yuzuru] {e.log or e.label}: {TIME_LIMIT_TEXT} (after {e.duration / 60:.1f} min)\n\n"
+        return "".join(f"[yuzuru] {e.log or e.label}: {self._ended(e)} (after {e.duration / 60:.1f} min)\n\n"
                        for e in unseen)
 
     def message(self, ev: Event, earlier: list[Event] | None = None) -> str:

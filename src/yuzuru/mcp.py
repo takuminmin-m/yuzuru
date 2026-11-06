@@ -252,7 +252,7 @@ class MCPServer:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
             if st.waiter:
-                st.waiter.note_job(info["log"], args["command"])
+                st.waiter.note_job(info["log"], args["command"], limit)
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])
@@ -359,7 +359,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
                 f"{session} is resumed automatically with the outcome when it exits.")
     parts = []
     for ev in ended:
-        code = f" ({TIME_LIMIT_TEXT})" if ev.rc == TIME_LIMIT_RC else f" (exit code {ev.rc})" if ev.rc is not None else ""
+        code = f" ({st.waiter._ended(ev)})" if ev.rc == TIME_LIMIT_RC else f" (exit code {ev.rc})" if ev.rc is not None else ""
         parts.append(f"{ev.label} ended{code} after {ev.duration / 60:.1f} min. Last lines of "
                      f"{ev.log or 'its log'}:\n```\n{ev.log_tail[-2000:]}\n```")
     if w.id in st.waiter.watches:
