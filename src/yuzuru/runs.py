@@ -326,7 +326,10 @@ def table(cwd: str | Path) -> str:
     lines = []
     for _, r in runs:
         args = (r.get("setting") or {}).get("args", {})
-        minutes = f"{(r['ended'] - r['started']) / 60:.0f} min" if r.get("ended") else "running"
+        if r.get("ended"):
+            minutes = f"{(r['ended'] - r['started']) / 60:.0f} min"
+        else:  # no end recorded: a job refused for want of a free GPU after it was started, or a server restart
+            minutes = "running" if _pid_alive(r.get("pid")) else "gone"
         changed = " ".join(f"{k}={args[k]}" for k in varying if k in args)
         lines.append(f"{r['id']:<24} rc={r.get('rc')!s:<4} {minutes:>8}  {changed}")
     return "\n".join(lines)

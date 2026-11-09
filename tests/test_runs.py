@@ -76,6 +76,15 @@ def test_a_record_keeps_the_command_the_setting_and_the_code(task):
     assert "002-x" in runs.table(task) and "wd=0.02" in runs.table(task)
 
 
+def test_a_job_that_is_gone_is_not_shown_as_running(task):
+    # All-PR run: 8 jobs sent at once, the ones with no free GPU left records that read "running" for hours.
+    runs.started(runs.begin("python train.py --name lost", task, "s1", None, gpu=True), 999_999_999, str(task / "a.log"))
+    runs.started(runs.begin("python train.py --name live --lr 0.2", task, "s1", None, gpu=True), os.getpid(), str(task / "b.log"))
+    lost, live = runs.table(task).splitlines()
+    assert "gone" in lost and "running" not in lost
+    assert "running" in live and "gone" not in live
+
+
 def test_the_same_setting_is_refused_once(task):
     finish(runs.begin("python train.py --name exp02 --epochs 60", task, "s1", None, gpu=True))
     refusal = runs.refuse_repeat("python train.py --name exp05 --epochs 60 --lr 0.1 --wd 5e-4 --seed 123", task)
