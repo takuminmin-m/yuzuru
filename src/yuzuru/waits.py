@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import scope
+from . import runs, scope
 from .broker import Broker, Lease, Placement, _pid_alive
 from .config import Config
 
@@ -243,6 +243,9 @@ class Waiter:
         return next((x for x in self.watches.values() if x.session == w.session and target(x) == target(w)), None)
 
     def _lease_ended(self, lease: Lease, rc: int | None) -> None:
+        if lease.kind == "job" and lease.log:
+            last = next((x for x in reversed(tail(lease.log, lease.cwd, 5).splitlines()) if x.strip()), "")
+            runs.ended(lease.cwd, lease.log, rc, last)
         for w in [w for w in self.watches.values() if w.lease == lease.id]:
             self._finish(w, rc)
 

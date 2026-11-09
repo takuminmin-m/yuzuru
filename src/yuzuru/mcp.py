@@ -24,7 +24,7 @@ from typing import Any
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from . import __version__, scope
+from . import __version__, runs, scope
 from .waits import outside_env, tail
 
 log = logging.getLogger("yuzuru.mcp")
@@ -239,10 +239,18 @@ class MCPServer:
                 # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
                 argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True,
                                   cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
-            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=outside_env(), capture_output=True, text=True, timeout=30)
+            if not cpu and (refusal := runs.refuse_repeat(args["command"], cwd)):
+                raise ValueError(refusal)
+            # yuzuru's own record of the job (.yuzuru/runs/): its command, setting and code, whatever the agent keeps.
+            record = runs.begin(args["command"], cwd, session, args.get("log"), gpu=not cpu)
+            env = outside_env()
+            env[runs.RUN_DIR_ENV] = str(record)
+            r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
             if r.returncode != 0:
+                runs.ended(cwd, args.get("log"), None, "did not start: " + (r.stderr or r.stdout).strip()[-200:])
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
+            runs.started(record, info["pid"], info["log"])
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])

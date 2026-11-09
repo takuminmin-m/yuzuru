@@ -168,6 +168,44 @@ def _hint_on_cuda_errors():
     sys.excepthook = hook
 
 
+def _record_args(run_dir):
+    """Write the arguments the job's script parses, defaults included, to `run_dir`/args.json.
+
+    yuzuru keeps a record of each job (yuzuru/runs.py); what argparse returned is the setting the
+    job really trained with. Only a script of the task (a .py file under the job's directory) is
+    recorded, not a launcher such as `accelerate launch` that parses its own options first, and
+    only its outermost parse (a subparser's comes first). The first such parse in the job wins.
+    """
+    script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    if not script.endswith(".py") or not script.startswith(os.path.abspath(os.getcwd()) + os.sep):
+        return
+    import argparse
+
+    original = argparse.ArgumentParser.parse_known_args
+    depth = [0]
+
+    def parse_known_args(self, args=None, namespace=None):
+        depth[0] += 1
+        try:
+            result = original(self, args, namespace)
+        finally:
+            depth[0] -= 1
+        if depth[0] == 0:
+            try:
+                import json
+
+                fd = os.open(os.path.join(run_dir, "args.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"script": script, "argv": sys.argv[1:], "args": vars(result[0])}, f, indent=2,
+                              default=str)
+                    f.write("\n")
+            except (OSError, TypeError, ValueError):
+                pass
+        return result
+
+    argparse.ArgumentParser.parse_known_args = parse_known_args
+
+
 def _chain():
     import importlib.machinery
     import importlib.util
@@ -184,4 +222,6 @@ if _PINNED is not None:
     _pin()
     if _AGENT:
         _hint_on_cuda_errors()
+if os.environ.get("YUZURU_RUN_DIR") and not _AGENT:
+    _record_args(os.environ["YUZURU_RUN_DIR"])
 _chain()

@@ -100,7 +100,9 @@ async def train(cfg, two_gpus, http, tmp_path, monkeypatch):
     st = State(cfg, probe=FakeProbe(two_gpus), http=http)
     await st.broker.refresh()
     base = {"command": "python train.py", "cwd": str(tmp_path), "resume_when_done": False}
-    return SimpleNamespace(call=lambda **kw: mcp_mod.MCPServer(st).tools["train"][1](base | kw, {}), argv=calls, st=st)
+    # Each call another setting: yuzuru refuses once a job that trains the same as one running (runs.py).
+    return SimpleNamespace(call=lambda **kw: mcp_mod.MCPServer(st).tools["train"][1](
+        base | {"command": f"python train.py --epochs {len(calls) + 1}"} | kw, {}), argv=calls, st=st)
 
 
 def flag(argv, name):

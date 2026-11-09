@@ -817,7 +817,7 @@ async def test_mcp_gpu_job_needs_vram_or_gpus(cfg, world, http, tmp_path, monkey
     assert not calls
     await train(base | {"vram": "6G"}, {})
     assert calls[-1][calls[-1].index("--vram") + 1] == "6G"
-    await train(base | {"gpus": "1"}, {})  # whole GPUs: the LLM keeps off them
+    await train(base | {"gpus": "1", "command": "python train.py --lr 0.05"}, {})  # whole GPUs: the LLM keeps off them
     assert "--gpu" in calls[-1] and "--vram" not in calls[-1]
     await train(base | {"device": "cpu"}, {})
     assert "--cpu" in calls[-1]
