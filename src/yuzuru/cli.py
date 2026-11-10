@@ -318,6 +318,13 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("runs", help="list the jobs recorded in a task's .yuzuru/runs/ (command, setting, code, outcome)")
     p.add_argument("dir", nargs="?", default=".", help="the task directory (default: here)")
+    p = sub.add_parser("report", help="sum up a task's run: the best job and its weights, what each job changed, "
+                       "GPU idle time, what went wrong")
+    p.add_argument("dir", nargs="?", default=".", help="the task directory (default: here)")
+    p.add_argument("--metric", help="the `name=value` pair of the logs to compare jobs by (default: guessed, "
+                   "e.g. val_acc)")
+    p.add_argument("--lower", action="store_true", default=None, help="with --metric: lower is better")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("agent", help="start an agent (e.g. opencode run) in its own memory-capped scope")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
@@ -385,6 +392,11 @@ def main(argv: list[str] | None = None) -> None:
         from .runs import table
 
         return print(table(Path(args.dir)))
+    if args.command == "report":
+        from . import report
+
+        r = report.build(Path(args.dir), args.metric, args.lower)
+        return print(json.dumps(r, indent=1, ensure_ascii=False) if args.json else report.text(r))
     if args.command == "init":
         from .scaffold import cmd_init
 

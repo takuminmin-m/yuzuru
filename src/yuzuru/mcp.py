@@ -233,6 +233,7 @@ class MCPServer:
                 argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True,
                                   cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
             if not cpu and (refusal := runs.refuse_repeat(args["command"], cwd)):
+                runs.note(cwd, "repeat_refused", command=args["command"])
                 raise ValueError(refusal)
             if st.waiter:
                 await asyncio.to_thread(st.waiter.weights.keep, cwd)
@@ -249,6 +250,10 @@ class MCPServer:
             text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])
+                if lease := next((l for l in st.broker.leases.values() if l.pid == info["pid"]), None):
+                    runs.started(record, info["pid"], info["log"], [
+                        {"index": d["index"], "name": d["name"]}
+                        for d in st.broker.devices(st.broker.visible_gpus(lease))])
             if resume:
                 text += ("\n" + ("The local LLM stays loaded (CPU-only job)." if cpu else
                                  "The local LLM is released while the job runs.") +

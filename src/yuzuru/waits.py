@@ -470,6 +470,7 @@ class Waiter:
                     session, replies, done + 1, limit)
         if not self.watches and self.cfg.resume.warm_before_resume:
             await self._warm(session)
+        runs.note(cwd, "stalled_nudge", session=session)
         await self._continue(session, STALLED, cwd)
 
     async def _idle_gpu_after_turn(self, session: str, cwd: str | None) -> None:
@@ -558,6 +559,7 @@ class Waiter:
         self.idle_gpu_nudges[session] = done + 1
         log.warning("session %s ended its turn with its job running and a GPU free; continuing it (%d/%d)",
                     session, done + 1, limit)
+        runs.note(cwd, "idle_gpu_nudge", session=session)
         await self._continue(session, f"{IDLE_GPU}\n\n{self.broker.gpu_usage_line()}", cwd)
 
     async def _retry_load_failure(self, session: str, before: int, cwd: str | None,
