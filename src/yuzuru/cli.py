@@ -316,6 +316,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--note", default="", help="what to do next, passed back when resuming")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
+    p = sub.add_parser("runs", help="list the jobs recorded in a task's .yuzuru/runs/ (command, setting, code, outcome)")
+    p.add_argument("dir", nargs="?", default=".", help="the task directory (default: here)")
     p = sub.add_parser("agent", help="start an agent (e.g. opencode run) in its own memory-capped scope")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
 
@@ -379,6 +381,10 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.command == "serve":
         return cmd_serve(args)
+    if args.command == "runs":
+        from .runs import table
+
+        return print(table(Path(args.dir)))
     if args.command == "init":
         from .scaffold import cmd_init
 
