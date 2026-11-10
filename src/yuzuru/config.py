@@ -198,6 +198,13 @@ class ResumeConfig:
     # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
     # such a session this many times in a row, telling it so; 0 turns this off.
     stall_nudges: int = 1
+    # A turn that ends with a GPU job of the session running and another GPU free is continued, telling the agent to use
+    # that GPU; nothing else would wake it until the job ends (Overfit run 2: the 3050 idle for 42 min, with the
+    # rule in AGENTS.md). At most this many times since the session last started a job; 0 turns this off.
+    idle_gpu_nudges: int = 2
+    # With several GPUs and a job of an agent running: when one GPU has been free this long, add a reminder to the next LLM
+    # request, and again after as long (Loop run 10 debugged for 109 min in one long turn); 0 turns this off.
+    idle_gpu_remind_minutes: float = 15.0
 
     # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
