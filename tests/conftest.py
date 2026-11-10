@@ -186,7 +186,7 @@ FAKE_OLLAMA = """#!{python}
 import http.server, json, os, sys
 assert sys.argv[1:] == ["serve"], sys.argv
 host, port = os.environ["OLLAMA_HOST"].rsplit(":", 1)
-keys = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OLLAMA_MODELS", "OLLAMA_HOST", "OLLAMA_FLASH_ATTENTION")
+keys = ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OLLAMA_MODELS", "OLLAMA_HOST", "OLLAMA_FLASH_ATTENTION", "OLLAMA_VULKAN")
 with open({record!r}, "a") as f:
     f.write(json.dumps({{"pid": os.getpid(), **{{k: os.environ.get(k) for k in keys}}}}) + "\\n")
 
