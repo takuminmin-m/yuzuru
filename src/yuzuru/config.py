@@ -205,6 +205,9 @@ class ResumeConfig:
     # With several GPUs and a job of an agent running: when one GPU has been free this long, add a reminder to the next LLM
     # request, and again after as long (Loop run 10 debugged for 109 min in one long turn); 0 turns this off.
     idle_gpu_remind_minutes: float = 15.0
+    # When a job starts, copy the weight files in its directory to .yuzuru/kept-weights, up to this
+    # many GB in all (Loop run 9 overwrote its best weights with a worse run); 0 turns this off.
+    keep_weights_gb: float = 5.0
 
     # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
