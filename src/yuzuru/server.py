@@ -191,6 +191,8 @@ def create_app(cfg: Config, state: State | None = None) -> FastAPI:
                 continue
             if placement is not Placement.NONE:
                 decision.placement = placement
+            if st.waiter:
+                st.waiter.remind_of_free_gpu(body)
             return decision, placement
         raise HTTPException(503, "no local model could be loaded")
 

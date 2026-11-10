@@ -190,13 +190,6 @@ class MCPServer:
             if not cwd.is_dir():
                 raise ValueError(f"cwd does not exist: {cwd}")
             cpu = _device(args) == "cpu"
-            deadline = st.cfg.resume.deadline()
-            if not cpu and deadline is not None and time.time() >= deadline:
-                # HPO run 2 kept starting 1.5-hour trials three hours past the task's end time.
-                raise ValueError(
-                    f"the task's time for new GPU jobs ended at {st.cfg.resume.until} (resume.until): do not start "
-                    "another experiment. Finish with what you have: write up RESULTS.md and the deliverables the "
-                    "README asks for. Inference for them can run with device 'cpu'")
             count = args.get("gpu_count")
             if cpu and (args.get("gpus") or args.get("vram") or count):
                 raise ValueError("device 'cpu' takes no gpus, gpu_count or vram")
@@ -241,6 +234,8 @@ class MCPServer:
                                   cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
             if not cpu and (refusal := runs.refuse_repeat(args["command"], cwd)):
                 raise ValueError(refusal)
+            if st.waiter:
+                await asyncio.to_thread(st.waiter.weights.keep, cwd)
             # yuzuru's own record of the job (.yuzuru/runs/): its command, setting and code, whatever the agent keeps.
             record = runs.begin(args["command"], cwd, session, args.get("log"), gpu=not cpu)
             env = outside_env()
@@ -259,7 +254,7 @@ class MCPServer:
                                  "The local LLM is released while the job runs.") +
                          " End your turn now: this session is resumed automatically with the exit status and "
                          "the log tail when the job ends.")
-            return text
+            return (st.waiter.weights.news() if st.waiter else "") + text
 
         @self.tool(
             "wait",
@@ -293,10 +288,11 @@ class MCPServer:
                 seconds = r.repeat_wait_seconds
                 if seconds > 0 and w.repeats > 1:  # it ignored the first hold's "end your turn"
                     seconds = max(seconds, r.repeat_wait_max_seconds)
-                if seconds > 0:
+                if seconds > 0 and not st.waiter.answer_at_once_for_free_gpu(session):
                     return await _held_wait(st, w, session, seconds)
             return (f"waiting ({w.id}); the local LLM is {'unloaded' if w.suspend else 'left loaded'}. End your "
-                    f"turn now: session {session} is resumed automatically when the process exits.")
+                    f"turn now: session {session} is resumed automatically when the process exits."
+                    + st.waiter.free_gpu_hint(session))
 
     async def handle(self, request: Request) -> Response:
         try:
@@ -350,7 +346,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
         return (f"still running: you already wait for it ({w.id}), so this call waited {_span(seconds)} "
                 f"first{'' if w.repeats == 1 else ' (you called wait again instead of ending your turn)'}. "
                 "Checking again keeps the LLM busy (and any free GPU idle). End your turn now: session "
-                f"{session} is resumed automatically with the outcome when it exits.")
+                f"{session} is resumed automatically with the outcome when it exits." + st.waiter.free_gpu_hint(session))
     parts = []
     for ev in ended:
         code = f" (exit code {ev.rc})" if ev.rc is not None else ""
@@ -359,7 +355,7 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
     if w.id in st.waiter.watches:
         parts.append(f"{w.label} is still running.")
     parts.append("Start the next job if there is one, then end your turn.")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts) + st.waiter.free_gpu_hint(session)
 
 
 def _ok(mid: Any, result: dict[str, Any]) -> dict[str, Any]:
