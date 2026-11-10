@@ -7,7 +7,6 @@ derived from what the resource probe reports at runtime.
 
 from __future__ import annotations
 
-import datetime
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -173,18 +172,6 @@ class LeaseConfig:
     restore_after: bool = True
 
 
-def _local_time(name: str, value: Any) -> float | None:
-    """A `resume` time as a Unix time (a time without zone is local); None when unset."""
-    if value is None:
-        return None
-    if isinstance(value, datetime.datetime):  # YAML reads 2026-10-31T06:15:00 as a datetime
-        return value.timestamp()
-    try:
-        return datetime.datetime.fromisoformat(str(value)).timestamp()
-    except ValueError:
-        raise ValueError(f"resume.{name} must be a date and time like 2026-10-31T06:15, not {value!r}") from None
-
-
 @dataclass
 class ResumeConfig:
     """Free the LLM while an agent waits for a process, and resume it afterwards."""
@@ -211,37 +198,16 @@ class ResumeConfig:
     # running, leaves nothing to wake the agent again (LoRA run 3 sat idle for 13 hours). Continue
     # such a session this many times in a row, telling it so; 0 turns this off.
     stall_nudges: int = 1
-    # The task runs until this local time ("2026-10-31T06:15"), e.g. a time-boxed search: a resumed
-    # turn that ends before it with no job of the session running is continued, telling the agent
-    # how long is left (HPO run 1 declared itself done 3.5 hours early). Set it to when the last
-    # job should start. At most until_nudges times in a row; starting a job resets the count.
-    # After it, the train tool refuses GPU jobs (HPO run 2 went on three hours past its end time);
-    # CPU jobs still run, for the inference the deliverables need.
-    until: str | None = None
-    until_nudges: int = 3
-    # When the task itself ends, after `until`. A resumed turn that ends between the two with no job of
-    # the session running is continued, telling the agent to finish the deliverables (Alloc run 2 ended
-    # its turn 25 min before the end, with none written). At most finish_nudges times for a session,
-    # whatever it does between them: only CPU jobs are left to start, and a finished agent gets them too.
-    finish_by: str | None = None
-    finish_nudges: int = 2
+    # A turn that ends with a GPU job of the session running and another GPU free is continued, telling the agent to use
+    # that GPU; nothing else would wake it until the job ends (Overfit run 2: the 3050 idle for 42 min, with the
+    # rule in AGENTS.md). At most this many times since the session last started a job; 0 turns this off.
+    idle_gpu_nudges: int = 2
+    # With several GPUs and a job of an agent running: when one GPU has been free this long, add a reminder to the next LLM
+    # request, and again after as long (Loop run 10 debugged for 109 min in one long turn); 0 turns this off.
+    idle_gpu_remind_minutes: float = 15.0
     # When a job starts, copy the weight files in its directory to .yuzuru/kept-weights, up to this
     # many GB in all (Loop run 9 overwrote its best weights with a worse run); 0 turns this off.
     keep_weights_gb: float = 5.0
-
-    def __post_init__(self) -> None:
-        until, finish = self.deadline(), self.finish_time()
-        if finish is not None and (until is None or finish <= until):
-            raise ValueError(f"resume.finish_by must come after resume.until, not {self.finish_by!r} "
-                             f"with until {self.until!r}")
-
-    def deadline(self) -> float | None:
-        """`until` as a Unix time (a time without zone is local); None when unset."""
-        return _local_time("until", self.until)
-
-    def finish_time(self) -> float | None:
-        """`finish_by` as a Unix time, like `deadline`."""
-        return _local_time("finish_by", self.finish_by)
 
     # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until
