@@ -190,13 +190,6 @@ class MCPServer:
             if not cwd.is_dir():
                 raise ValueError(f"cwd does not exist: {cwd}")
             cpu = _device(args) == "cpu"
-            deadline = st.cfg.resume.deadline()
-            if not cpu and deadline is not None and time.time() >= deadline:
-                # HPO run 2 kept starting 1.5-hour trials three hours past the task's end time.
-                raise ValueError(
-                    f"the task's time for new GPU jobs ended at {st.cfg.resume.until} (resume.until): do not start "
-                    "another experiment. Finish with what you have: write up RESULTS.md and the deliverables the "
-                    "README asks for. Inference for them can run with device 'cpu'")
             count = args.get("gpu_count")
             if cpu and (args.get("gpus") or args.get("vram") or count):
                 raise ValueError("device 'cpu' takes no gpus, gpu_count or vram")
