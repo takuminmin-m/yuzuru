@@ -30,7 +30,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import metrics
+
 RUNS_DIR = Path(".yuzuru") / "runs"
+JOURNAL = Path(".yuzuru") / "journal.jsonl"
 RUN_DIR_ENV = "YUZURU_RUN_DIR"
 # Arguments that only name a run, say where its outputs go, or set the seed: two jobs that differ only in
 # these train the same setting (a seed alone tells nothing about what to change next).
@@ -243,17 +246,23 @@ def begin(command: str, cwd: str | Path, session: str | None, log: str | None, g
         (d / "code" / rel).parent.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
             shutil.copy2(p, d / "code" / rel)
+    # Jobs given the same log file append to it: what this one writes starts here.
+    offset = 0
+    with contextlib.suppress(OSError):
+        offset = (Path(cwd) / log).stat().st_size if log else 0
     _save(d, {"id": d.name, "command": command, "cwd": str(cwd), "session": session, "gpu": gpu, "log": log,
-              "setting": setting(command, cwd), "code": digest(files, cwd), "git": _git(cwd),
+              "log_offset": offset, "setting": setting(command, cwd), "code": digest(files, cwd), "git": _git(cwd),
               "started": time.time(), "ended": None, "rc": None})
     return d
 
 
-def started(d: Path, pid: int, log: str) -> None:
-    """Add what the job got when it started."""
+def started(d: Path, pid: int, log: str, gpus: list[dict[str, Any]] | None = None) -> None:
+    """Add what the job got when it started: its pid and log, and its GPUs as [{"index", "name"}]."""
     with contextlib.suppress(OSError, ValueError):
         run = json.loads((d / "run.json").read_text())
         run.update(pid=pid, log=log)
+        if gpus is not None:
+            run["gpus"] = gpus
         _save(d, run)
 
 
@@ -264,9 +273,31 @@ def ended(cwd: str | Path | None, log: str | None, rc: int | None, last_line: st
     for d, run in reversed(load(cwd)):
         if run.get("log") == log and run.get("ended") is None:
             run.update(ended=time.time(), rc=rc, last_line=last_line)
+            # The validation metric its log reports, for `yuzuru report`.
+            run["metric"] = metrics.read(Path(cwd) / run["log"], run.get("log_offset", 0))
             with contextlib.suppress(OSError):
                 _save(d, run)
             return
+
+
+def note(cwd: str | Path | None, kind: str, **data: Any) -> None:
+    """Add a line to the task's journal of what yuzuru did to its agent (a nudge, a refusal), for `yuzuru report`."""
+    if not cwd:
+        return
+    with contextlib.suppress(OSError):
+        path = Path(cwd) / JOURNAL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps({"ts": time.time(), "kind": kind, **data}, ensure_ascii=False, default=str) + "\n")
+
+
+def journal(cwd: str | Path) -> list[dict[str, Any]]:
+    out = []
+    with contextlib.suppress(OSError):
+        for line in (Path(cwd) / JOURNAL).read_text().splitlines():
+            with contextlib.suppress(ValueError):
+                out.append(json.loads(line))
+    return out
 
 
 def _pid_alive(pid: Any) -> bool:

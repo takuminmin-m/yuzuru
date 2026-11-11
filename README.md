@@ -197,6 +197,8 @@ yuzuru release <id>                        # 枠を返す
 | `yuzuru_models` | 入っているモデルの一覧 |
 | `yuzuru_model` | このセッションで使う tier かモデルを固定する（`auto` で戻す） |
 
+run が終わったら、`yuzuru report [課題ディレクトリ]` で要約を見られます（一番良いジョブとその重み、各ジョブの設定の違い、GPU の空き時間、失敗したジョブ）。
+
 エージェントが自分のシェルで実行するコマンドからは、GPU が見えません。GPU を使う処理は `yuzuru_train` を通させるためです。
 
 CLI からも同じことができます。
@@ -241,6 +243,7 @@ API キーは設定ファイルに書かず、`api_key_env` で指定した環�
 ```bash
 yuzuru status                              # GPU / RAM、LLM の予算、tier ごとの配置見込み、lease
 yuzuru status --json                       # 同じ内容を JSON で
+yuzuru report [課題ディレクトリ]            # run の要約: 一番良いジョブと重み、設定の違い、GPU の空き時間、失敗
 yuzuru route "この loss が発散する原因を調べて"   # ルーターの判定だけを試す
 yuzuru warm large                          # tier を今読み込む（--force で予算を超えても読み込む）
 yuzuru unload                              # 全モデルを解放する（tier 名を付けるとその tier だけ）
