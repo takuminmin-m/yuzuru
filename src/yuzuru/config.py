@@ -208,6 +208,13 @@ class ResumeConfig:
     # When a job starts, copy the weight files in its directory to .yuzuru/kept-weights, up to this
     # many GB in all (Loop run 9 overwrote its best weights with a worse run); 0 turns this off.
     keep_weights_gb: float = 5.0
+    # A job started with `verify` evaluates an earlier job's saved weights on the validation data. What it reports
+    # matches that job's log when it is within this fraction of the log's best (0.02: 78.74 -> 77.17..80.31). The
+    # All-PR run's log said 78.74, its weights gave 74.16 (BatchNorm buffers not saved).
+    verify_tolerance: float = 0.02
+    # A resumed turn that ends with no job running while the best job's saved weights have not been checked that way
+    # (or did not match) is continued this many times per best job, asking for the check; 0 turns this off.
+    verify_nudges: int = 1
 
     # `wait` on a process the session already waits for (HPO run 2's agent checked a running job every
     # few seconds for an hour, the LLM busy and the other GPU idle) holds the call this long, or until

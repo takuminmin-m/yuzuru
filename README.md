@@ -191,7 +191,7 @@ yuzuru release <id>                        # 枠を返す
 
 | ツール | 用途 |
 |---|---|
-| `yuzuru_train` | 学習ジョブをバックグラウンドで起動する。GPU が 1 枚なら GPU ジョブに `vram`（または `gpus`）が必須。2 枚以上なら空いている GPU を丸ごと割り当てる。CPU ジョブは `device: "cpu"` |
+| `yuzuru_train` | 学習ジョブをバックグラウンドで起動する。GPU が 1 枚なら GPU ジョブに `vram`（または `gpus`）が必須。2 枚以上なら空いている GPU を丸ごと割り当てる。CPU ジョブは `device: "cpu"`。`verify` を付けると、保存した重みを検証データで推論するジョブとして、出た指標を元の試行のログと照合する |
 | `yuzuru_wait` | 自分で起動したのではないプロセス（PID か lease）の終了を待つ |
 | `yuzuru_status` | GPU / RAM、載せられる tier、学習ジョブを見る |
 | `yuzuru_models` | 入っているモデルの一覧 |

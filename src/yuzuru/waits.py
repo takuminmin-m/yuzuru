@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import runs, scope
+from . import report, runs, scope
 from .broker import Broker, Lease, Placement, _pid_alive
 from .config import Config
 from .weights import WeightKeeper
@@ -48,6 +48,11 @@ IDLE_GPU_REMINDER = ("[yuzuru] A GPU has been free for {free} min while your job
                      "the GPUs busy: start the best setting so far with one change on the free GPU now, and carry on "
                      "alongside it. If a method has not worked after a couple of attempts, use a library's version of "
                      "it or drop it.")
+VERIFY = ("[yuzuru] Your turn ended with no job running, and the saved weights of your best job, {id} ({metric} in "
+          "its log), {state}. A submission made from weights that do not give the log's number scores less (a log of "
+          "78.74 gave 74.16 once). Before you finish: run your inference script with those weights on the validation "
+          "data through `yuzuru_train` with verify \"{id}\", print the metric as in training, and end your turn; "
+          "yuzuru tells you whether it matches. If the task is not finished, carry on with it first.")
 IDLE_GPU_SETTLE = 2.0  # lets a resume for a job that ended during the turn go first
 
 
@@ -82,6 +87,7 @@ class Event:
     resumed: bool = False
     resume_error: str | None = None
     delivered: bool = False  # answered a held `wait` call: the agent has it already
+    check: str = ""  # a verify job's outcome (runs.verify_text)
 
 
 def outside_env() -> dict[str, str]:
@@ -170,6 +176,7 @@ class Waiter:
         self._held: dict[str, list[tuple[Event, Watch]]] = {}
         self.nudges: dict[str, int] = {}  # session -> stalled turns continued in a row
         self.idle_gpu_nudges: dict[str, int] = {}  # session -> turns continued for a free GPU since it last started a job
+        self.verify_nudged: dict[str, Counter[str]] = {}  # session -> best jobs it was told to verify, how often
         self.idle_gpu_answers: dict[str, int] = {}  # session -> repeated `wait`s not held for a free GPU since its last job
         self._gpu_free_since: float | None = None  # since when some GPU has been free, as seen by LLM requests
         self._gpu_reminded = 0.0  # when the agent was last reminded of it
@@ -258,9 +265,11 @@ class Waiter:
     def _lease_ended(self, lease: Lease, rc: int | None) -> None:
         if lease.kind == "job" and lease.log:
             last = next((x for x in reversed(tail(lease.log, lease.cwd, 5).splitlines()) if x.strip()), "")
-            runs.ended(lease.cwd, lease.log, rc, last)
+            check = runs.verify_text(runs.ended(lease.cwd, lease.log, rc, last))
+        else:
+            check = ""
         for w in [w for w in self.watches.values() if w.lease == lease.id]:
-            self._finish(w, rc)
+            self._finish(w, rc, check)
 
     async def poll(self) -> None:
         """Check plain-PID watches (no lease to tell us the exit); suspend when quiet."""
@@ -303,12 +312,12 @@ class Waiter:
                 del self.holding[session]
         return [e for e in self.events if e.watch in mine and e.delivered]
 
-    def _finish(self, w: Watch, rc: int | None) -> None:
+    def _finish(self, w: Watch, rc: int | None, check: str = "") -> None:
         self.watches.pop(w.id, None)
         ev = Event(
             id=self._next, watch=w.id, session=w.session, label=w.label, rc=rc,
             duration=time.time() - w.created, log=w.log,
-            log_tail=tail(w.log, w.cwd, self.cfg.resume.log_tail_lines), note=w.note,
+            log_tail=tail(w.log, w.cwd, self.cfg.resume.log_tail_lines), note=w.note, check=check,
         )
         self._next += 1
         if not self.watches:
@@ -367,6 +376,10 @@ class Waiter:
             parts.append(f"Your note for this moment: {ev.note}")
         if ev.log_tail:
             parts.append(f"Last lines of {ev.log}:\n```\n{ev.log_tail}\n```")
+        if getattr(ev, "check", ""):
+            parts.append(ev.check)
+        if earlier and (checks := [e.check for e in earlier if getattr(e, "check", "")]):
+            parts += checks
         if news := self.weights.news():
             parts.append(news.strip())
         if len(self.broker.snapshot.gpus) > 1:
@@ -459,6 +472,7 @@ class Waiter:
         if replies > 1:
             self.nudges.pop(session, None)
             log.info("session %s ended its turn with no job running", session)
+            await self._nudge_verify(session, cwd)
             return
         done, limit = self.nudges.get(session, 0), self.cfg.resume.stall_nudges
         if done >= limit:
@@ -472,6 +486,37 @@ class Waiter:
             await self._warm(session)
         runs.note(cwd, "stalled_nudge", session=session)
         await self._continue(session, STALLED, cwd)
+
+    async def _nudge_verify(self, session: str, cwd: str | None) -> None:
+        """Continue a session that ended its turn, all its jobs done, without checking its best job's saved weights on
+        the validation data (All-PR run: log 78.74, submission 74.16; HPO run 3: log 57.12, submission 7.23)."""
+        limit = self.cfg.resume.verify_nudges
+        if limit <= 0 or not cwd:
+            return
+        r = await asyncio.to_thread(report.build, cwd)
+        best = next((j for j in r["jobs"] if j["id"] == r["best"]), None)
+        if not best:
+            return
+        checks = best["verified"]
+        if checks and checks[-1]["verdict"] == "match":
+            return
+        told = self.verify_nudged.setdefault(session, Counter())
+        if told[best["id"]] >= limit:
+            return
+        told[best["id"]] += 1
+        m = best["metric"]
+        if checks and checks[-1]["verdict"] == "mismatch":
+            state = f"gave {checks[-1]['got']:g} on the validation data when last checked ({checks[-1]['by']})"
+        elif checks:
+            why = "printed no metric yuzuru could compare" if checks[-1]["verdict"] == "unread" else "failed"
+            state = f"have not been checked: the last check ({checks[-1]['by']}) {why}"
+        else:
+            state = "have not been checked on the validation data"
+        log.warning("session %s: best job %s not verified; continuing it", session, best["id"])
+        runs.note(cwd, "verify_nudge", session=session, best=best["id"])
+        if not self.watches and self.cfg.resume.warm_before_resume:
+            await self._warm(session)
+        await self._continue(session, VERIFY.format(id=best["id"], metric=f"{m['name']} {m['best']:g}", state=state), cwd)
 
     async def _idle_gpu_after_turn(self, session: str, cwd: str | None) -> None:
         """Check for a free GPU when the turn that started a job ends. That turn may be the agent's first,
