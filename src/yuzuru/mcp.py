@@ -182,6 +182,10 @@ class MCPServer:
                 "resume_when_done": {"type": "boolean", "description": "free the LLM while the job runs and "
                                      "resume this session when it ends (default true); end your turn after starting"},
                 "note": {"type": "string", "description": "what you will do when the job ends (handed back to you)"},
+                "verify": {"type": "string", "description": "for a job that loads the weights an earlier job saved and "
+                           "evaluates them on the validation data: that job's id (e.g. '024-cutmix50', from the train "
+                           "answer or .yuzuru/runs). Print the metric as in training (`val_acc=0.7874`); when the job "
+                           "ends yuzuru tells you whether it matches that job's log. Do it before building a submission"},
             },
             ["command", "cwd"],
         )
@@ -232,13 +236,15 @@ class MCPServer:
                 # ends with 137 and the agent is resumed with that) instead of systemd stopping yuzuru.
                 argv = scope.wrap(argv, scope.unit_name("job"), st.cfg.isolation.memory_max, oom_continue=True,
                                   cpu_weight=st.cfg.isolation.cpu_job_weight if cpu else None)
-            if not cpu and (refusal := runs.refuse_repeat(args["command"], cwd)):
+            verify = (runs.verify_target(cwd, args["verify"], st.cfg.resume.verify_tolerance)
+                      if args.get("verify") else None)
+            if not cpu and not verify and (refusal := runs.refuse_repeat(args["command"], cwd)):
                 runs.note(cwd, "repeat_refused", command=args["command"])
                 raise ValueError(refusal)
             if st.waiter:
                 await asyncio.to_thread(st.waiter.weights.keep, cwd)
             # yuzuru's own record of the job (.yuzuru/runs/): its command, setting and code, whatever the agent keeps.
-            record = runs.begin(args["command"], cwd, session, args.get("log"), gpu=not cpu)
+            record = runs.begin(args["command"], cwd, session, args.get("log"), gpu=not cpu, verify=verify)
             env = outside_env()
             env[runs.RUN_DIR_ENV] = str(record)
             r = await asyncio.to_thread(subprocess.run, argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
@@ -247,7 +253,10 @@ class MCPServer:
                 raise RuntimeError(r.stderr or r.stdout)
             info = json.loads(r.stdout)
             runs.started(record, info["pid"], info["log"])
-            text = f"started pid {info['pid']}\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+            text = f"started pid {info['pid']} (record {record.name})\nlog: {info['log']}\nfollow with: tail -n 50 {info['log']}"
+            if verify:
+                text += (f"\nWhen it ends, yuzuru compares its {verify['name']} with {verify['of']}'s best in its log "
+                         f"({verify['expected']:g}).")
             if not cpu:
                 text += await self._placement(info["pid"], info["log"])
                 if lease := next((l for l in st.broker.leases.values() if l.pid == info["pid"]), None):
@@ -357,6 +366,8 @@ async def _held_wait(st: Any, w: Any, session: str | None, seconds: float) -> st
         code = f" (exit code {ev.rc})" if ev.rc is not None else ""
         parts.append(f"{ev.label} ended{code} after {ev.duration / 60:.1f} min. Last lines of "
                      f"{ev.log or 'its log'}:\n```\n{ev.log_tail[-2000:]}\n```")
+        if ev.check:
+            parts.append(ev.check)
     if w.id in st.waiter.watches:
         parts.append(f"{w.label} is still running.")
     parts.append("Start the next job if there is one, then end your turn.")

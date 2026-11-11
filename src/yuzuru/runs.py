@@ -233,8 +233,13 @@ def _save(d: Path, run: dict[str, Any]) -> None:
     os.replace(tmp, d / "run.json")
 
 
-def begin(command: str, cwd: str | Path, session: str | None, log: str | None, gpu: bool) -> Path:
-    """Make the record of a job about to start: its directory, run.json and a copy of its code."""
+def begin(command: str, cwd: str | Path, session: str | None, log: str | None, gpu: bool,
+          verify: dict[str, Any] | None = None) -> Path:
+    """Make the record of a job about to start: its directory, run.json and a copy of its code.
+
+    `verify` (from `verify_target`) makes it a job that evaluates an earlier job's saved weights on the
+    validation data: when it ends, what it reports is compared with that job's log.
+    """
     root = runs_dir(cwd)
     root.mkdir(parents=True, exist_ok=True)
     n = 1 + max((int(p.name.split("-", 1)[0]) for p in root.iterdir() if p.name.split("-", 1)[0].isdigit()), default=0)
@@ -252,7 +257,7 @@ def begin(command: str, cwd: str | Path, session: str | None, log: str | None, g
         offset = (Path(cwd) / log).stat().st_size if log else 0
     _save(d, {"id": d.name, "command": command, "cwd": str(cwd), "session": session, "gpu": gpu, "log": log,
               "log_offset": offset, "setting": setting(command, cwd), "code": digest(files, cwd), "git": _git(cwd),
-              "started": time.time(), "ended": None, "rc": None})
+              "started": time.time(), "ended": None, "rc": None, **({"verify": verify} if verify else {})})
     return d
 
 
@@ -266,18 +271,165 @@ def started(d: Path, pid: int, log: str, gpus: list[dict[str, Any]] | None = Non
         _save(d, run)
 
 
-def ended(cwd: str | Path | None, log: str | None, rc: int | None, last_line: str = "") -> None:
-    """Close the record of the job that wrote `log`."""
+def ended(cwd: str | Path | None, log: str | None, rc: int | None, last_line: str = "") -> dict[str, Any] | None:
+    """Close the record of the job that wrote `log`; the record, or None if there is none."""
     if not cwd or not log:
-        return
+        return None
     for d, run in reversed(load(cwd)):
         if run.get("log") == log and run.get("ended") is None:
             run.update(ended=time.time(), rc=rc, last_line=last_line)
             # The validation metric its log reports, for `yuzuru report`.
             run["metric"] = metrics.read(Path(cwd) / run["log"], run.get("log_offset", 0))
+            if run.get("verify"):
+                _check(cwd, run)
             with contextlib.suppress(OSError):
                 _save(d, run)
-            return
+            return run
+    return None
+
+
+# ------------------------------------------------------------------ verify
+
+def log_ends(records: list[dict[str, Any]]) -> dict[str, int | None]:
+    """Where each job's part of its log ends, by job id: where the next job given the same file began.
+
+    A record older than `log_offset` cannot be told apart from the others in its file: -1 (nothing to read),
+    but for the last job that wrote there.
+    """
+    out: dict[str, int | None] = {}
+    by_log: dict[str, list[dict[str, Any]]] = {}
+    for run in records:
+        if run.get("log"):
+            by_log.setdefault(str(Path(run.get("cwd") or "") / run["log"]), []).append(run)
+    for sharing in by_log.values():
+        for i, run in enumerate(sharing):
+            later = [r["log_offset"] for r in sharing[i + 1:] if "log_offset" in r]
+            out[run["id"]] = min(later) if "log_offset" in run and later else (-1 if sharing[i + 1:] and "log_offset" not in run else None)
+    return out
+
+
+def own_text(cwd: str | Path, run: dict[str, Any]) -> str:
+    """What the job `run` wrote to its log, without what other jobs given the same file wrote there."""
+    if not run.get("log"):
+        return ""
+    end = log_ends([r for _, r in load(cwd)]).get(run["id"])
+    return metrics.read_text(Path(cwd) / run["log"], run.get("log_offset", 0), end)
+
+
+def find(cwd: str | Path, ref: str) -> tuple[Path, dict[str, Any]] | None:
+    """The record `ref` names: its id ("024-cutmix50"), number ("24", "024") or name ("cutmix50"; the newest)."""
+    ref = ref.strip()
+    records = load(cwd)
+    for d, run in records:
+        if run["id"] == ref:
+            return d, run
+    head, _, name = ref.partition("-")
+    if head.isdigit():
+        for d, run in records:
+            if int(run["id"].split("-", 1)[0]) == int(head) and (not name or run["id"].split("-", 1)[1] == name):
+                return d, run
+    return next(((d, run) for d, run in reversed(records) if run["id"].split("-", 1)[-1] == ref), None)
+
+
+def verify_target(cwd: str | Path, ref: str, tolerance: float) -> dict[str, Any]:
+    """What a job that evaluates `ref`'s saved weights is checked against. Raises ValueError for a job that cannot be."""
+    found = find(cwd, ref)
+    if not found:
+        raise ValueError(f"no job {ref!r} in {RUNS_DIR}: give its id as `yuzuru_train` named it (e.g. '024-cutmix50')")
+    _, run = found
+    if run.get("verify"):
+        raise ValueError(f"{run['id']} itself evaluated {run['verify']['of']}: name the training job")
+    if run.get("ended") is None:
+        raise ValueError(f"{run['id']} has not ended: verify its weights once it has")
+    if "metric" in run:
+        m = run["metric"]
+    else:  # a record from before yuzuru read metrics at a job's end
+        found = metrics.series(own_text(cwd, run))
+        name = metrics.choose(found)
+        m = metrics.summarize(name, found[name]) if name else None
+    if not m:
+        raise ValueError(f"{run['id']}'s log has no validation metric yuzuru can read (a `name=value` pair whose "
+                         "name says validation, such as val_acc=0.81): there is nothing to compare with")
+    return {"of": run["id"], "name": m["name"], "lower": m["lower"], "expected": m["best"], "best_at": m["best_at"],
+            "n": m["n"], "tolerance": tolerance}
+
+
+def _core(name: str) -> str:
+    """A metric name without its split: `va_acc`, `val/acc` and `[val] acc` are all `acc`."""
+    return re.sub(r"(?:^|[^a-z])(?:val|valid|validation|va|eval|dev|best|final|test)(?=[^a-z]|$)", "", name).strip("_/.- ")
+
+
+def _pick(found: dict[str, list[float]], want: str) -> str | None:
+    """The pair of a verify job's log that reports the metric `want` of the job it checks."""
+    if want in found:
+        return want
+    core = _core(want)
+    alike = [n for n in found if not metrics.COUNT.search(n) and core
+             and ((c := _core(n)) and (c.startswith(core) or core.startswith(c)))]
+    if alike:  # `val_accuracy` for `va_acc`
+        return min(alike, key=lambda n: (not metrics.VAL.search(n), -len(found[n])))
+    return metrics.choose(found)
+
+
+def _close(a: float, b: float, rel: float) -> bool:
+    a, b = metrics.same_scale(a, b)
+    return abs(a - b) <= rel * max(abs(b), 1e-12)
+
+
+def _check(cwd: str | Path, run: dict[str, Any]) -> None:
+    """Compare what a verify job reported with the log of the job whose weights it evaluated."""
+    v = run["verify"]
+    if run.get("rc") != 0:
+        v["verdict"] = "failed"
+        return
+    found = metrics.series(metrics.read_text(Path(cwd) / run["log"], run.get("log_offset", 0)))
+    name = _pick(found, v["name"])
+    if not name:
+        v["verdict"] = "unread"
+    else:
+        got = found[name][-1]
+        v.update(got=got, got_name=name, verdict="match" if _close(got, v["expected"], v["tolerance"]) else "mismatch")
+    target = find(cwd, v["of"])
+    if v["verdict"] == "mismatch" and target and v["best_at"] < v["n"]:
+        # The last value, not the best: the file was written at the end of training. (Any value below the best
+        # is also somewhere on a rising curve, so only the last one says something.)
+        values = metrics.series(own_text(cwd, target[1])).get(v["name"], [])
+        if values and _close(v["got"], values[-1], v["tolerance"] / 4):
+            v["like_last"] = values[-1]
+    if target:
+        d, t = target
+        t.setdefault("verified", []).append({"by": run["id"], "verdict": v["verdict"], "got": v.get("got")})
+        with contextlib.suppress(OSError):
+            _save(d, t)
+    note(cwd, "verify", of=v["of"], by=run["id"], verdict=v["verdict"], got=v.get("got"), expected=v["expected"])
+
+
+def _num(x: float) -> str:
+    return f"{x:.4g}" if abs(x) < 1 else f"{x:.2f}"
+
+
+def verify_text(run: dict[str, Any] | None) -> str:
+    """For the agent, when a verify job ends: whether the saved weights give what the training log says."""
+    v = (run or {}).get("verify")
+    if not v or v.get("verdict") in (None, "failed"):
+        return ""
+    of, want = v["of"], f"{v['name']} {_num(v['expected'])}"
+    if v["verdict"] == "unread":
+        return (f"[yuzuru] Verify of {of}: yuzuru found no metric in this job's log to compare with {of}'s best "
+                f"{want}. Print it on the validation data under the same name, as `{v['name']}=<value>`, and run "
+                "the check again.")
+    got = f"{v['got_name']} {_num(v['got'])}"
+    if v["verdict"] == "match":
+        return (f"[yuzuru] Verify of {of}: the saved weights give {got} on the validation data, as its log's best "
+                f"({want}). Build the submission from these weights with the same script.")
+    epoch = (f" It is the log's last value ({_num(v['like_last'])}): the file holds the weights from the end of "
+             "training, not those of the best point." if "like_last" in v else "")
+    return (f"[yuzuru] Verify of {of} FAILED: the saved weights give {got} on the validation data, but its log's "
+            f"best is {want} (value {v['best_at']} of {v['n']}).{epoch} A submission made from them will not score "
+            "what the log says. Usual causes: the weights saved at another point than the best, BatchNorm buffers "
+            "or other state not saved, preprocessing (normalization, resizing, tokenization) not the same as in "
+            "validation during training, the model not in eval mode, or another model definition. Find the cause, "
+            "fix it, and verify again before you build the submission.")
 
 
 def note(cwd: str | Path | None, kind: str, **data: Any) -> None:
@@ -323,7 +475,8 @@ def refuse_repeat(command: str, cwd: str | Path) -> str | None:
     code = digest(code_files(command, cwd), cwd)
     same = []
     for d, run in load(cwd):
-        if not run.get("gpu") or run.get("repeat_allowed") or run.get("setting") != new or run.get("code") != code:
+        if (not run.get("gpu") or run.get("verify") or run.get("repeat_allowed") or run.get("setting") != new
+                or run.get("code") != code):
             continue
         running = run.get("ended") is None and _pid_alive(run.get("pid"))
         if running or run.get("rc") == 0:

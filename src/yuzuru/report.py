@@ -63,24 +63,6 @@ def _weights(cwd: Path, run: dict[str, Any]) -> list[dict[str, Any]]:
     return [w for w in out if name in w["path"]] or out
 
 
-def _log_ends(records: list[dict[str, Any]]) -> dict[str, int | None]:
-    """Where each job's part of its log ends, by job id: where the next job given the same file began.
-
-    A record older than `log_offset` cannot be told apart from the others in its file: -1 (nothing to read),
-    but for the last job that wrote there.
-    """
-    out: dict[str, int | None] = {}
-    by_log: dict[str, list[dict[str, Any]]] = {}
-    for run in records:
-        if run.get("log"):
-            by_log.setdefault(str(Path(run.get("cwd") or "") / run["log"]), []).append(run)
-    for sharing in by_log.values():
-        for i, run in enumerate(sharing):
-            later = [r["log_offset"] for r in sharing[i + 1:] if "log_offset" in r]
-            out[run["id"]] = min(later) if "log_offset" in run and later else (-1 if sharing[i + 1:] and "log_offset" not in run else None)
-    return out
-
-
 def _idle(jobs: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
     """Per GPU: how long it ran jobs and how long it was free, between the task's first GPU job and its last."""
     spans = [(j["started"], j["ended"] or now, j) for j in jobs if j["gpus"] and j["state"] != "gone"]
@@ -112,7 +94,7 @@ def build(cwd: str | Path, metric: str | None = None, lower: bool | None = None)
     now = time.time()
     jobs = []
     records = [run for _, run in runs.load(cwd)]
-    ends = _log_ends(records)
+    ends = runs.log_ends(records)
     for run in records:
         log = Path(run.get("cwd") or cwd) / run["log"] if run.get("log") else None
         offset, end, state = run.get("log_offset", 0), ends.get(run["id"]), _state(run)
@@ -126,7 +108,7 @@ def build(cwd: str | Path, metric: str | None = None, lower: bool | None = None)
                      "started": run["started"], "ended": run.get("ended"), "gpus": _gpus(run, head) if run.get("gpu") else [],
                      "gpu": bool(run.get("gpu")), "metric": m, "last_line": run.get("last_line") or "",
                      "setting": run.get("setting") or {}, "code": run.get("code") or {},
-                     "verify": run.get("verify")})
+                     "verify": run.get("verify"), "verified": run.get("verified") or []})
     report: dict[str, Any] = {"task": str(cwd), "jobs": jobs, "best": None, "metric": None, "weights": [],
                               "gpus": _idle(jobs, now), "journal": dict(Counter(e.get("kind") for e in runs.journal(cwd)))}
     # Jobs are compared by the metric most of them report; a job reporting another one is not ranked.
@@ -152,6 +134,18 @@ def _notes(r: dict[str, Any]) -> list[str]:
         out.append(f"no weights file written by the best job ({r['best']}) is left, nor a copy of one")
     elif r["best"] and all(w["path"].startswith(str(KEPT_DIR)) for w in r["weights"]):
         out.append(f"the weights of the best job ({r['best']}) were overwritten or removed; yuzuru's copy is listed above")
+    best = next((j for j in jobs if j["id"] == r["best"]), None)
+    if best:
+        checks = best["verified"]
+        if not checks:
+            out.append(f"the best job's weights ({best['id']}) were not evaluated again on the validation data "
+                       "(`yuzuru_train` with verify): a submission made from them is unchecked")
+        elif checks[-1]["verdict"] == "mismatch":
+            out.append(f"the best job's saved weights gave {checks[-1]['got']:g} on the validation data "
+                       f"({checks[-1]['by']}), not the {best['metric']['best']:g} of its log")
+    bad = [j for j in jobs if j["verify"] and j["verify"].get("verdict") == "mismatch" and j["verify"]["of"] != r["best"]]
+    if bad:
+        out.append("saved weights that did not match their log: " + ", ".join(j["verify"]["of"] for j in bad))
     failed = [j["id"] for j in jobs if j["state"] == "failed"]
     if failed:
         out.append(f"{len(failed)} of {len(jobs)} jobs failed: " + ", ".join(failed[:6]) + (" ..." if len(failed) > 6 else ""))
@@ -176,7 +170,8 @@ def _notes(r: dict[str, Any]) -> list[str]:
             out.append(f"GPU {g['index']} was free for {(longest['to'] - longest['from']) / 60:.0f} min from "
                        f"{_clock(longest['from'])} ({len(g['gaps'])} gaps of 15 min or more)")
     said = {"stalled_nudge": "continued the agent after a turn that did nothing",
-            "idle_gpu_nudge": "continued the agent to use a free GPU", "repeat_refused": "refused a repeated setting"}
+            "idle_gpu_nudge": "continued the agent to use a free GPU", "repeat_refused": "refused a repeated setting",
+            "verify_nudge": "continued the agent to check its best weights"}
     for kind, n in r["journal"].items():
         if kind in said:
             out.append(f"yuzuru {said[kind]}: {n}×")
@@ -223,6 +218,9 @@ def text(r: dict[str, Any], width: int = 150) -> str:
         out.append(f"      {best['command']}")
         for w in r["weights"]:
             out.append(f"      weights: {w['path']} ({w['state']})")
+        for c in best["verified"]:
+            got = f" {_fmt(c['got'])}" if c.get("got") is not None else ""
+            out.append(f"      verified by {c['by']}: {c['verdict']}{got}")
     if r["gpus"]:
         out.append("")
         for g in r["gpus"]:
@@ -235,7 +233,11 @@ def text(r: dict[str, Any], width: int = 150) -> str:
         m = j["metric"] if j["metric"] and r["metric"] and j["metric"]["name"] == r["metric"]["name"] else None
         state = f"rc={j['rc']}" if j["state"] == "failed" else j["state"]
         where = ",".join(str(g["index"]) for g in j["gpus"]) or ("cpu" if not j["gpu"] else "?")
-        what = "(best)" if j is best else ("verify" if j["verify"] else _changed(j, best))
+        if j["verify"]:
+            v = j["verify"]
+            what = f"verify of {v['of']}: {v.get('verdict', '-')}" + (f" ({_fmt(v['got'])})" if "got" in v else "")
+        else:
+            what = "(best)" if j is best else _changed(j, best)
         if j["state"] == "failed" and j["last_line"]:
             what = j["last_line"]
         line = (f"{j['id']:<26.26} {state:<8} {took:>8} {where:<4} {_fmt(m['best']) if m else '-':>8} "
